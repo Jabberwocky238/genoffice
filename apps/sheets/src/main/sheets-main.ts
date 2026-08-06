@@ -2108,11 +2108,7 @@ export function registerSheetsAiIpc(): void {
   ipcMain.handle(IPC_CHANNELS.aiGetSettings, (event): AiSettings => {
     sessionFor(event)
     const stored = readJson<Partial<AiSettings> & LegacyAiSettings>(SETTINGS_PATH(), {})
-    const settings = resolveAiSettings(stored, defaultAiSettings())
-    // AI features all go through Genspark (gsk login); legacy settings that chose
-    // another provider are reset
-    settings.provider = 'genspark'
-    return settings
+    return resolveAiSettings(stored, defaultAiSettings())
   })
 
   // Genspark account (gsk login state): the auth source for AI features; the

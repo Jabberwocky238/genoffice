@@ -66,7 +66,7 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
   {
     id: 'deepseek',
     label: 'DeepSeek',
-    models: ['deepseek-chat', 'deepseek-reasoner'],
+    models: ['deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-chat', 'deepseek-reasoner'],
     defaultModel: 'deepseek-chat',
     keyPlaceholder: 'sk-...',
   },
