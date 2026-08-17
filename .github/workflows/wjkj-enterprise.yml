@@ -43,6 +43,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Read application version
+        id: metadata
+        shell: pwsh
+        run: |
+          $version = node -p "require('./apps/shell/package.json').version"
+          "version=$version" >> $env:GITHUB_OUTPUT
+
       - name: Build applications
         run: npm run notices && npm run build:all
 
@@ -57,11 +64,21 @@ jobs:
       - name: Package Windows application
         run: npm run dist:win -w @genoffice/shell
 
+      - name: Rename Windows installer
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem 'apps/shell/release/*.exe' -File)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one Windows installer, found $($installers.Count)."
+          }
+          $name = 'wjkj-genoffice-ee-${{ steps.metadata.outputs.version }}-windows.exe'
+          Move-Item $installers[0].FullName "apps/shell/release/$name"
+
       - name: Upload Windows artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: wjkj-enterprise-windows-x64
-          path: apps/shell/release/*.exe
+          name: wjkj-genoffice-ee-${{ steps.metadata.outputs.version }}-windows
+          path: apps/shell/release/wjkj-genoffice-ee-${{ steps.metadata.outputs.version }}-windows.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -96,18 +113,30 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Read application version
+        id: metadata
+        run: echo "version=$(node -p "require('./apps/shell/package.json').version")" >> "$GITHUB_OUTPUT"
+
       - name: Build applications and universal sidecar
         run: npm run notices && npm run build:all && npm run native:build:universal -w @genoffice/sheets
 
       - name: Package macOS application
         run: npm run dist:mac -w @genoffice/shell
 
+      - name: Rename macOS installer
+        run: |
+          set -eu
+          set -- apps/shell/release/*.dmg
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "Expected exactly one macOS installer, found $#." >&2
+            exit 1
+          fi
+          mv "$1" "apps/shell/release/wjkj-genoffice-ee-${{ steps.metadata.outputs.version }}-macos.dmg"
+
       - name: Upload macOS artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: wjkj-enterprise-macos-arm64
-          path: |
-            apps/shell/release/*.dmg
-            apps/shell/release/*-mac.zip
+          name: wjkj-genoffice-ee-${{ steps.metadata.outputs.version }}-macos
+          path: apps/shell/release/wjkj-genoffice-ee-${{ steps.metadata.outputs.version }}-macos.dmg
           if-no-files-found: error
           retention-days: 30
