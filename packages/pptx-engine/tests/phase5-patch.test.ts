@@ -9,8 +9,13 @@ import {
   addElement,
   addPicture,
   createBlankPptx,
+  editPictureSrcRect,
   patchElementStroke,
+  replacePictureBytes,
+  resetSlideBackground,
   setSlideBackground,
+  setSlideBackgroundImage,
+  setSlideBgGraphicsHidden,
 } from '../src/index'
 import type { PictureElement, TextElement } from '../src/types'
 
@@ -62,6 +67,102 @@ describe('addPicture', () => {
   })
 })
 
+describe('replacePictureBytes', () => {
+  // 1x1 transparent GIF (distinct format exercises the Content_Types Default too)
+  const GIF_1PX = Uint8Array.from(
+    Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64'),
+  )
+
+  async function openWithPicture() {
+    const opened0 = await openPptx(await createBlankPptx())
+    addPicture(opened0, opened0.deck.slides[0]!, { bytes: PNG_1PX, ext: 'png', offset: { ...OFF } })
+    // reopen so the picture is a parsed element with on-disk originalXml
+    const opened = await openPptx(await savePptx(opened0))
+    const slide = opened.deck.slides[0]!
+    const pic = slide.elements.find((e) => e.type === 'picture') as PictureElement
+    return { opened, slide, pic }
+  }
+
+  it('swaps media in place, keeps frame + crop when asked, survives save → reopen', async () => {
+    const { opened, slide, pic } = await openWithPicture()
+    expect(editPictureSrcRect(slide, pic.id, { l: 0.1, t: 0.1, r: 0.1, b: 0.1 })).toBe(true)
+    expect(replacePictureBytes(opened, slide, pic.id, GIF_1PX, 'gif', { keepSrcRect: true })).toBe(
+      true,
+    )
+    expect(pic.mediaRef).toBe('ppt/media/image2.gif')
+
+    const out = await savePptx(opened)
+    const zip = await JSZip.loadAsync(out)
+    expect(new Uint8Array(await zip.file('ppt/media/image2.gif')!.async('uint8array'))).toEqual(
+      GIF_1PX,
+    )
+    expect(await zip.file('[Content_Types].xml')!.async('string')).toContain('Extension="gif"')
+
+    const reopened = await openPptx(out)
+    const pic2 = reopened.deck.slides[0]!.elements.find(
+      (e) => e.type === 'picture',
+    ) as PictureElement
+    expect(pic2.mediaRef).toBe('ppt/media/image2.gif')
+    expect(pic2.srcRect).toEqual({ l: 0.1, t: 0.1, r: 0.1, b: 0.1 })
+    expect(pic2.transform.offset).toEqual(OFF)
+  })
+
+  it('clears a stale crop window by default', async () => {
+    const { opened, slide, pic } = await openWithPicture()
+    editPictureSrcRect(slide, pic.id, { l: 0.2, t: 0, r: 0.2, b: 0 })
+    expect(replacePictureBytes(opened, slide, pic.id, GIF_1PX, 'gif')).toBe(true)
+    expect(pic.srcRect).toBeUndefined()
+
+    const reopened = await openPptx(await savePptx(opened))
+    const pic2 = reopened.deck.slides[0]!.elements.find(
+      (e) => e.type === 'picture',
+    ) as PictureElement
+    expect(pic2.srcRect).toBeUndefined()
+  })
+
+  it('keeps stroke and z-order: the element is mutated, not re-added', async () => {
+    const { opened, slide, pic } = await openWithPicture()
+    pic.stroke = { fill: { type: 'solid', color: '#C43E1C' }, width: 12700 }
+    pic.dirtyStroke = true
+    addElement(slide, { kind: 'rect', offset: { ...OFF }, fillColor: '#112233' })
+    const picIndex = slide.elements.indexOf(pic)
+    expect(replacePictureBytes(opened, slide, pic.id, GIF_1PX, 'gif')).toBe(true)
+    expect(slide.elements.indexOf(pic)).toBe(picIndex)
+
+    const reopened = await openPptx(await savePptx(opened))
+    const els = reopened.deck.slides[0]!.elements
+    expect(els.findIndex((e) => e.type === 'picture')).toBe(picIndex)
+    const pic2 = els[picIndex] as PictureElement
+    expect(pic2.stroke?.fill).toEqual({ type: 'solid', color: '#C43E1C' })
+  })
+
+  it('drops a stale svgBlip extension and companion r:link', async () => {
+    const { opened, slide, pic } = await openWithPicture()
+    // Simulate an SVG picture inserted by Office 2016+: the blip carries a raster
+    // fallback (r:embed), an external link (r:link), and the svgBlip extension
+    const anchor = (pic as unknown as { anchor: { originalXml: string } }).anchor
+    anchor.originalXml = anchor.originalXml.replace(
+      /<a:blip r:embed="(rId\d+)"\s*\/>/,
+      '<a:blip r:embed="$1" r:link="rId99">' +
+        '<a:extLst><a:ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}">' +
+        '<asvg:svgBlip xmlns:asvg="http://schemas.microsoft.com/office/drawing/2016/SVG/main" r:embed="$1"/>' +
+        '</a:ext></a:extLst></a:blip>',
+    )
+    expect(anchor.originalXml).toContain('svgBlip')
+    expect(replacePictureBytes(opened, slide, pic.id, GIF_1PX, 'gif')).toBe(true)
+    expect(anchor.originalXml).not.toContain('svgBlip')
+    expect(anchor.originalXml).not.toContain('r:link')
+    expect(anchor.originalXml).toContain(`r:embed="rId`)
+    expect(anchor.originalXml).not.toContain('<a:extLst></a:extLst>')
+  })
+
+  it('unknown extension is rejected without touching the element', async () => {
+    const { opened, slide, pic } = await openWithPicture()
+    expect(replacePictureBytes(opened, slide, pic.id, GIF_1PX, 'exe')).toBe(false)
+    expect(pic.mediaRef).toBe('ppt/media/image1.png')
+  })
+})
+
 describe('patchElementStroke', () => {
   it('stroke color+width round-trips through save → reopen', async () => {
     const opened = await openPptx(fx('01_standard_business.pptx'))
@@ -74,6 +175,22 @@ describe('patchElementStroke', () => {
     const el2 = reopened.deck.slides[0]!.elements.at(-1) as TextElement
     expect(el2.stroke?.fill).toEqual({ type: 'solid', color: '#C43E1C' })
     expect(el2.stroke?.width).toBe(3 * 12700)
+  })
+
+  it('picture border round-trips through save → reopen', async () => {
+    const opened = await openPptx(await createBlankPptx())
+    const slide = opened.deck.slides[0]!
+    const pic = addPicture(opened, slide, { bytes: PNG_1PX, ext: 'png', offset: { ...OFF } })!
+    pic.stroke = { fill: { type: 'solid', color: '#C43E1C' }, width: 2 * 12700, dash: 'sysDot' }
+    pic.dirtyStroke = true
+
+    const reopened = await openPptx(await savePptx(opened))
+    const pic2 = reopened.deck.slides[0]!.elements.find(
+      (e) => e.type === 'picture',
+    ) as PictureElement
+    expect(pic2.stroke?.fill).toEqual({ type: 'solid', color: '#C43E1C' })
+    expect(pic2.stroke?.width).toBe(2 * 12700)
+    expect(pic2.stroke?.dash).toBe('sysDot')
   })
 
   it('null stroke writes explicit noFill, keeping other ln bytes', () => {
@@ -185,5 +302,90 @@ describe('setSlideBackground', () => {
 
     const reopened = await openPptx(await savePptx(opened))
     expect(reopened.deck.slides[0]!.background).toEqual({ type: 'solid', color: '#222222' })
+  })
+
+  it('gradient background round-trips through save → reopen', async () => {
+    const opened = await openPptx(await createBlankPptx())
+    const slide = opened.deck.slides[0]!
+    setSlideBackground(slide, {
+      stops: [
+        { pos: 0, color: '#FF0000' },
+        { pos: 1, color: '#0000FF' },
+      ],
+      angle: 90 * 60000,
+    })
+    expect(slide.background?.type).toBe('gradient')
+    expect(slide.bgOwn).toBe(true)
+
+    const reopened = await openPptx(await savePptx(opened))
+    const bg = reopened.deck.slides[0]!.background
+    expect(bg?.type).toBe('gradient')
+    if (bg?.type === 'gradient') {
+      expect(bg.stops.map((s) => s.color)).toEqual(['#FF0000', '#0000FF'])
+      expect(bg.angle).toBe(90 * 60000)
+    }
+    expect(reopened.deck.slides[0]!.bgOwn).toBe(true)
+  })
+
+  it('image background lands media + rel and round-trips', async () => {
+    const opened = await openPptx(await createBlankPptx())
+    const slide = opened.deck.slides[0]!
+    const used = setSlideBackgroundImage(opened, slide, { bytes: PNG_1PX, ext: 'png' })
+    expect(used).toBe('ppt/media/image1.png')
+    expect(slide.background).toEqual({
+      type: 'image',
+      mediaRef: 'ppt/media/image1.png',
+      mode: 'stretch',
+    })
+
+    const reopened = await openPptx(await savePptx(opened))
+    expect(reopened.deck.slides[0]!.background).toEqual({
+      type: 'image',
+      mediaRef: 'ppt/media/image1.png',
+      mode: 'stretch',
+    })
+  })
+
+  it('re-applying an existing media path adds no new media part (tile mode)', async () => {
+    const opened = await openPptx(await createBlankPptx())
+    const slide = opened.deck.slides[0]!
+    setSlideBackgroundImage(opened, slide, { bytes: PNG_1PX, ext: 'png' })
+    const used = setSlideBackgroundImage(opened, slide, { mediaPath: 'ppt/media/image1.png' }, true)
+    expect(used).toBe('ppt/media/image1.png')
+    const mediaParts = [...opened.archive.entries.keys()].filter((p) => p.startsWith('ppt/media/'))
+    expect(mediaParts).toEqual(['ppt/media/image1.png'])
+
+    const reopened = await openPptx(await savePptx(opened))
+    const bg = reopened.deck.slides[0]!.background
+    expect(bg?.type === 'image' && bg.mode).toBe('tile')
+  })
+
+  it('resetSlideBackground removes the override', async () => {
+    const opened = await openPptx(await createBlankPptx())
+    const slide = opened.deck.slides[0]!
+    setSlideBackground(slide, '#112233')
+    resetSlideBackground(opened, slide)
+    expect(slide.bgOwn).toBeUndefined()
+    expect(slide.bodyPrefix).not.toContain('<p:bg>')
+
+    const reopened = await openPptx(await savePptx(opened))
+    expect(reopened.deck.slides[0]!.bgOwn).toBeUndefined()
+    expect(reopened.deck.slides[0]!.originalXml).not.toContain('<p:bg>')
+  })
+
+  it('hide background graphics toggles <p:sld showMasterSp>', async () => {
+    const opened = await openPptx(await createBlankPptx())
+    setSlideBgGraphicsHidden(opened, opened.deck.slides[0]!, true)
+    expect(opened.deck.slides[0]!.masterSpHidden).toBe(true)
+
+    const reopened = await openPptx(await savePptx(opened))
+    const slide = reopened.deck.slides[0]!
+    expect(slide.masterSpHidden).toBe(true)
+
+    setSlideBgGraphicsHidden(reopened, slide, false)
+    expect(slide.masterSpHidden).toBeUndefined()
+    expect(slide.bodyPrefix).not.toContain('showMasterSp')
+    const reopened2 = await openPptx(await savePptx(reopened))
+    expect(reopened2.deck.slides[0]!.masterSpHidden).toBeUndefined()
   })
 })

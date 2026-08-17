@@ -22,6 +22,7 @@ import {
   readSections,
   readSectionSettings,
   saveDocx,
+  type Block,
   type CommentInfo,
   type DocProtection,
   type HeaderFooter,
@@ -69,6 +70,9 @@ export interface FileActionContext {
   saveInFlightRef: { current: boolean }
   saveIncompleteRef: { current: boolean }
   pendingMixedExportRef: { current: boolean | string }
+  /** the print dialog auto-opened the pagination preview: closing the dialog closes it again */
+  printAutoOpenedPreviewRef: { current: boolean }
+  setShowPrintDialog: (show: boolean) => void
   setStatus: (status: string) => void
   setRecent: (paths: string[]) => void
   setShowAi: (show: boolean) => void
@@ -165,6 +169,35 @@ export interface FileActionContext {
 
 /** Drop the undo stack: undo across an open/reparse boundary resurrects stale
  *  docxIndex anchors (corrupting the next save) or the previous document. */
+/**
+ * Comments with no anchor anywhere in the body (no marked run, no range
+ * markers, no reference in any block's XML) have neither a click target nor a
+ * margin bubble; open the panel so they are visible at all.
+ */
+export function hasUnanchoredComments(comments: CommentInfo[], blocks: Block[]): boolean {
+  if (comments.length === 0) return false
+  const anchored = new Set<string>()
+  for (const b of blocks) {
+    for (const id of [...(b.commentStarts ?? []), ...(b.commentEnds ?? [])]) anchored.add(id)
+    for (const r of b.runs ?? []) for (const id of r.commentIds ?? []) anchored.add(id)
+    for (const row of b.table?.rows ?? [])
+      for (const cell of row)
+        for (const p of cell.richParas ?? [])
+          for (const r of p.runs) for (const id of r.commentIds ?? []) anchored.add(id)
+    // bare w:commentReference on a text-less run never becomes a mark, but the
+    // margin bubble overlay anchors it to the block (margin-annotations.ts)
+    if (b.originalXml) {
+      for (const m of b.originalXml.matchAll(
+        /<w:comment(?:Reference|RangeStart)\b[^>]*w:id="([^"]+)"/g,
+      ))
+        anchored.add(m[1])
+    }
+  }
+  return comments.some(
+    (c) => !c.done && !anchored.has(c.id) && !(c.parentId && anchored.has(c.parentId)),
+  )
+}
+
 function resetEditorHistory(editor: Editor): void {
   const plugin = editor.state.plugins.find((p) =>
     String((p as unknown as { key: string }).key).startsWith('history$'),
@@ -181,8 +214,10 @@ export async function loadFile(
   if (!result || !ctx.editor) return
   try {
     const parsed = await parseDocx(new Uint8Array(result.data))
+    ctx.editor.storage.listNumbering.styles = parsed.styles
+    ctx.editor.storage.listNumbering.docDefaults = parsed.docDefaults
     ctx.editor.storage.listNumbering.defs = parsed.numbering
-    ctx.editor.commands.setContent(blocksToPmDoc(parsed.blocks) as never)
+    ctx.editor.commands.setContent(blocksToPmDoc(parsed.blocks, readSections(parsed)) as never)
     resetEditorHistory(ctx.editor)
     noteDocumentSwapped()
     ctx.setDoc({ parsed, filePath: result.path, fileName: result.name, hash: result.hash })
@@ -220,7 +255,7 @@ export async function loadFile(
     ctx.setEvenOddHf(parsed.evenAndOddHeaders ?? false)
     ctx.setEvenOddHfDirty(false)
     ctx.setHfView('default')
-    ctx.setShowComments(false)
+    ctx.setShowComments(hasUnanchoredComments(parsed.comments, parsed.blocks))
     ctx.setComments(parsed.comments)
     ctx.setCommentsDirty(false)
     ctx.setWatermark(parsed.watermarkText ?? null)
@@ -269,8 +304,10 @@ export async function newFile(ctx: FileActionContext): Promise<boolean | undefin
   try {
     const bytes = await buildBlankDocx({ eastAsiaFont: defaultEastAsiaFontFor(getLang()) })
     const parsed = await parseDocx(bytes)
+    ctx.editor.storage.listNumbering.styles = parsed.styles
+    ctx.editor.storage.listNumbering.docDefaults = parsed.docDefaults
     ctx.editor.storage.listNumbering.defs = parsed.numbering
-    ctx.editor.commands.setContent(blocksToPmDoc(parsed.blocks) as never)
+    ctx.editor.commands.setContent(blocksToPmDoc(parsed.blocks, readSections(parsed)) as never)
     resetEditorHistory(ctx.editor)
     noteDocumentSwapped()
     ctx.setDoc({ parsed, filePath: null, fileName: t('appUntitledDocx'), hash: '', isBlank: true })
@@ -606,8 +643,10 @@ async function saveOnce(ctx: FileActionContext, saveAs: boolean, auto: boolean):
     }
     // Reload from saved bytes so docxIndex anchors point at the new file.
     const reparsed = await parseDocx(bytes)
+    editor.storage.listNumbering.styles = reparsed.styles
+    editor.storage.listNumbering.docDefaults = reparsed.docDefaults
     editor.storage.listNumbering.defs = reparsed.numbering
-    const rebasedPm = blocksToPmDoc(reparsed.blocks)
+    const rebasedPm = blocksToPmDoc(reparsed.blocks, readSections(reparsed))
     let unchanged = false
     try {
       unchanged = editor.state.doc.eq(editor.schema.nodeFromJSON(rebasedPm))
@@ -705,6 +744,22 @@ async function saveOnce(ctx: FileActionContext, saveAs: boolean, auto: boolean):
   }
 }
 
+/**
+ * Print via the pagination preview so each printed sheet is exactly one editor page
+ * (WYSIWYG). Printing the continuous canvas instead would let Chromium auto-paginate:
+ * middle pages lose the per-page top/bottom margins and the breaks drift from the
+ * editor. Opens the Word-style print dialog (preview + range); the pagination
+ * preview is mounted (visually hidden behind the dialog) as its print source.
+ */
+export function printDoc(ctx: FileActionContext): void {
+  if (!ctx.doc) return
+  if (!document.querySelector('.pagination-preview')) {
+    ctx.printAutoOpenedPreviewRef.current = true
+    ctx.setShowPagePreview(true)
+  }
+  ctx.setShowPrintDialog(true)
+}
+
 export async function exportPdf(ctx: FileActionContext, outPath?: string): Promise<void> {
   const { doc } = ctx
   if (!doc) return
@@ -723,6 +778,21 @@ export async function exportPdf(ctx: FileActionContext, outPath?: string): Promi
       if (last && last.w === w && last.h === h) last.to = i
       else groups.push({ w, h, from: i, to: i })
     })
+    // Chromium's printToPDF can non-deterministically paint later pages blank
+    // when one job carries hundreds of heavy pages (large table clones on
+    // 100+-page forms). Chunk long documents through the group-merge path so
+    // each print job stays small.
+    const PRINT_CHUNK = 40
+    if (pvPages.length > 60) {
+      const chunked: typeof groups = []
+      for (const g of groups) {
+        for (let s = g.from; s <= g.to; s += PRINT_CHUNK) {
+          chunked.push({ w: g.w, h: g.h, from: s, to: Math.min(s + PRINT_CHUNK - 1, g.to) })
+        }
+      }
+      groups.length = 0
+      groups.push(...chunked)
+    }
     if (groups.length > 1) {
       const parts: string[] = []
       try {

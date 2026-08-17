@@ -41,12 +41,33 @@ export interface PendingNumbering {
 }
 
 export function hfFromPart(part: HfPartInfo | null | undefined): HeaderFooter | null {
-  if (!part || (!part.text && !part.hasPageNumber && part.paras.length === 0)) return null
+  // image-only parts (logo headers/footers) are not empty — the canvas path
+  // (hfHasVisibleContent) already counts images; keep both checks aligned
+  if (
+    !part ||
+    (!part.text && !part.hasPageNumber && part.paras.length === 0 && !part.images?.length)
+  )
+    return null
   return {
     text: part.text,
     pageNumber: part.hasPageNumber,
     paras: part.paras.length > 0 ? part.paras : undefined,
   }
+}
+
+/**
+ * Variant a resting canvas header/footer area shows (no variant chip picked):
+ * the header area sits on page 1 (titlePg -> first-page variant, blank when
+ * that part is absent — Word semantics), the footer area on the last page.
+ */
+export function restingHfAreaVariant(
+  kind: 'header' | 'footer',
+  opts: { titlePg: boolean; evenOddHf: boolean; pageCount: number; lastPageNo?: number },
+): HfView {
+  if (kind === 'header') return opts.titlePg ? 'first' : 'default'
+  if (opts.titlePg && opts.pageCount <= 1) return 'first'
+  if (opts.evenOddHf && (opts.lastPageNo ?? opts.pageCount) % 2 === 0) return 'even'
+  return 'default'
 }
 
 export function hfVariantsFromParsed(parsed: ParsedDocFull): HfVariantsState {

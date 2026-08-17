@@ -4,14 +4,16 @@
  * to avoid renderer CORS), search tools, and the slides-only ai:* channels
  * (image generation, media analysis, style templates).
  */
-import { app, ipcMain, shell } from 'electron'
+import { app, ipcMain, nativeImage, net, shell } from 'electron'
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   AiCreditsError,
   AiTimeoutError,
+  isAiNetworkError,
   defaultAiSettings,
   resolveAiSettings,
+  setRescueFetch,
   streamForProvider,
   type AiSettings,
   type AiStreamChunk,
@@ -30,10 +32,11 @@ import {
   gskLoginInfo,
   hasGskAuth,
 } from '@genoffice/ai-search'
-import { addPicture } from '@genoffice/pptx-engine'
+import { addPicture, editPictureSrcRect, replacePictureBytes } from '@genoffice/pptx-engine'
+import { coverCropFractions } from '../shared/cover-crop'
 import { EMU_PER_PX_96 } from '@genoffice/pptx-render'
 import { tm } from './i18n-main'
-import { pushHistory, rebuildSlide, sessions } from './session-state'
+import { pushHistory, rebuildSlide, scheduleHistoryNotify, sessions } from './session-state'
 
 // ---- AI settings + streaming proxy (the main process does the networking to avoid renderer CORS; implementation shared via @genoffice/ai-provider) ----
 
@@ -56,6 +59,9 @@ function writeJson(path: string, value: unknown): void {
 const activeAiStreams = new Map<string, AbortController>()
 
 export function registerAiIpc(): void {
+  // Node fetch (undici) direct connections get reset under VPN/tun setups; retry over Chromium's stack
+  setRescueFetch((url, init) => net.fetch(url, init))
+
   ipcMain.handle('ai:get-settings', (): AiSettings => {
     const stored = readJson<Partial<AiSettings> & LegacyAiSettings>(AI_SETTINGS_PATH(), {})
     return resolveAiSettings(stored, defaultAiSettings())
@@ -137,7 +143,9 @@ export function registerAiIpc(): void {
             ? { errorCode: 'timeout' as const }
             : err instanceof AiCreditsError
               ? { errorCode: 'credits' as const }
-              : {}),
+              : isAiNetworkError(err)
+                ? { errorCode: 'network' as const }
+                : {}),
         })
       }
     } finally {
@@ -265,11 +273,67 @@ export function registerSlidesOnlyAiIpc(): void {
         })
         if (!el) {
           session.undoStack.pop()
+          scheduleHistoryNotify(session)
           return null
         }
+        // The requested frame rarely matches the image's aspect ratio; never
+        // stretch — fill the frame and center-crop the overflow (object-fit:
+        // cover) so the layout box stays exactly where the model placed it.
+        const natural = nativeImage.createFromBuffer(buf).getSize()
+        const crop = coverCropFractions(natural.width, natural.height, op.wPx, op.hPx)
+        if (crop) editPictureSrcRect(slide, el.id, crop)
         session.fitWidthPx = op.fitWidthPx
         const rebuilt = rebuildSlide(session, op.slideIndex)
         return rebuilt ? { slide: rebuilt, sourceId: el.id } : null
+      } catch {
+        return null
+      }
+    },
+  )
+
+  // Download an image from a URL and swap it into an existing picture in place
+  // (frame/z-order/effects survive). Same URL hardening as ai:insert-image-url.
+  ipcMain.handle(
+    'ai:replace-picture-url',
+    async (e, op: { slideIndex: number; sourceId: string; url: string; keepSrcRect?: boolean }) => {
+      const session = sessions.get(e.sender.id)
+      if (!session) return null
+      const slide = session.opened.deck.slides[op.slideIndex]
+      if (!slide) return null
+      try {
+        const resp = await fetchRemoteImage(String(op.url))
+        if (!resp || !resp.ok) return null
+        const buf = Buffer.from(await resp.arrayBuffer())
+        const ct = resp.headers.get('content-type') ?? ''
+        const ext = ct.includes('png') ? 'png' : ct.includes('gif') ? 'gif' : 'jpg'
+        pushHistory(session)
+        const ok = replacePictureBytes(
+          session.opened,
+          slide,
+          String(op.sourceId),
+          new Uint8Array(buf),
+          ext,
+          op.keepSrcRect ? { keepSrcRect: true } : undefined,
+        )
+        if (!ok) {
+          session.undoStack.pop()
+          scheduleHistoryNotify(session)
+          return null
+        }
+        // A replacement with a different aspect ratio would be stretched into
+        // the surviving frame — center-crop it to cover the frame instead.
+        if (!op.keepSrcRect) {
+          const pic = slide.elements.find(
+            (el) => el.id === String(op.sourceId) && el.type === 'picture',
+          )
+          const frame = pic?.transform?.offset
+          if (frame) {
+            const natural = nativeImage.createFromBuffer(buf).getSize()
+            const crop = coverCropFractions(natural.width, natural.height, frame.cx, frame.cy)
+            if (crop) editPictureSrcRect(slide, String(op.sourceId), crop)
+          }
+        }
+        return rebuildSlide(session, op.slideIndex)
       } catch {
         return null
       }

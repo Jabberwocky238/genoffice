@@ -2,6 +2,11 @@ import { describe, expect, it } from 'vitest'
 
 import { loadWorkbookSkeleton, normalizeVisibleRange } from '../src/renderer/univer-sync'
 
+/// loadWorkbookSkeleton clears the unit's undo history through the injector.
+const undoStub = {
+  __getInjector: () => ({ get: () => ({ clearUndoRedo: () => undefined }) }),
+}
+
 describe('normalizeVisibleRange', () => {
   it('uses the initial viewport when Univer has no scroll range yet', () => {
     expect(normalizeVisibleRange(null, 14_516, 16)).toEqual({
@@ -59,10 +64,14 @@ describe('loadWorkbookSkeleton', () => {
       sheets: Record<string, { rowCount: number; columnCount: number }>
     }> = []
     const runtime = {
+      univer: undoStub,
       univerAPI: {
         getActiveWorkbook: () => null,
         disposeUnit: () => undefined,
-        createWorkbook: (config: (typeof created)[number]) => created.push(config),
+        createWorkbook: (config: (typeof created)[number]) => {
+          created.push(config)
+          return { getSheetBySheetId: () => null, setActiveSheet: () => undefined }
+        },
       },
     }
     const file = {
@@ -90,6 +99,50 @@ describe('loadWorkbookSkeleton', () => {
 
     expect(created[0]?.sheets['sheet-1']).toMatchObject({
       rowCount: 1000,
+      columnCount: 26,
+    })
+  })
+
+  it('preserves a file extent larger than the starter grid', () => {
+    const created: Array<{
+      sheets: Record<string, { rowCount: number; columnCount: number }>
+    }> = []
+    const runtime = {
+      univer: undoStub,
+      univerAPI: {
+        getActiveWorkbook: () => null,
+        disposeUnit: () => undefined,
+        createWorkbook: (config: (typeof created)[number]) => {
+          created.push(config)
+          return { getSheetBySheetId: () => null, setActiveSheet: () => undefined }
+        },
+      },
+    }
+    const file = {
+      sha256: 'large',
+      name: 'Large.xlsx',
+      visuals: [],
+      sheets: [
+        {
+          id: 'sheet-1',
+          name: 'Sheet1',
+          rowCount: 1004,
+          columnCount: 13,
+          hidden: false,
+          showGridLines: true,
+          tabColor: null,
+          defaultRowHeight: null,
+          defaultColumnWidth: null,
+          freeze: null,
+          columnWidths: [],
+        },
+      ],
+    }
+
+    loadWorkbookSkeleton(runtime as never, file as never)
+
+    expect(created[0]?.sheets['sheet-1']).toMatchObject({
+      rowCount: 1004,
       columnCount: 26,
     })
   })

@@ -29,15 +29,27 @@ export interface Run {
   sizeHalfPoints?: number
   /** primary font family (w:rFonts, eastAsia ?? ascii ?? hAnsi) */
   font?: string
+  /** `font` is a backfill for an empty EA theme slot (<a:ea typeface=""/>), not a document choice
+   * (display keeps the Word-look face; line metrics follow the theme's Latin face like LO) */
+  eaSlotEmpty?: boolean
   /** Latin-slot font (w:rFonts ascii/hAnsi) when the run declares one; may equal `font`.
    * Kept separate so editing one script's font never flattens the other slot. */
   fontAscii?: string
+  /** Complex-script font (w:rFonts cs/cstheme). Display only; saving is kept faithful by rawRPr */
+  csFont?: string
   /** Character spacing (w:spacing, twips, may be negative). Display only; saving is kept faithful by rawRPr */
   charSpacingTwips?: number
+  /** w:caps ('all') / w:smallCaps ('small') display transform. Display only; saving is kept faithful by rawRPr */
+  caps?: 'all' | 'small'
   /** Horizontal character scale percent (w:w). Display only (approximated as spacing); saving is kept faithful by rawRPr */
   charScalePct?: number
   /** OOXML named highlight color (w:highlight), e.g. "yellow" */
   highlight?: string
+  /** character shading fill, hex without '#' (w:shd w:fill, non-auto); highlight wins when both are set */
+  shading?: string
+  /** rtl run (explicit w:rtl, or inherited from its style chain): bold/italic/size
+   * were read from the Cs twins (w:bCs/w:iCs/w:szCs) */
+  cs?: boolean
   /** superscript / subscript (w:vertAlign) */
   vertAlign?: 'superscript' | 'subscript'
   /** East Asian emphasis mark (w:em). Display only; saving is kept faithful by rawRPr */
@@ -74,6 +86,9 @@ export interface Run {
   refInstr?: string
   /** Generic inline field (DATE/TIME/NUMPAGES/FILENAME etc.): full instruction text; run text is the cached result */
   instrField?: string
+  /** Original field-begin run XML (w:fldChar + w:ffData), written back verbatim so form-field
+   * definitions survive; when set, the run text is a synthesized glyph (☐/☒), not a cached result */
+  fldBeginXml?: string
   /**
    * Run-level formatting revision (w:rPrChange): records the review info and the modeled
    * subset of the pre-revision formatting. Accept = keep the current formatting and clear
@@ -108,6 +123,22 @@ export interface Run {
    * and emitted verbatim when the paragraph regenerates.
    */
   ruby?: { rt: string; xml: string }
+  /**
+   * Picture carried by this run (table cell, or a paragraph mixing text and
+   * pictures). `dataUrl` is for display; `xml` is the exact <w:drawing>
+   * fragment, re-wrapped in a w:r and emitted verbatim on regeneration.
+   * `wrap`/offsets are display-only anchor geometry of a floating picture
+   * (wp:anchor); absent = inline.
+   */
+  image?: {
+    dataUrl: string
+    widthPx?: number
+    heightPx?: number
+    xml: string
+    wrap?: ImageWrap
+    offsetXEmu?: number
+    offsetYEmu?: number
+  }
 }
 
 /** One comment from word/comments.xml (read-only display model). */
@@ -174,6 +205,14 @@ export interface TabStop {
   leader?: 'none' | 'dot' | 'hyphen' | 'underscore' | 'heavy' | 'middleDot'
 }
 
+/** Declared look of one w:pBdr side. */
+export interface ParaBorderLine {
+  /** hex without '#' (w:color); undefined = auto */
+  color?: string
+  /** line width in pt (w:sz eighth-points / 8) */
+  szPt?: number
+}
+
 /** Paragraph-level formatting that survives regeneration (subset of w:pPr). */
 export interface ParaFormat {
   /** w:jc */
@@ -208,12 +247,18 @@ export interface ParaFormat {
   keepLines?: boolean
   /** widow/orphan control (w:widowControl; Word default=true) */
   widowControl?: boolean
+  /** snap lines to the section docGrid (w:snapToGrid; default on) — false only when explicitly off */
+  snapToGrid?: boolean
+  /** CJK-Latin/digit auto spacing (w:autoSpaceDE/DN; Word default=true); false when both are explicitly off */
+  autoSpace?: boolean
   /** ignore space-after when followed by same-style para (w:contextualSpacing) */
   contextualSpacing?: boolean
   /** paragraph shading fill, hex without '#' (w:shd w:fill) */
   shadingFill?: string
   /** paragraph borders, subset of "tblr" e.g. "b" or "tblr" (w:pBdr, single lines) */
   borders?: string
+  /** per-side color/width of `borders` (w:color / w:sz); side absent = auto color, default width */
+  borderLines?: Partial<Record<'t' | 'b' | 'l' | 'r', ParaBorderLine>>
   /** custom tab stops from w:tabs (non-empty overrides default 0.5in grid) */
   tabStops?: TabStop[]
   /** first-line drop cap (w:framePr w:dropCap="drop|margin") */
@@ -224,6 +269,12 @@ export interface ParaFormat {
    * visual direction and writing back converts again.
    */
   bidi?: boolean
+  /**
+   * w:sz (half-points) governing a run-less paragraph's line height: the
+   * paragraph-mark rPr, else the last (dropped) empty run's rPr. Set only when
+   * the paragraph has no runs, so empty lines keep their Word height.
+   */
+  emptyRunSizeHalfPoints?: number
 }
 
 /**
@@ -289,21 +340,46 @@ export interface SectionInfo {
 
 /** one rich paragraph of a header / footer part */
 export interface HfParagraph extends ParaFormat {
+  /** w:framePr w:xAlign — text frame floated at the margin edge; the line
+   *  overlays the following paragraph's flow line instead of stacking (Word) */
+  frameXAlign?: 'left' | 'center' | 'right'
+  /** w:ptab alignments indexed by overall tab order (regular w:tab slots are undefined); margin-relative, ignores tab stops */
+  ptabAligns?: Array<'left' | 'center' | 'right' | undefined>
   runs: Run[]
+  /** layout-table row: one entry per cell, rendered as columns. Display-only —
+   *  saving keeps the part's original w:tbl bytes and never serializes cells. */
+  cells?: HfTableCell[]
+}
+
+/** one cell of a header/footer layout-table row */
+export interface HfTableCell {
+  /** cell paragraphs, each rendered as its own block line (Word stacks them) */
+  paras: Run[][]
+  align?: ParaAlign
+  /** column width as % of the row (w:tcW, falling back to tblGrid) */
+  widthPct?: number
+  /** cell shading fill (w:tcPr w:shd w:fill hex, non-auto) */
+  fill?: string
 }
 
 /** one w:lvl of a numbering definition */
 export interface NumberingLevel {
   /** w:numFmt, e.g. "decimal" | "bullet" | "lowerLetter" | "upperRoman" | "chineseCountingThousand" */
   numFmt: string
+  /** w14 custom numFmt enumeration (numFmt "custom"), e.g. "α, β, γ, ..." */
+  customFormat?: string
   /** w:lvlText, e.g. "%1." or "%1.%2" (placeholders %n = counter of level n-1) or a bullet glyph */
   lvlText: string
   /** w:start, default 1 */
   start: number
+  /** w:suff — what follows the marker (Word default: tab up to the hanging edge) */
+  suff?: 'tab' | 'space' | 'nothing'
   /** w:pPr/w:ind left (twips); fallback geometry for items without their own w:ind */
   indentLeft?: number
   /** w:pPr/w:ind hanging (twips): width reserved for the number/bullet marker */
   hanging?: number
+  /** w:pPr/w:ind positive firstLine (twips): the marker starts right of the text indent */
+  firstLine?: number
   /** w:rPr/w:sz of the marker itself (half-points) */
   szHalfPoints?: number
   /** w:rPr/w:rFonts of the marker (bullet glyphs in Symbol/Wingdings need decoding) */
@@ -328,27 +404,48 @@ export interface HeaderFooter {
   pageNumber?: boolean
   /**
    * Rich paragraphs; when present they are the content source of truth and
-   * the part regenerates one w:p per entry ('#' in a run text becomes the
-   * PAGE field when pageNumber is set). Absent = legacy single centered line.
+   * the part regenerates one w:p per entry (PAGE_MARK \u2014 or a user-typed '#'
+   * when no PAGE_MARK exists \u2014 becomes the PAGE field when pageNumber is
+   * set). Absent = legacy single centered line.
    */
   paras?: HfParagraph[]
 }
 
-/** Placeholder for NUMPAGES (total pages) fields in headers/footers; the renderer substitutes the total page count and saving writes the field back (PAGE uses '#' the same way) */
+/** Placeholder for NUMPAGES (total pages) fields in headers/footers; the renderer substitutes the total page count and saving writes the field back (PAGE uses PAGE_MARK the same way) */
 export const TOTAL_PAGES_MARK = '\uE000'
+/** Placeholder for PAGE fields in headers/footers; a private-use character so literal '#' text in the part can never be mistaken for the field position */
+export const PAGE_MARK = '\uE001'
 
 /** display-only image in a header/footer part (logos etc.; saving preserves the part's bytes) */
 export interface HfImage {
   dataUrl: string
   widthPx?: number
   heightPx?: number
-  /** wp:anchor floating (otherwise inline) */
+  /** wp:anchor floating / VML position:absolute (otherwise inline) */
   floating?: boolean
+  /** behind body text (negative VML z-index / wp:anchor behindDoc): picture watermarks */
+  behind?: boolean
+  /** VML mso-position-horizontal / wp:positionH wp:align */
+  posH?: 'left' | 'center' | 'right'
+  /** VML mso-position-vertical / wp:positionV wp:align */
+  posV?: 'top' | 'center' | 'bottom'
+  /** wp:positionH wp:posOffset (px); origin per posHRel */
+  posXPx?: number
+  /** wp:positionV wp:posOffset (px); origin per posVRel */
+  posYPx?: number
+  /** wp:positionH relativeFrom: offsets measure from the page edge or the margin box */
+  posHRel?: 'page' | 'margin'
+  /** wp:positionV relativeFrom */
+  posVRel?: 'page' | 'margin'
+  /** v:imagedata gain/blacklevel present (Word watermark washout preset) */
+  washout?: boolean
+  /** w:jc of the containing paragraph (inline images follow paragraph alignment) */
+  align?: 'left' | 'center' | 'right'
 }
 
 /** Parsed content of one header/footer part (any w:type variant). */
 export interface HfPartInfo {
-  /** plain text, PAGE fields shown as '#', NUMPAGES as TOTAL_PAGES_MARK */
+  /** plain text, PAGE fields shown as PAGE_MARK, NUMPAGES as TOTAL_PAGES_MARK */
   text: string
   hasPageNumber: boolean
   paras: HfParagraph[]
@@ -366,6 +463,8 @@ export interface NoteRun {
   /** hex without '#' */
   color?: string
   sizeHalfPoints?: number
+  /** w:caps ('all') / w:smallCaps ('small') display transform */
+  caps?: 'all' | 'small'
 }
 
 /** One footnote or endnote (display/edit model; separators are preserved separately). */
@@ -422,6 +521,8 @@ export interface ChartDisplay {
   /** zip path of the chart part this model was read from */
   partPath: string
   kind: 'bar' | 'line' | 'pie' | 'area' | 'other'
+  /** bar charts: c:barDir="bar" (horizontal bars); default is column direction */
+  horizontal?: boolean
   /** chart title; undefined when the chart has no title part (then not editable) */
   title?: string
   categories: string[]
@@ -429,6 +530,43 @@ export interface ChartDisplay {
   /** display size (from wp:extent), editable via the corner resize handle */
   widthPx?: number
   heightPx?: number
+}
+
+/** One SmartArt shape from the precomputed diagram drawing part (dsp:sp), in px */
+export interface DiagramShape {
+  xPx: number
+  yPx: number
+  wPx: number
+  hPx: number
+  /** a:prstGeom preset (roundRect/ellipse/...); rendering approximates by radius */
+  prst?: string
+  /** solid fill (hex without '#') */
+  fillHex?: string
+  /** picture fill (a:blipFill) */
+  imageDataUrl?: string
+  /** a:stretch/a:fillRect fractions of the picture fill (negative = bleed) */
+  fillRect?: { l: number; t: number; r: number; b: number }
+  /** paragraph texts of the shape's txBody */
+  texts?: string[]
+  fontSizePt?: number
+  textColorHex?: string
+  /** rotation in degrees (a:xfrm rot / 60000) */
+  rotDeg?: number
+}
+
+/** SmartArt display-only degrade from diagrams/drawingN.xml (Word's resolved layout) */
+export interface DiagramDisplay {
+  widthPx: number
+  heightPx: number
+  shapes: DiagramShape[]
+  /** anchored-drawing offset of the diagram's own wp:anchor (EMU) */
+  offsetXEmu?: number
+  offsetYEmu?: number
+  /** wrapNone/behind/front anchor (or sharing a paragraph with other drawings): leaves the flow like Word */
+  floating?: boolean
+  /** drawing-canvas display (lockedCanvas): text renders at its raw font size
+   *  and overflows the scaled child geometry instead of clipping (LO behavior) */
+  canvas?: boolean
 }
 
 /** A new chart to embed at save time (becomes word/charts/chartN.xml + relationship). */
@@ -442,6 +580,8 @@ export interface NewChart {
 /** Editable interchange model of one table cell (type === 'table' blocks). */
 export interface TableParagraph extends ParaFormat {
   runs: Run[]
+  /** w:pStyle of the cell paragraph (style CSS: fonts/spacing reach cell content) */
+  styleId?: string
   /** list paragraph inside the cell (w:numPr) */
   list?: { kind: 'bullet' | 'ordered'; numId: string; ilvl: number }
 }
@@ -486,6 +626,10 @@ export interface TableCell {
   cellMarTwips?: CellMargins
   /** nested tables inside this cell (shown as read-only sub-tables; bytes kept faithful by the outer table) */
   nestedTables?: TableModel[]
+  /** anchored shapes/textboxes inside cell paragraphs (display-only; Word grows the row to hold them) */
+  anchoredBoxes?: TextboxDisplay[]
+  /** per nested table: how many cell paragraphs precede it (reading-order anchor); absent = after all paragraphs */
+  nestedTableAnchors?: number[]
   colSpan?: number
   /** 'restart' opens a vertical merge, 'continue' is a merged-away cell */
   vMerge?: 'restart' | 'continue'
@@ -519,6 +663,8 @@ export interface TableModel {
   colWidthsTwips?: number[]
   /** table width as a percentage of the body width (w:tblW type="pct"); absolute widths are ignored when set */
   widthPct?: number
+  /** autofit layout (w:tblW auto/absent/zero, no fixed w:tblLayout): display may widen columns to min-content */
+  autoLayout?: boolean
   /** table-level default cell margins (w:tblCellMar) */
   cellMarTwips?: CellMargins
   /** table-level borders (w:tblBorders); undefined = not declared (default gridlines apply) */
@@ -529,6 +675,8 @@ export interface TableModel {
   indentTwips?: number
   /** per-row height (twips, w:trHeight; null = not set), aligned with rows */
   rowHeightsTwips?: Array<number | null>
+  /** per-row height rule (w:trHeight w:hRule; absent/legacy models = atLeast), aligned with rows */
+  rowHeightRules?: Array<'atLeast' | 'exact' | null>
   /** per-row raw <w:trPr>…</w:trPr> bytes (passed through verbatim), aligned with rows */
   rawTrPrs?: Array<string | null>
   /** row-level revisions (trPr w:ins/w:del = inserted/deleted row), aligned with rows */
@@ -606,6 +754,11 @@ export interface NewImage {
   align?: 'left' | 'center' | 'right'
   /** floating wrap mode; absent = inline */
   wrap?: ImageWrap
+  /** rotation in degrees clockwise (a:xfrm rot) */
+  rotDeg?: number
+  /** mirror flips (a:xfrm flipH/flipV) */
+  flipH?: boolean
+  flipV?: boolean
 }
 
 export type BlockType = 'paragraph' | 'heading' | 'listItem' | 'table' | 'image' | 'passthrough'
@@ -657,6 +810,10 @@ export interface Block {
   /** display size from wp:extent in CSS px (type === 'image') */
   imageWidthPx?: number
   imageHeightPx?: number
+  /** source crop (a:srcRect) as fractions of the source picture (display-only) */
+  imageCrop?: { l: number; t: number; r: number; b: number }
+  /** fill placement (a:stretch/a:fillRect) as fractions of the shape box; negative = bleed (display-only) */
+  imageFillRect?: { l: number; t: number; r: number; b: number }
   /** paragraph alignment of the image (w:jc) */
   imageAlign?: 'left' | 'center' | 'right'
   /** text wrapping of a floating image (wp:anchor); absent = inline (in line with text) */
@@ -672,6 +829,11 @@ export interface Block {
   /** margin-relative wp:align of a floating image (Word position-gallery presets) */
   imagePosH?: 'left' | 'center' | 'right'
   imagePosV?: 'top' | 'center' | 'bottom'
+  /** picture rotation in degrees clockwise 0-359 (pic a:xfrm rot / 60000) */
+  imageRotDeg?: number
+  /** picture mirror flips (pic a:xfrm flipH/flipV) */
+  imageFlipH?: boolean
+  imageFlipV?: boolean
   /** editable structure (type === 'table'); untouched original XML still saves byte-identically */
   table?: TableModel
   /** display-only rendering for field passthrough paragraphs (TOC lines etc.) */
@@ -680,12 +842,30 @@ export interface Block {
   hidden?: boolean
   /** protected drawing that is just a decorative rule; render as a line, not a chip */
   decorative?: boolean
+  /** stroke display of a decorative rule (a:ln); absent = default 1px full-width line */
+  ruleColorHex?: string
+  ruleThicknessPx?: number
+  ruleWidthPx?: number
+  /** picture whose rel/media is broken (or metafile-only): render an empty frame + alt text */
+  brokenImage?: boolean
+  /**
+   * Invisible range marker leaked to body top level (w:bookmarkEnd, w:proofErr…):
+   * renders as nothing but keeps its body position. Not `hidden` — hidden blocks
+   * are moved to the body tail on save, which would relocate the marker.
+   */
+  invisibleMarker?: boolean
   /** display-only content of anchored textboxes (code boxes, callouts) */
   textboxes?: TextboxDisplay[]
+  /** the anchor paragraph's own text runs next to content textboxes (display-only) */
+  strayRuns?: Run[]
+  /** w:pStyle of the anchor paragraph; styles strayRuns via data-style */
+  strayStyleId?: string
   /** text tokens of an OMML formula, in document order */
   formulaDisplay?: FormulaDisplay
   /** display/edit model of an embedded chart (set on chart-labeled blocks) */
   chartDisplay?: ChartDisplay
+  /** display-only SmartArt degrade from the precomputed diagram drawing part */
+  diagramDisplay?: DiagramDisplay
   /**
    * When this block was wrapped in a w:sdt (structured document tag), the
    * original sdtPr + shell bytes are stored here for save-time re-wrapping.
@@ -722,6 +902,8 @@ export interface Block {
 
 /** one paragraph inside an anchored textbox */
 export interface TextboxParaDisplay extends ParaFormat {
+  /** w:pStyle id, rendered as data-style so the document style CSS applies */
+  styleId?: string
   runs: Run[]
 }
 
@@ -759,6 +941,12 @@ export interface TextboxDisplay {
    * This field is display-only; it is never written to OOXML.
    */
   wordArtId?: string
+  /** text outline of imported VML WordArt (v:textpath strokecolor), display-only */
+  textOutline?: { colorHex: string; widthPx: number }
+  /** single-line content (WordArt strings never wrap) */
+  nowrap?: boolean
+  /** vertical anchoring of the text body (wps:bodyPr anchor="ctr|b"), display-only */
+  vAlign?: 'center' | 'bottom'
   /**
    * Content holds tables / content controls flattened into display lines, so
    * paras do not map 1:1 onto the w:txbxContent w:p children the patch-save
@@ -767,6 +955,31 @@ export interface TextboxDisplay {
    */
   readOnly?: boolean
   paras: TextboxParaDisplay[]
+  /** this box's own wp:anchor offset (EMU); with `floating`, the box positions
+   *  absolutely at the offset from the paragraph's flow origin */
+  offsetXEmu?: number
+  offsetYEmu?: number
+  /** wrapNone/behind/front anchors — or any anchored shape sharing its
+   *  paragraph with other drawings — leave the flow like Word (absolute
+   *  position, no flow height) instead of stacking as blocks */
+  floating?: boolean
+  /** rotation in degrees clockwise (a:xfrm rot / 60000) */
+  rotDeg?: number
+  /** border width in CSS px (a:ln w) */
+  borderWidthPx?: number
+  /** dashed/dotted border (a:prstDash) */
+  borderDash?: 'dashed' | 'dotted'
+  /** picture fill (a:blipFill in the shape properties, or a pic:pic photo
+   *  sharing a multi-drawing paragraph), as a data URL */
+  fillImageDataUrl?: string
+  /** tile the picture fill (a:tile) instead of stretching it */
+  fillTile?: boolean
+  /** straight connector with a real vertical extent: drawn corner-to-corner
+   *  instead of as a level rule (flips pick the diagonal) */
+  lineDiag?: boolean
+  /** a:xfrm flipH/flipV (connector direction) */
+  flipH?: boolean
+  flipV?: boolean
 }
 
 /** Final body content decided by the editor at save time. */
@@ -813,13 +1026,28 @@ export interface StyleDisplay {
   color?: string
   bold?: boolean
   italic?: boolean
+  /** Cs twins (w:bCs/w:iCs/w:szCs): the set rtl runs read instead of bold/italic/
+   * sizeHalfPoints (probed, no cross-fallback) — select via styleRunFormat */
+  boldCs?: boolean
+  italicCs?: boolean
+  sizeCsHalfPoints?: number
+  /** style rPr w:rtl: inherited rtl for runs without their own flag */
+  rtl?: boolean
   underline?: boolean
   strike?: boolean
   font?: string
   /** latin-slot font when it differs from the east-asian one (w:ascii/w:hAnsi) */
   fontAscii?: string
+  /** the EA face is a backfill for an empty theme slot (<a:ea typeface=""/>), not a document choice */
+  eaSlotEmpty?: boolean
+  /** complex-script font (w:rFonts cs/cstheme) */
+  csFont?: string
   /** character spacing (rPr w:spacing, twips, may be negative) */
   charSpacingTwips?: number
+  /** style-level pPr w:tabs (Word's built-in Header/Footer styles carry the center/right stops) */
+  tabStops?: TabStop[]
+  /** w:caps ('all') / w:smallCaps ('small') display transform */
+  caps?: 'all' | 'small'
   /** multiple of single line spacing (w:spacing w:line, lineRule auto) */
   lineSpacing?: number
   /** F1: lineRule for accurate height calculation */
@@ -836,18 +1064,30 @@ export interface StyleDisplay {
   keepNext?: boolean
   /** keepLines from style definition */
   keepLines?: boolean
+  /** pageBreakBefore from style definition */
+  pageBreakBefore?: boolean
   /** F1: contextualSpacing from style definition */
   contextualSpacing?: boolean
   /** paragraph alignment from the style (w:pPr w:jc) */
   align?: 'left' | 'center' | 'right' | 'justify'
+  /** CJK-Latin/digit auto spacing from the style pPr (w:autoSpaceDE/DN) */
+  autoSpace?: boolean
+  /** style-level w:vanish (hidden text, e.g. z-TopofForm/z-BottomofForm HTML form markers) */
+  vanish?: boolean
 }
 
 /** display-only formatting a table style contributes (fills applied per tblLook flags) */
 export interface TableStyleDisplay {
   /** whole-table cell shading (hex without '#') */
   fill?: string
+  /** whole-table run formatting (style-level w:rPr) */
+  wholeTable?: { color?: string; bold?: boolean }
   /** conditional first-row formatting (w:tblStylePr w:type="firstRow") */
   firstRow?: { fill?: string; bold?: boolean; color?: string }
+  /** conditional first/last-column and last-row formatting (w:tblStylePr) */
+  firstCol?: { fill?: string; bold?: boolean; color?: string }
+  lastCol?: { fill?: string; bold?: boolean; color?: string }
+  lastRow?: { fill?: string; bold?: boolean; color?: string }
   /** odd-band row shading (band1Horz) */
   band1Fill?: string
   /** even-band row shading (band2Horz) */
@@ -882,8 +1122,9 @@ export interface StyleInfo {
   display?: StyleDisplay
   /** table-style rendering hints (type === 'table') */
   tableDisplay?: TableStyleDisplay
-  /** w:pPr/w:numPr on the style — list numbering referenced via pStyle (ListBullet/ListNumber) */
-  numPr?: { numId: string; ilvl: number }
+  /** w:pPr/w:numPr on the style — list numbering referenced via pStyle (ListBullet/ListNumber);
+   *  'none' = explicit w:numId 0 (cancels numbering inherited via basedOn) */
+  numPr?: { numId: string; ilvl: number } | 'none'
   /** w:default="1" — Word applies this style to every paragraph without a w:pStyle */
   isDefault?: boolean
 }
@@ -895,6 +1136,8 @@ export interface DocDefaults {
   asciiFont?: string
   /** default Chinese font (rPrDefault w:rFonts w:eastAsia) — determines the CJK line-height factor */
   eastAsiaFont?: string
+  /** eastAsiaFont is a lang-based backfill for an empty theme slot, not a document choice */
+  eaSlotEmpty?: boolean
   /** bold/italic/color from rPrDefault (display-layer defaults, used by canvas CSS) */
   bold?: boolean
   italic?: boolean
@@ -956,6 +1199,8 @@ export interface ThemeFonts {
   /** a:majorFont / a:minorFont a:cs typefaces (complex script), optional */
   majorCs?: string
   minorCs?: string
+  /** settings.xml w:themeFontLang w:eastAsia — picks Word's face for empty EA theme slots */
+  eaLang?: string
 }
 
 /** Color scheme values (hex without '#') from a:clrScheme. */
@@ -996,7 +1241,7 @@ export interface ParsedDoc {
   protection: DocProtection | null
   /** plain text of the default page header, null when the document has none */
   headerText?: string | null
-  /** rich paragraphs of the default header (PAGE fields appear as '#' runs) */
+  /** rich paragraphs of the default header (PAGE fields appear as PAGE_MARK runs) */
   headerParas?: HfParagraph[] | null
   /** rich paragraphs of the default footer */
   footerParas?: HfParagraph[] | null
@@ -1005,7 +1250,7 @@ export interface ParsedDoc {
   footerImages?: HfImage[] | null
   /** text watermark (VML textpath) in the default header, null when none */
   watermarkText?: string | null
-  /** plain text of the default page footer (PAGE fields appear as "#") */
+  /** plain text of the default page footer (PAGE fields appear as PAGE_MARK) */
   footerText?: string | null
   /** the default footer contains an automatic page number field */
   footerHasPageNumber?: boolean
@@ -1015,6 +1260,8 @@ export interface ParsedDoc {
   titlePg?: boolean
   /** "different odd & even pages" (settings.xml w:evenAndOddHeaders) */
   evenAndOddHeaders?: boolean
+  /** settings.xml compatSetting compatibilityMode (0 when absent; >=15 = Word 2013+ layout) */
+  compatibilityMode?: number
   /** first-page header/footer parts (w:type="first"), null when absent */
   headerFirst?: HfPartInfo | null
   footerFirst?: HfPartInfo | null

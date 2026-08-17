@@ -1,5 +1,5 @@
 export * from './types'
-export { parseDocx, type ParseExtras } from './parse'
+export { parseDocx, styleRunFormat, type ParseExtras } from './parse'
 export {
   saveDocx,
   findChartWorkbookPath,
@@ -93,5 +93,14 @@ export {
 export { bibliographyLine, citationText, parseSourcesXml } from './sources'
 export { readThemeColors, readThemeFonts } from './theme'
 export { hashProtectionPassword, verifyProtectionPassword } from './protection'
-export { decodeSymbolChar, decodeSymbolText, isSymbolFont } from './symbol-fonts'
-export { computeListMarkers, formatNumber, type ListItemRef } from './list-markers'
+export { decodeSymbolChar, decodeSymbolText, isSymbolFont, toSymbolPua } from './symbol-fonts'
+export {
+  bulletMarkerScale,
+  computeListMarkerInfos,
+  computeListMarkers,
+  customEnumItems,
+  formatNumber,
+  markerTabAdvance,
+  type ListItemRef,
+  type ListMarkerInfo,
+} from './list-markers'

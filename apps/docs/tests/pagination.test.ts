@@ -3,6 +3,7 @@ import type { SectionInfo } from '@genoffice/docx-engine'
 import {
   appendEndnotesBlock,
   assignSections,
+  cellCutYs,
   computePageSlices,
   computeSectionedSlices,
   computeSectionedSlicesF2,
@@ -16,6 +17,8 @@ import {
   pageNumbers,
   pageStartBlocks,
   applyBlockMeta,
+  fillLineBoxes,
+  measureBlocks,
   sectionFirstPages,
   sectionGeoms,
   sectionPageBox,
@@ -564,6 +567,17 @@ describe('computeSectionedSlicesF2 — line-level pagination', () => {
     expect(slices[1].start).toBe(150) // mainBlock pushed down whole; new page starts at top=150
   })
 
+  it('widowControl: gives up one line at the page bottom so the next page gets 2 lines', () => {
+    // Page height 300; 150px used → exactly 3 of 4 lines fit → a naive split leaves a 1-line widow
+    // Word takes one line back: 2 lines stay, 2 go to the next page (no whole-paragraph push)
+    const beforeBlock = lineBlock(0, [50, 50, 50])
+    const mainBlock = lineBlock(150, [50, 50, 50, 50], { widowControl: true })
+    const geoms = [{ contentHeight: 300, forceBreak: false }]
+    const slices = computeSectionedSlicesF2([beforeBlock, mainBlock], geoms, 350)
+    expect(slices.length).toBe(2)
+    expect(slices[1].start).toBe(250) // 2+2 split; a whole push would start at 150
+  })
+
   it('widowControl=false: a single line may remain at the page bottom', () => {
     const beforeBlock = lineBlock(0, [50, 50, 50]) // 150px
     const mainBlock = lineBlock(150, [50, 50, 50, 50], { widowControl: false }) // 200px
@@ -589,6 +603,30 @@ describe('computeSectionedSlicesF2 — line-level pagination', () => {
     expect(() => computeSectionedSlicesF2([b], geoms1, 300)).not.toThrow()
   })
 
+  it('keepLines without line data taller than a page terminates with hard cuts', () => {
+    // First slicing pass has no lineBoxes yet; a keepLines paragraph taller
+    // than the page used to re-test its full height after every column turn
+    // and loop forever (form-gov renderer hang).
+    const b = block(0, 1000, { keepLines: true })
+    const slices = computeSectionedSlicesF2([b], geoms1, 1000)
+    expect(slices.length).toBe(5) // 1000px / 200px pages
+    expect(slices[0].start).toBe(0)
+    expect(slices[slices.length - 1].end).toBe(1000)
+    // pages advance monotonically
+    for (let i = 1; i < slices.length; i++) {
+      expect(slices[i].start).toBeGreaterThan(slices[i - 1].start)
+    }
+  })
+
+  it('keepLines without line data on a partly used page fills the remainder then hard-cuts', () => {
+    const before = block(0, 150)
+    const b = block(150, 500, { keepLines: true })
+    const slices = computeSectionedSlicesF2([before, b], geoms1, 650)
+    // 50px fills page 1 (matches the _hardCutLines policy), then 200px cuts
+    expect(slices.map((s) => s.start)).toEqual([0, 200, 400, 600])
+    expect(slices[slices.length - 1].end).toBe(650)
+  })
+
   it('keepNext: chain head stays on the same page as the first line of the next paragraph', () => {
     // Block A (100px keepNext) + block B (100px) — page height 200
     // 120px of the page is used; A alone fits (100px → 220px > 200), but A + B's first line must share a page
@@ -611,6 +649,99 @@ describe('computeSectionedSlicesF2 — line-level pagination', () => {
     // b has breakBefore; even with a's keepNext, a page break is forced before b
     expect(slices.length).toBe(2)
     expect(slices[1].start).toBe(100)
+  })
+
+  it("keepNext on the document's last block places normally (POI headerPic: lone keepNext paragraph crashed)", () => {
+    const only = block(0, 100, { keepNext: true })
+    const slices = computeSectionedSlicesF2([only], geoms1, 100)
+    expect(slices.length).toBe(1)
+    expect(slices[0].end).toBe(100)
+
+    const a = block(0, 100)
+    const last = block(100, 100, { keepNext: true })
+    const two = computeSectionedSlicesF2([a, last], geoms1, 200)
+    expect(two[two.length - 1].end).toBe(200)
+  })
+
+  it('keepNext+keepLines heading at the page bottom moves with the next paragraph', () => {
+    // Word Heading styles carry both flags; the chain decides the push even when
+    // the heading alone would fit at the page bottom.
+    const before = block(0, 120)
+    const heading = lineBlock(120, [60], { keepNext: true, keepLines: true })
+    const body = lineBlock(180, [50, 50])
+    const slices = computeSectionedSlicesF2([before, heading, body], geoms1, 280)
+    expect(slices.length).toBe(2)
+    expect(slices[1].start).toBe(120) // heading pushed together with the body
+  })
+
+  it('keepLines without keepNext stays at the page bottom (no chain push)', () => {
+    const before = block(0, 120)
+    const kl = lineBlock(120, [60], { keepLines: true })
+    const body = lineBlock(180, [50, 50])
+    const slices = computeSectionedSlicesF2([before, kl, body], geoms1, 280)
+    expect(slices.length).toBe(2)
+    expect(slices[1].start).toBe(180) // only the body moves
+  })
+
+  it('keepNext chain taller than a page degrades to per-block placement', () => {
+    const a = lineBlock(0, [60, 60], { keepNext: true, widowControl: false })
+    const b = lineBlock(120, [60, 60], { keepNext: true, widowControl: false })
+    const c = lineBlock(240, [60, 60], { keepNext: true, widowControl: false })
+    const anchor = lineBlock(360, [50], { widowControl: false })
+    const slices = computeSectionedSlicesF2([a, b, c, anchor], geoms1, 410)
+    expect(slices.map((s) => s.start)).toEqual([0, 180, 360])
+    expect(slices[slices.length - 1].end).toBe(410)
+  })
+
+  it('overlong keepNext chain with a keepLines head keeps the head unsplit', () => {
+    const before = block(0, 120)
+    const head = lineBlock(120, [50, 50, 50], { keepNext: true, keepLines: true })
+    const mid = lineBlock(270, [60, 60], { keepNext: true })
+    const anchor = lineBlock(390, [50, 50], { widowControl: false })
+    const slices = computeSectionedSlicesF2([before, head, mid, anchor], geoms1, 490)
+    // head (120..270) pushed whole to page 2, never split
+    expect(slices.map((s) => s.start)).toEqual([0, 120, 270, 440])
+    expect(slices[slices.length - 1].end).toBe(490)
+  })
+
+  it('keepNext heading stays at the page bottom when the anchor brings its first 2 lines', () => {
+    // Word: the anchor paragraph is not atomic — the heading only needs the anchor's
+    // first 2 lines (widow minimum) on the same page; the paragraph splits normally.
+    const before = block(0, 140)
+    const heading = lineBlock(140, [20], { keepNext: true, keepLines: true })
+    const body = lineBlock(160, [20, 20, 20, 20, 20]) // widow control on by default
+    const slices = computeSectionedSlicesF2([before, heading, body], geoms1, 260)
+    // 140 + heading 20 + 2 body lines 40 = 200 fits → heading stays, body splits 2/3
+    expect(slices.map((s) => s.start)).toEqual([0, 200])
+    expect(slices[slices.length - 1].end).toBe(260)
+  })
+
+  it("keepNext heading pushes when the anchor's first 2 lines do not fit; the anchor flows on", () => {
+    const before = block(0, 170)
+    const heading = lineBlock(170, [20], { keepNext: true })
+    const body = lineBlock(190, [20, 20, 20])
+    const slices = computeSectionedSlicesF2([before, heading, body], geoms1, 250)
+    // 170 + 20 + 40 > 200 → heading pushed; body follows and fits whole on page 2
+    expect(slices.map((s) => s.start)).toEqual([0, 170])
+    expect(slices[slices.length - 1].end).toBe(250)
+  })
+
+  it('keepLines anchor follows the chain whole (atomic exception)', () => {
+    const before = block(0, 140)
+    const heading = lineBlock(140, [20], { keepNext: true })
+    const body = lineBlock(160, [20, 20, 20, 20], { keepLines: true })
+    const slices = computeSectionedSlicesF2([before, heading, body], geoms1, 240)
+    // anchor demand = whole 80px block → 140+20+80 > 200 → heading + body pushed together
+    expect(slices.map((s) => s.start)).toEqual([0, 140])
+    expect(slices[slices.length - 1].end).toBe(240)
+  })
+
+  it('anchor without line data (first pass) is kept whole conservatively', () => {
+    const before = block(0, 140)
+    const heading = block(140, 20, { keepNext: true })
+    const body = block(160, 80)
+    const slices = computeSectionedSlicesF2([before, heading, body], geoms1, 240)
+    expect(slices.map((s) => s.start)).toEqual([0, 140])
   })
 })
 
@@ -663,14 +794,54 @@ describe('computeSectionedSlicesF2 — table row-level page breaks', () => {
     expect(slices[1].end - slices[1].start).toBeLessThanOrEqual(160)
   })
 
-  it('tblHeader: header taller than half a page is not repeated', () => {
+  it('tblHeader: header at 75% of the page still repeats (Word probe 2026-08-16)', () => {
     const rows: TableRowBox[] = [
       { height: 150, isHeader: true },
       ...Array.from({ length: 4 }, () => ({ height: 50 })),
     ]
     const b = makeTableBlock(0, rows)
     const slices = computeSectionedSlicesF2([b], [{ contentHeight: 200, forceBreak: false }], 350)
+    for (const s of slices.slice(1)) expect(s.repeatHeader).toEqual({ top: 0, height: 150 })
+  })
+
+  it('tblHeader: header block taller than a full page is not repeated', () => {
+    const rows: TableRowBox[] = [
+      { height: 120, isHeader: true },
+      { height: 120, isHeader: true },
+      ...Array.from({ length: 4 }, () => ({ height: 50 })),
+    ]
+    const b = makeTableBlock(0, rows)
+    const slices = computeSectionedSlicesF2([b], [{ contentHeight: 200, forceBreak: false }], 440)
     for (const s of slices) expect(s.repeatHeader).toBeUndefined()
+  })
+
+  it('modernTableHeaders: a header block that misses the remaining space pushes the table to a fresh page', () => {
+    const para: BlockBox = { top: 0, height: 60 }
+    const rows: TableRowBox[] = [
+      { height: 90, isHeader: true },
+      { height: 90, isHeader: true },
+      ...Array.from({ length: 3 }, () => ({ height: 40 })),
+    ]
+    const b = makeTableBlock(60, rows)
+    b.modernTableHeaders = true
+    const slices = computeSectionedSlicesF2(
+      [para, b],
+      [{ contentHeight: 200, forceBreak: false }],
+      360,
+    )
+    // page 1 keeps only the paragraph; the table starts page 2 with its header block
+    expect(slices[1].start).toBe(60)
+    // legacy mode places header row 1 on page 1 and splits in place
+    const b2 = makeTableBlock(
+      60,
+      rows.map((r) => ({ ...r })),
+    )
+    const legacy = computeSectionedSlicesF2(
+      [{ top: 0, height: 60 }, b2],
+      [{ contentHeight: 200, forceBreak: false }],
+      360,
+    )
+    expect(legacy[1].start).toBe(150)
   })
 
   it('split table without tblHeader carries no repeatHeader', () => {
@@ -697,6 +868,63 @@ describe('computeSectionedSlicesF2 — table row-level page breaks', () => {
     expect(slices[1].start).toBe(110)
   })
 
+  it('plain first row splits at cutYs like any row (Word probe: no first-row rule)', () => {
+    // 80px block, then a table whose first row (100px, cuts 40/70) exceeds the 40px remainder
+    const rows: TableRowBox[] = [{ height: 100, cutYs: [40, 70] }, { height: 20 }]
+    const table = makeTableBlock(80, rows)
+    const slices = computeSectionedSlicesF2(
+      [block(0, 80), table],
+      [{ contentHeight: 120, forceBreak: false }],
+      200,
+    )
+    // first segment (40) fills page 1; page 2 starts at the in-row cut 80+40=120
+    expect(slices.map((s) => s.start)).toEqual([0, 120])
+  })
+
+  it('1x1 table: page remainder holds 2 of 3 segments, row splits leaving them behind', () => {
+    // sample 14_10f3d2ed cover banner: Word leaves 2 paragraphs on page 1
+    const rows: TableRowBox[] = [{ height: 90, cutYs: [20, 40] }]
+    const table = makeTableBlock(80, rows)
+    const slices = computeSectionedSlicesF2(
+      [block(0, 80), table],
+      [{ contentHeight: 120, forceBreak: false }],
+      170,
+    )
+    expect(slices.map((s) => s.start)).toEqual([0, 120])
+  })
+
+  it('tblHeader first row is pushed whole despite cutYs', () => {
+    const rows: TableRowBox[] = [{ height: 50, cutYs: [20, 35], isHeader: true }, { height: 20 }]
+    const table = makeTableBlock(100, rows)
+    const slices = computeSectionedSlicesF2(
+      [block(0, 100), table],
+      [{ contentHeight: 120, forceBreak: false }],
+      170,
+    )
+    expect(slices.map((s) => s.start)).toEqual([0, 100])
+  })
+
+  it('tblHeader row taller than half a page still pushes whole (only repetition is dropped)', () => {
+    // header block > contentH/2 disables per-page repetition, not the no-split rule:
+    // remaining space (50) fits the first cut segment (30), so a split-allowed row
+    // would leave it behind — the header row must still push whole
+    const rows: TableRowBox[] = [{ height: 80, cutYs: [30, 55], isHeader: true }, { height: 20 }]
+    const table = makeTableBlock(70, rows)
+    const slices = computeSectionedSlicesF2(
+      [block(0, 70), table],
+      [{ contentHeight: 120, forceBreak: false }],
+      170,
+    )
+    expect(slices.map((s) => s.start)).toEqual([0, 70])
+  })
+
+  it('first row taller than an empty page still splits at cutYs', () => {
+    const rows: TableRowBox[] = [{ height: 300, cutYs: [100, 200] }]
+    const b = makeTableBlock(0, rows)
+    const slices = computeSectionedSlicesF2([b], [{ contentHeight: 120, forceBreak: false }], 300)
+    expect(slices.map((s) => s.start)).toEqual([0, 100, 200])
+  })
+
   it('cantSplit row ignores cutYs and stays atomic', () => {
     const rows: TableRowBox[] = [{ height: 50 }, { height: 200, cutYs: [60, 120], cantSplit: true }]
     const b = makeTableBlock(0, rows)
@@ -720,6 +948,249 @@ describe('computeSectionedSlicesF2 — table row-level page breaks', () => {
     const b = makeTableBlock(0, rows)
     const slices = computeSectionedSlicesF2([b], [{ contentHeight: 200, forceBreak: false }], 600)
     expect(slices.map((slice) => slice.start)).toEqual([0, 150, 350, 500])
+  })
+
+  it('page-sized declared-fill row is pushed whole, not clipped (fill clipping is over-tall only)', () => {
+    const rows: TableRowBox[] = [{ height: 50 }, { height: 180, contentBottom: 20 }]
+    const b = makeTableBlock(0, rows)
+    const slices = computeSectionedSlicesF2([b], geoms1, 230)
+    expect(slices.map((slice) => slice.start)).toEqual([0, 50])
+  })
+
+  it('page-sized rows after a pushed fill row keep whole-row placement', () => {
+    const rows: TableRowBox[] = [
+      { height: 50 },
+      { height: 180, contentBottom: 20 },
+      { height: 40, contentBottom: 30 },
+    ]
+    const b = makeTableBlock(0, rows)
+    const slices = computeSectionedSlicesF2([b], geoms1, 270)
+    expect(slices.map((slice) => slice.start)).toEqual([0, 50, 230])
+  })
+
+  it('empty rows that do not fit are pushed whole, not absorbed by clipped-fill bookkeeping', () => {
+    // empty rows report contentBottom 0 and no cuts; each must turn the page like an atomic row
+    const rows: TableRowBox[] = [
+      { height: 190, contentBottom: 190 },
+      ...Array.from({ length: 4 }, () => ({ height: 30, contentBottom: 0 })),
+    ]
+    const b = makeTableBlock(0, rows)
+    const slices = computeSectionedSlicesF2([b], geoms1, 310)
+    expect(slices.map((slice) => slice.start)).toEqual([0, 190])
+  })
+
+  it('trailing padding of a page-sized row stays glued to its last text band (no fill strip past the page)', () => {
+    // two text bands (cut at 45, content ends at 80) + shaded bottom padding to 120
+    const rows: TableRowBox[] = [{ height: 110 }, { height: 120, cutYs: [45], contentBottom: 80 }]
+    const b = makeTableBlock(0, rows)
+    const slices = computeSectionedSlicesF2([b], geoms1, 230)
+    // last segment spans 45..120 and does not fit the 45px remainder → breaks at the cut
+    expect(slices.map((slice) => slice.start)).toEqual([0, 155])
+  })
+
+  it('declared row taller than a page with top-only content: one clipped page, no empty segment pages', () => {
+    const rows: TableRowBox[] = [{ height: 600, contentBottom: 40 }]
+    const b = makeTableBlock(0, rows)
+    const slices = computeSectionedSlicesF2([b], geoms1, 600)
+    expect(slices).toEqual([{ start: 0, end: 600, section: 0 }])
+  })
+
+  it('content below the fold still pushes the row to the next page (not clipped)', () => {
+    const rows: TableRowBox[] = [{ height: 50 }, { height: 100, contentBottom: 80 }]
+    const b = makeTableBlock(0, rows)
+    const slices = computeSectionedSlicesF2([b], [{ contentHeight: 120, forceBreak: false }], 150)
+    expect(slices.map((slice) => slice.start)).toEqual([0, 50])
+  })
+
+  it('rows with natural cut points keep the segment path even with contentBottom set', () => {
+    const rows: TableRowBox[] = [
+      { height: 50 },
+      { height: 200, cutYs: [60, 120], contentBottom: 190 },
+    ]
+    const b = makeTableBlock(0, rows)
+    const slices = computeSectionedSlicesF2([b], [{ contentHeight: 120, forceBreak: false }], 250)
+    expect(slices[1].start).toBe(110)
+  })
+
+  it('fill below the last content band collapses into a clipped remainder, not empty pages', () => {
+    const rows: TableRowBox[] = [{ height: 600, cutYs: [50], contentBottom: 80 }]
+    const b = makeTableBlock(0, rows)
+    const slices = computeSectionedSlicesF2([b], geoms1, 600)
+    expect(slices).toEqual([{ start: 0, end: 600, section: 0 }])
+  })
+
+  it('multi-page content keeps page-sized segments; only the fill tail is clipped', () => {
+    const rows: TableRowBox[] = [{ height: 900, contentBottom: 450 }]
+    const b = makeTableBlock(0, rows)
+    const slices = computeSectionedSlicesF2([b], geoms1, 900)
+    expect(slices.map((slice) => slice.start)).toEqual([0, 200, 400])
+  })
+})
+
+describe('computeSectionedSlicesF2 — keepNext chain anchored by a table', () => {
+  it('the heading only keeps with the first table row; the table breaks by rows', () => {
+    const filler = block(0, 80)
+    const heading = block(80, 20, { keepNext: true })
+    const rows: TableRowBox[] = Array.from({ length: 6 }, () => ({ height: 30 }))
+    const table = block(100, 180, { tableRows: rows })
+    const slices = computeSectionedSlicesF2([filler, heading, table], geoms1, 280)
+    // whole-table anchor height would push heading + table to page 2 (start 80)
+    expect(slices.map((slice) => slice.start)).toEqual([0, 190])
+  })
+})
+
+describe('fillLineBoxes — keepNext chain anchors', () => {
+  const geoms = [{ contentHeight: 200, forceBreak: false }]
+  const tableEl = () => {
+    const el = document.createElement('div')
+    el.innerHTML = '<table><tbody><tr><td></td></tr></tbody></table>'
+    return el
+  }
+
+  it('samples table rows even when the table fits on one page', () => {
+    const heading: BlockBox = { top: 0, height: 20, keepNext: true }
+    const table: BlockBox = { top: 20, height: 60, el: tableEl() }
+    expect(fillLineBoxes([heading, table], geoms, 1)).toBe(true)
+    expect(table.tableRows).toEqual([{ height: 60, contentBottom: 0 }])
+  })
+
+  it('leaves non-anchored fitting tables unsampled', () => {
+    const para: BlockBox = { top: 0, height: 20 }
+    const table: BlockBox = { top: 20, height: 60, el: tableEl() }
+    expect(fillLineBoxes([para, table], geoms, 1)).toBe(false)
+    expect(table.tableRows).toBeUndefined()
+  })
+
+  it('samples line boxes for paragraph anchors even when they fit on one page', () => {
+    const heading: BlockBox = { top: 0, height: 20, keepNext: true }
+    const el = document.createElement('p')
+    el.textContent = 'two lines'
+    const para: BlockBox = { top: 20, height: 40, el }
+    const rects = [
+      { top: 0, bottom: 20, height: 20, width: 50, left: 0 },
+      { top: 20, bottom: 40, height: 20, width: 50, left: 0 },
+    ]
+    const orig = Range.prototype.getClientRects
+    Range.prototype.getClientRects = () => rects as unknown as DOMRectList
+    try {
+      expect(fillLineBoxes([heading, para], geoms, 1)).toBe(true)
+    } finally {
+      Range.prototype.getClientRects = orig
+    }
+    expect(para.lineBoxes).toEqual([
+      { offsetInBlock: 0, height: 20 },
+      { offsetInBlock: 20, height: 20 },
+    ])
+  })
+})
+
+describe('measureBlocks — break-only paragraphs', () => {
+  const rectOf = (top: number, height: number) =>
+    ({
+      top,
+      height,
+      bottom: top + height,
+      left: 0,
+      right: 100,
+      width: 100,
+      x: 0,
+      y: top,
+      toJSON: () => ({}),
+    }) as DOMRect
+  // page height 200; the break paragraph's DOM height is two line boxes (br + trailingBreak) = 44px
+  const breakDoc = (fillerH: number) => {
+    const pm = document.createElement('div')
+    const addPara = (top: number, height: number, html: string) => {
+      const el = document.createElement('p')
+      el.innerHTML = html
+      el.getBoundingClientRect = () => rectOf(top, height)
+      pm.appendChild(el)
+    }
+    addPara(0, fillerH, 'filler text')
+    addPara(fillerH, 44, '<br class="doc-page-br"><br class="ProseMirror-trailingBreak">')
+    addPara(fillerH + 44, 100, 'after the break')
+    return measureBlocks(pm, 0, 1)
+  }
+  const geoms = [{ contentHeight: 200, forceBreak: false }]
+
+  it('absorbs at the page bottom when the break line fits (no blank page)', () => {
+    const { blocks, totalHeight } = breakDoc(173) // 27px left
+    expect(blocks[1].breakAfter).toBe(true)
+    expect(blocks[1].breakOnlyLineH).toBe(44)
+    const slices = computeSectionedSlicesF2(blocks, geoms, totalHeight)
+    // break paragraph overflows the bottom margin; page 2 starts at the following block
+    expect(slices.map((s) => s.start)).toEqual([0, 217])
+  })
+
+  it('opens a Word-style blank page when the previous paragraph exactly fills the page', () => {
+    const { blocks, totalHeight } = breakDoc(200)
+    const slices = computeSectionedSlicesF2(blocks, geoms, totalHeight)
+    // page 2 holds only the break paragraph (blank), which then pushes the rest to page 3
+    expect(slices.map((s) => s.start)).toEqual([0, 200, 244])
+    expect(slices[1]).toMatchObject({ start: 200, end: 244 })
+  })
+
+  it('still absorbs within the drift tolerance (half the block height)', () => {
+    const { blocks, totalHeight } = breakDoc(177) // 23px left, just above the 22px floor
+    const slices = computeSectionedSlicesF2(blocks, geoms, totalHeight)
+    expect(slices.map((s) => s.start)).toEqual([0, 221])
+  })
+})
+
+describe('cellCutYs — line-level in-row cut candidates', () => {
+  it('emits a boundary between adjacent lines even with zero gap', () => {
+    const lines: Array<[number, number]> = [
+      [0, 15],
+      [15, 30],
+      [30, 45],
+    ]
+    expect(cellCutYs([lines], 45)).toEqual([15, 30])
+  })
+
+  it('clusters same-line rects (overlapping spans) into one line box', () => {
+    const rects: Array<[number, number]> = [
+      [0, 15],
+      [1, 14],
+      [15, 30],
+    ]
+    expect(cellCutYs([rects], 30)).toEqual([15])
+  })
+
+  it('drops a candidate that crosses another cell line box', () => {
+    const cellA: Array<[number, number]> = [
+      [0, 15],
+      [15, 30],
+    ]
+    const cellB: Array<[number, number]> = [[5, 25]]
+    expect(cellCutYs([cellA, cellB], 30)).toEqual([])
+  })
+
+  it('keeps only boundaries safe across all cells and dedupes near-identical ones', () => {
+    const cellA: Array<[number, number]> = [
+      [0, 20],
+      [20, 60],
+    ]
+    const cellB: Array<[number, number]> = [
+      [0, 20.3],
+      [20.3, 40],
+      [40, 60],
+    ]
+    // 20/20.3 coincide within jitter → one cut; B's 40 falls inside A's [20,60] line
+    expect(cellCutYs([cellA, cellB], 60)).toEqual([20])
+  })
+
+  it('rejects candidates hugging the row edges', () => {
+    const lines: Array<[number, number]> = [
+      [0, 1.5],
+      [2, 28],
+      [28.5, 30],
+    ]
+    expect(cellCutYs([lines], 30)).toEqual([])
+  })
+
+  it('returns nothing for empty or single-line rows', () => {
+    expect(cellCutYs([], 100)).toEqual([])
+    expect(cellCutYs([[[0, 20]]], 100)).toEqual([])
   })
 })
 
@@ -850,13 +1321,28 @@ describe('applyBlockMeta / trailing spacing overflow', () => {
       idx === 0
         ? { keepNext: true, widowControl: false }
         : idx === 1
-          ? { keepLines: true }
+          ? { keepLines: true, breakBefore: true }
           : undefined,
     )
     expect(blocks[0].keepNext).toBe(true)
     expect(blocks[0].widowControl).toBe(false)
     expect(blocks[1].keepLines).toBe(true)
+    expect(blocks[1].breakBefore).toBe(true)
     expect(blocks[2].keepNext).toBeUndefined()
+  })
+
+  it('breakBefore meta (style-level pageBreakBefore) forces a page break, first block excepted', () => {
+    const blocks: BlockBox[] = [
+      { top: 0, height: 100, docxIndex: 0 },
+      { top: 100, height: 100, docxIndex: 1 },
+    ]
+    // both paragraphs use a pageBreakBefore style; the document's first block must not open an empty page
+    applyBlockMeta(blocks, () => ({ breakBefore: true }))
+    const slices = computePageSlices(blocks, 800, 200)
+    expect(slices).toEqual([
+      { start: 0, end: 100, section: 0 },
+      { start: 100, end: 200, section: 0 },
+    ])
   })
 
   it('trailing spaceAfter overflow does not push to the next page (Word breaks by text only)', () => {

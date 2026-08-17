@@ -14,6 +14,7 @@ import { type TabStop } from '@genoffice/docx-engine'
 
 import { SearchHighlight } from './extensions'
 import { revisionDisplayState } from './marks'
+import { borderMergeFlags, type ParaBorderAttrs } from './para-border-merge'
 
 export const searchPluginKey = new PluginKey<DecorationSet>('docSearch')
 
@@ -171,31 +172,93 @@ interface MeasuredTab {
 /** nodes are immutable, so the has-tab verdict per textblock never goes stale */
 const paraHasTabCache = new WeakMap<ProseMirrorNode, boolean>()
 
+const MEASURE_RETRY_MAX = 10
+/**
+ * Distinct decoration signatures tolerated between external invalidations
+ * (edit / resize / font load). A convergent measure→decorate→re-measure
+ * settles within a couple of dispatches; seeing a signature twice (or an
+ * ever-drifting stream of new ones) means decorating keeps changing the very
+ * layout being measured. Each dispatch re-enters update() synchronously, so
+ * an unguarded oscillation recurses until the stack overflows (observed on
+ * tab-heavy government forms: the renderer hangs at 100% CPU).
+ */
+const MEASURE_SIGS_MAX = 8
+
 class TabLayoutView {
   private lastSig = ''
+  private seenSigs = new Set<string>()
+  private frozen = false
+  private retryRaf = 0
+  private retries = 0
+  private resizeObserver?: ResizeObserver
+  private lastDomWidth = -1
+  // font swaps change text metrics, which shifts every tab's start x
+  private onFontsLoaded = () => {
+    this.invalidate()
+    this.measure()
+  }
 
   constructor(private view: EditorView) {
     this.measure()
-    // font swaps change text metrics, which shifts every tab's start x
-    document.fonts?.ready.then(() => this.measure()).catch(() => {})
+    document.fonts?.addEventListener('loadingdone', this.onFontsLoaded)
+    if (typeof ResizeObserver !== 'undefined') {
+      // width-only trigger: height changes on every keystroke
+      this.resizeObserver = new ResizeObserver(() => {
+        const w = this.view.dom.offsetWidth
+        if (w === this.lastDomWidth) return
+        this.lastDomWidth = w
+        this.invalidate()
+        this.measure()
+      })
+      this.resizeObserver.observe(view.dom)
+    }
+  }
+
+  /** external layout input changed: start a fresh convergence run */
+  private invalidate() {
+    this.seenSigs.clear()
+    this.frozen = false
   }
 
   update(view: EditorView, prevState: EditorState) {
-    // selection-only transactions change neither the doc nor tab layout; the
-    // plugin-state check keeps the measure→decorate→re-measure convergence alive
-    if (
-      view.state.doc === prevState.doc &&
+    if (view.state.doc !== prevState.doc) {
+      this.invalidate()
+    } else if (
+      // selection-only transactions change neither the doc nor tab layout; the
+      // plugin-state check keeps the measure→decorate→re-measure convergence alive
       tabStopPluginKey.getState(view.state) === tabStopPluginKey.getState(prevState)
-    )
+    ) {
       return
+    }
     this.measure()
   }
 
-  destroy() {}
+  destroy() {
+    document.fonts?.removeEventListener('loadingdone', this.onFontsLoaded)
+    this.resizeObserver?.disconnect()
+    if (this.retryRaf) cancelAnimationFrame(this.retryRaf)
+  }
+
+  /** initial-load dispatches measure before the DOM is measurable; retry on rAF (bounded) */
+  private scheduleRetry() {
+    if (this.retryRaf || this.retries >= MEASURE_RETRY_MAX) return
+    this.retries++
+    this.retryRaf = requestAnimationFrame(() => {
+      this.retryRaf = 0
+      this.measure()
+    })
+  }
 
   private measure() {
+    if (this.retryRaf) {
+      cancelAnimationFrame(this.retryRaf)
+      this.retryRaf = 0
+    }
     const { view } = this
-    if (!view.dom.isConnected) return
+    if (!view.dom.isConnected) {
+      this.scheduleRetry()
+      return
+    }
 
     const paras: Array<{ node: ProseMirrorNode; pos: number }> = []
     view.state.doc.descendants((node, pos) => {
@@ -211,15 +274,32 @@ class TabLayoutView {
 
     const paraRanges: Array<{ from: number; to: number }> = []
     const tabs: MeasuredTab[] = []
+    let measurable = false
     for (const para of paras) {
       const measured = this.measureParagraph(para.node, para.pos)
       if (!measured) continue
+      measurable = true
       paraRanges.push({ from: para.pos, to: para.pos + para.node.nodeSize })
       tabs.push(...measured)
     }
 
+    if (paras.length > 0 && !measurable) {
+      this.scheduleRetry()
+      return
+    }
+    this.retries = 0
+
     const sig = JSON.stringify([paraRanges, tabs])
     if (sig === this.lastSig) return
+    if (this.frozen) return
+    if (this.seenSigs.has(sig) || this.seenSigs.size >= MEASURE_SIGS_MAX) {
+      // oscillation: keep the current decorations until an edit/resize/font
+      // load invalidates, instead of dispatching (and recursing) forever
+      this.frozen = true
+      console.warn('[docs] tab-stop layout did not converge; keeping current tab decorations')
+      return
+    }
+    this.seenSigs.add(sig)
     this.lastSig = sig
 
     const old = tabStopPluginKey.getState(view.state)
@@ -258,7 +338,10 @@ class TabLayoutView {
     // whether it is margin-left on docParagraph or padding-left on list items)
     const marginLeft = parseFloat(cs.marginLeft) || 0
     const paddingLeft = parseFloat(cs.paddingLeft) || 0
+    const paddingRight = parseFloat(cs.paddingRight) || 0
     const originX = rect.left - marginLeft * zoom
+    // paragraph right content edge in tab-origin space
+    const paraW = marginLeft + el.clientWidth - paddingRight
     // CSS tab-size origin: the paragraph content edge, offset from the column
     // edge by the full indent
     const contentEdge = marginLeft + paddingLeft
@@ -317,22 +400,36 @@ class TabLayoutView {
         target = (Math.floor((x + 0.5) / grid) + 1) * grid
       }
 
-      if (val === 'right' || val === 'decimal' || val === 'center') {
-        // text between this tab and the next tab (or paragraph end) is aligned
-        // at the stop; decimal is approximated as right (no '.'-splitting)
-        const segStart = tabPos + 1
-        const segEnd = i + 1 < tabPositions.length ? tabPositions[i + 1] : paraEnd
-        let segWidth = 0
-        if (segEnd > segStart) {
-          try {
-            const endCoords = view.coordsAtPos(segEnd, -1)
-            segWidth = Math.max(0, (endCoords.left - coords.left) / zoom)
-          } catch {
-            /* keep 0 */
-          }
+      // Width of the text between this tab and the next tab (or paragraph
+      // end), measured from the tab's END so it excludes the tab's current
+      // advance — otherwise the computed target depends on the layout being
+      // measured and re-measure never reaches a fixed point.
+      const segStart = tabPos + 1
+      const segEnd = i + 1 < tabPositions.length ? tabPositions[i + 1] : paraEnd
+      let segWidth = 0
+      if (segEnd > segStart) {
+        try {
+          const startCoords = view.coordsAtPos(segStart, 1)
+          const endCoords = view.coordsAtPos(segEnd, -1)
+          segWidth = Math.max(0, (endCoords.left - startCoords.left) / zoom)
+        } catch {
+          /* keep 0 */
         }
-        target -= val === 'center' ? segWidth / 2 : segWidth
       }
+      // right/decimal/center align the segment at the stop; decimal is
+      // approximated as right (no '.'-splitting)
+      if (val === 'right' || val === 'decimal') target -= segWidth
+      else if (val === 'center') target -= segWidth / 2
+      // A right/center/decimal stop that would push the segment past the
+      // paragraph width pins it flush to the right edge (Word never wraps such
+      // TOC-style lines; Chromium would). In-column left stops are excluded —
+      // they advance to the stop and let the following text wrap naturally —
+      // but a left stop past the right edge pins too: Word keeps its segment
+      // on the same line (TOC page numbers), while an unpinned oversize
+      // tab-size wraps the whole paragraph word by word. The 1px slack keeps
+      // the 0.5px cssSize round-up from re-triggering wrap.
+      if (target + segWidth > paraW - 1 && (val !== 'left' || target > paraW - 1))
+        target = Math.max(x + 0.5, paraW - segWidth - 1)
       // convert the Word-space target to a CSS tab-size: the next multiple of
       // it past the tab's position must be the target itself, so it needs to
       // stay greater than the tab's content-edge-relative x
@@ -405,9 +502,52 @@ export const DropCapExtension = Extension.create({
   },
 })
 
+// ---- adjacent-paragraph border merging (Word border groups) ----
+
+const paraBorderMergePluginKey = new PluginKey<DecorationSet>('paraBorderMerge')
+
+/**
+ * Word border groups (ECMA-376 §17.3.1.24): adjacent top-level paragraphs with
+ * identical borders/shading draw top/bottom lines only at the group edges.
+ * Display-only classes; the borders attrs still serialize unchanged on save.
+ */
+export const ParaBorderMergeExtension = Extension.create({
+  name: 'paraBorderMerge',
+  addProseMirrorPlugins() {
+    return [
+      new Plugin({
+        key: paraBorderMergePluginKey,
+        props: {
+          decorations(state) {
+            const items: ParaBorderAttrs[] = []
+            const spans: Array<{ from: number; to: number }> = []
+            state.doc.forEach((node, offset) => {
+              // non-paragraph blocks (tables...) enter as border-less entries: they break adjacency
+              items.push(node.isTextblock ? (node.attrs as ParaBorderAttrs) : {})
+              spans.push({ from: offset, to: offset + node.nodeSize })
+            })
+            const decos: Decoration[] = []
+            borderMergeFlags(items).forEach((f, i) => {
+              if (!f.suppressTop && !f.suppressBottom) return
+              const cls = [
+                f.suppressTop ? 'pbdr-suppress-top' : '',
+                f.suppressBottom ? 'pbdr-suppress-bottom' : '',
+              ]
+                .filter(Boolean)
+                .join(' ')
+              decos.push(Decoration.node(spans[i].from, spans[i].to, { class: cls }))
+            })
+            return decos.length > 0 ? DecorationSet.create(state.doc, decos) : DecorationSet.empty
+          },
+        },
+      }),
+    ]
+  },
+})
+
 // ---- SDT (structured document tag) rendering extension ----
 
-const sdtPluginKey = new PluginKey<DecorationSet>('sdt')
+const sdtPluginKey = new PluginKey<boolean>('sdt')
 
 export const SdtExtension = Extension.create({
   name: 'sdt',
@@ -415,27 +555,85 @@ export const SdtExtension = Extension.create({
     return [
       new Plugin({
         key: sdtPluginKey,
+        // plugin state = "editor focused"; decorations() can't reach the view,
+        // and focus changes don't dispatch transactions on their own
+        state: {
+          init: () => false,
+          apply: (tr, focused) => (tr.getMeta(sdtPluginKey) as boolean | undefined) ?? focused,
+        },
+        // after a ribbon click the editor's own blur already fired (with a
+        // relatedTarget), so a later alt-tab only blurs the ribbon control;
+        // the window blur is the reliable "chrome must disappear" signal
+        view: (editorView) => {
+          const onWindowBlur = () => {
+            if (sdtPluginKey.getState(editorView.state)) {
+              editorView.dispatch(editorView.state.tr.setMeta(sdtPluginKey, false))
+            }
+          }
+          window.addEventListener('blur', onWindowBlur)
+          return { destroy: () => window.removeEventListener('blur', onWindowBlur) }
+        },
         props: {
+          handleDOMEvents: {
+            focus: (view) => {
+              view.dispatch(view.state.tr.setMeta(sdtPluginKey, true))
+              return false
+            },
+            blur: (view, event) => {
+              // Word keeps control chrome while formatting from the toolbar:
+              // only clear when focus leaves the document (relatedTarget null —
+              // window switch / screenshot), not on ribbon clicks
+              if ((event as FocusEvent).relatedTarget) return false
+              view.dispatch(view.state.tr.setMeta(sdtPluginKey, false))
+              return false
+            },
+          },
           decorations(state) {
-            const decos: Decoration[] = []
+            // Word shows content-control chrome only while the editor has focus
+            // and the cursor is inside the control; a static document view
+            // (export, screenshot, unfocused window) renders the content alone.
+            // "Inside" means fully contained — a doc-wide selection (initial
+            // AllSelection, ctrl-A) must not light up every control.
+            if (!sdtPluginKey.getState(state)) return DecorationSet.empty
+            const { from, to } = state.selection
+            // A multi-paragraph control (blocks sharing sdtShell.group) is one
+            // control: the caret anywhere inside lights up every member block.
+            type Entry = { offset: number; end: number; alias: string; group?: number }
+            const entries: Entry[] = []
             state.doc.forEach((node, offset) => {
               const raw = node.attrs?.sdtShell as string | null
               if (!raw) return
               let alias = ''
+              let group: number | undefined
               try {
                 const parsed = JSON.parse(raw)
                 alias = parsed?.alias || parsed?.tag || t('editorContentControl')
+                if (typeof parsed?.group === 'number') group = parsed.group
               } catch {
                 /* ignore */
               }
-              decos.push(
-                Decoration.node(offset, offset + node.nodeSize, {
-                  'data-sdt-alias': alias,
-                  class: 'has-sdt',
-                }),
-              )
+              entries.push({ offset, end: offset + node.nodeSize, alias, group })
             })
-            return decos.length > 0 ? DecorationSet.create(state.doc, decos) : DecorationSet.empty
+            const rangeOf = (e: Entry): [number, number] => {
+              if (e.group === undefined) return [e.offset, e.end]
+              const members = entries.filter((m) => m.group === e.group)
+              return [members[0].offset, members[members.length - 1].end]
+            }
+            const hit = entries.find((e) => {
+              const [start, end] = rangeOf(e)
+              return from >= start && to <= end
+            })
+            if (!hit) return DecorationSet.empty
+            const members =
+              hit.group === undefined ? [hit] : entries.filter((m) => m.group === hit.group)
+            const decos = members.map((m, i) =>
+              Decoration.node(m.offset, m.end, {
+                // one control-wide box: the alias tab renders once, on the first member
+                ...(i === 0 ? { 'data-sdt-alias': m.alias } : {}),
+                class: i === 0 ? 'has-sdt' : 'has-sdt has-sdt-follow',
+              }),
+            )
+            return DecorationSet.create(state.doc, decos)
           },
         },
       }),

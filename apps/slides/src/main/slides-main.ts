@@ -27,12 +27,14 @@ import { dirname, join } from 'node:path'
 import { gskApiKey, gskSlideGenerate, setGskProxyUrl } from '@genoffice/ai-search'
 import {
   appMenuLabels,
+  configuredDefaultSaveDir,
   contextMenuLabels,
   installContextMenu,
   installNavigationGuard,
   safeExternalUrl,
   showOpenDialogWithMemory,
   showSaveDialogWithMemory,
+  toggleDevToolsItem,
 } from '@genoffice/electron-utils'
 import { getUiLang, normalizeLang, setUiLang } from '@genoffice/i18n'
 import { ProjectStore } from '@genoffice/project-store'
@@ -106,6 +108,7 @@ import {
   pasteElements,
   reorderElement,
   reparseDeck,
+  replacePictureBytes,
   savePptx,
   savePptxToFile,
   commitSaved,
@@ -130,6 +133,9 @@ import {
   setElementParagraphFormat,
   setGroupChildParagraphFormat,
   setSlideBackground,
+  setSlideBackgroundImage,
+  resetSlideBackground,
+  setSlideBgGraphicsHidden,
   setSlideAdvanceTime,
   setSlideHidden,
   setSlideNotes,
@@ -159,6 +165,7 @@ import type {
   AddElementOp,
   AddImageBytesOp,
   AddInkOp,
+  ReplacePictureBytesOp,
   AddMediaBytesOp,
   AddBlankSlideOp,
   AddSlideOp,
@@ -226,6 +233,7 @@ import type {
   AnimationItem,
   ShapeKey,
 } from '../shared/ipc'
+import { buildPrintDocumentHtml } from '../shared/print-html'
 
 import { tm } from './i18n-main'
 import { tiffToPng } from './tiff-decode'
@@ -245,12 +253,15 @@ import {
   restoreSnapshot,
   settleStaleHistoryBatch,
   runtime,
+  scheduleHistoryNotify,
   sessions,
+  showChrome,
   takeSnapshot,
   windowRefs,
   type Session,
 } from './session-state'
 import { registerAiIpc, registerSlidesOnlyAiIpc } from './ai-ipc'
+import { listPrivateFontFaces, getPrivateFontData } from './fonts'
 
 /** One slide, copied from any deck open in this process, waiting to be pasted into another. */
 let slideClipboard: { bundle: SlideBundle; png?: string } | null = null
@@ -269,6 +280,7 @@ export {
   configureSlidesRuntime,
   setActiveSlidesWebContents,
   setSlidesShellWindow,
+  setSlidesShowBleed,
 } from './session-state'
 export { registerAiIpc } from './ai-ipc'
 
@@ -677,6 +689,7 @@ async function openAndBuild(
     redoStack: [],
     ...(recovered ? { metaDirty: true } : {}),
   })
+  scheduleHistoryNotify(sessions.get(wc.id)!)
   await pushRecent(path)
   slidesOpenedHook?.(wc, path)
   let slides = buildAllRenderSlides(opened, fitWidthPx)
@@ -690,9 +703,9 @@ async function openAndBuild(
   }
 }
 
-/** Directory where AI-generated drafts are saved: <Documents>/GenOffice/ */
+/** Directory where AI-generated drafts are saved: the configurable default save folder (falls back to <Documents>/GenOffice) */
 function getDraftsDir(): string {
-  return join(app.getPath('documents'), 'GenOffice')
+  return configuredDefaultSaveDir(app)
 }
 
 /** Fallback draft filename: <untitled label>-YYYYMMDD-HHmmss.pptx */
@@ -952,6 +965,9 @@ export function registerSlidesIpc(): void {
       /* Older Electron lacks this API: the screen-record button will get no stream and report failure */
     }
   })
+
+  ipcMain.handle('slides:private-font-faces', () => listPrivateFontFaces())
+  ipcMain.handle('slides:private-font-data', (_e, id: string) => getPrivateFontData(id))
 
   ipcMain.handle('slides:open', async (e, fitWidthPx: number) => {
     const parent = dialogParent()
@@ -1567,6 +1583,7 @@ export function registerSlidesIpc(): void {
   ipcMain.handle('slides:new-blank', async (e, fitWidthPx: number): Promise<OpenResult> => {
     const opened = await openPptx(await createBlankPptx())
     sessions.set(e.sender.id, { path: '', opened, fitWidthPx, undoStack: [], redoStack: [] })
+    scheduleHistoryNotify(sessions.get(e.sender.id)!)
     return {
       path: '',
       slides: buildAllRenderSlides(opened, fitWidthPx),
@@ -1638,7 +1655,11 @@ export function registerSlidesIpc(): void {
       }
       return rebuildSlide(session, op.slideIndex)
     }
-    const el = findEl(slide, op.sourceId)
+    // Unlike findEl, pictures are strokable too (picture border)
+    const el = slide.elements.find(
+      (x) =>
+        x.id === op.sourceId && (x.type === 'text' || x.type === 'shape' || x.type === 'picture'),
+    ) as TextElement | undefined
     if (!el) return null
     pushHistory(session)
     el.stroke = op.stroke
@@ -1659,14 +1680,39 @@ export function registerSlidesIpc(): void {
     if (!session) return null
     const slide = session.opened.deck.slides[op.slideIndex]
     if (!slide) return null
+    // Any element with an a:xfrm can flip (picture/shape/text/group) — findEl's
+    // text/shape filter would silently drop pictures
     const targets = op.sourceIds
-      .map((id) => (op.groupId ? findGroupChild(slide, op.groupId, id)?.child : findEl(slide, id)))
-      .filter((el): el is NonNullable<typeof el> => !!el)
+      .map((id) =>
+        op.groupId
+          ? findGroupChild(slide, op.groupId, id)?.child
+          : slide.elements.find((x) => x.id === id),
+      )
+      .filter((el): el is NonNullable<typeof el> => !!el && !!el.transform)
     if (targets.length === 0) return null
     pushHistory(session)
     for (const el of targets) {
-      if (op.axis === 'h') el.transform.flipH = !el.transform.flipH
-      else el.transform.flipV = !el.transform.flipV
+      const t = el.transform
+      // Rotation pivots on the flip-adjusted box origin, so toggling a flip on a
+      // rotated element would move its visual center: origin + R(rot)·(flip-signed
+      // half-extent) must stay put — shift the offset by the orbit difference.
+      const orbit = () => {
+        const rad = (((t.rot ?? 0) / 60000) * Math.PI) / 180
+        const bx = t.flipH ? t.offset.cx : 0
+        const by = t.flipV ? t.offset.cy : 0
+        const vx = ((t.flipH ? -1 : 1) * t.offset.cx) / 2
+        const vy = ((t.flipV ? -1 : 1) * t.offset.cy) / 2
+        return {
+          x: bx + vx * Math.cos(rad) - vy * Math.sin(rad),
+          y: by + vx * Math.sin(rad) + vy * Math.cos(rad),
+        }
+      }
+      const before = orbit()
+      if (op.axis === 'h') t.flipH = !t.flipH
+      else t.flipV = !t.flipV
+      const after = orbit()
+      t.offset.x += Math.round(before.x - after.x)
+      t.offset.y += Math.round(before.y - after.y)
       el.dirtyTransform = true
     }
     updateConnectorsForMoved(
@@ -1685,6 +1731,27 @@ export function registerSlidesIpc(): void {
     if (!editPictureSrcRect(slide, op.sourceId, op.srcRect)) {
       session.undoStack.pop()
       return null
+    }
+    // Crop confirm also shrinks the element frame to the crop frame — same history
+    // push, so a single undo restores frame and crop together (no distorted middle state)
+    if (op.boxPx && op.fitWidthPx) {
+      const el = slide.elements.find((x) => x.id === op.sourceId)
+      if (el) {
+        const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
+        const scale = op.fitWidthPx / baseWidthPx
+        const toEmu = (px: number) => Math.round((px / scale) * EMU_PER_PX_96)
+        el.transform = {
+          ...el.transform,
+          offset: {
+            x: toEmu(op.boxPx.x),
+            y: toEmu(op.boxPx.y),
+            cx: toEmu(op.boxPx.w),
+            cy: toEmu(op.boxPx.h),
+          },
+        }
+        el.dirtyTransform = true
+        updateConnectorsForMoved(slide, [op.sourceId])
+      }
     }
     return rebuildSlide(session, op.slideIndex)
   })
@@ -1718,11 +1785,20 @@ export function registerSlidesIpc(): void {
 
   // Full-page "backdrop" rectangles: design templates often use a text-free solid rectangle
   // covering the whole page as background; changing only the page background would be hidden
-  // behind them — so recolor such rectangles along with the background.
-  const recolorFullBleedBackdrops = (
+  // behind them — so repaint such rectangles along with the background (solid/gradient), or
+  // make them transparent when the new background is a picture.
+  const repaintFullBleedBackdrops = (
     slide: Slide,
     size: { cx: number; cy: number },
-    color: string,
+    fill:
+      | { type: 'solid'; color: string }
+      | {
+          type: 'gradient'
+          stops: Array<{ pos: number; color: string }>
+          angle?: number
+          path?: 'circle'
+        }
+      | { type: 'none' },
   ) => {
     for (const el of slide.elements) {
       if (el.type !== 'shape' && el.type !== 'text') continue
@@ -1734,21 +1810,93 @@ export function registerSlidesIpc(): void {
       const coversX = x <= size.cx * 0.05 && x + cx >= size.cx * 0.95
       const coversY = y <= size.cy * 0.05 && y + cy >= size.cy * 0.95
       if (!coversX || !coversY) continue
-      shaped.fill = { type: 'solid', color }
+      shaped.fill = fill
       shaped.dirtyFill = true
     }
   }
 
-  ipcMain.handle('slides:edit-background', (e, op: EditBackgroundOp) => {
+  ipcMain.handle('slides:edit-background', async (e, op: EditBackgroundOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
     const slides = session.opened.deck.slides
     const targets = op.slideIndex === -1 ? slides : [slides[op.slideIndex]].filter(Boolean)
     if (targets.length === 0) return null
-    pushHistory(session)
-    for (const s of targets) {
-      setSlideBackground(s!, op.color)
-      recolorFullBleedBackdrops(s!, session.opened.deck.size, op.color)
+
+    if (op.kind === 'image') {
+      let source: { bytes: Uint8Array; ext: string } | { mediaPath: string }
+      if (op.pick !== false) {
+        const r = await showOpenDialogWithMemory(dialog, dialogParent(), {
+          title: tm('dlgInsertImage'),
+          properties: ['openFile' as const],
+          filters: [
+            {
+              name: tm('filterImages'),
+              extensions: ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'tif', 'tiff'],
+            },
+          ],
+        })
+        if (r.canceled || !r.filePaths[0]) return null
+        const bytes = await readFile(r.filePaths[0])
+        source = {
+          bytes: new Uint8Array(bytes),
+          ext: r.filePaths[0].split('.').pop()!.toLowerCase(),
+        }
+      } else {
+        // Reuse an already-landed background image (mode change / apply-to-all)
+        const src = slides[op.sourceSlideIndex ?? op.slideIndex]
+        if (src?.background?.type !== 'image') return null
+        source = { mediaPath: src.background.mediaRef }
+      }
+      pushHistory(session)
+      // The picked bytes land as one media part; further slides only add a rel to it
+      let landed: string | null = null
+      for (const s of targets) {
+        const used = setSlideBackgroundImage(
+          session.opened,
+          s!,
+          landed ? { mediaPath: landed } : source,
+          op.mode === 'tile',
+        )
+        if (used) {
+          landed = used
+          repaintFullBleedBackdrops(s!, session.opened.deck.size, { type: 'none' })
+        }
+      }
+      if (!landed) {
+        session.undoStack.pop()
+        return null
+      }
+    } else if (op.kind === 'solid') {
+      pushHistory(session)
+      for (const s of targets) {
+        setSlideBackground(s!, op.color)
+        repaintFullBleedBackdrops(s!, session.opened.deck.size, {
+          type: 'solid',
+          color: op.color,
+        })
+      }
+    } else if (op.kind === 'gradient') {
+      pushHistory(session)
+      const stops = [
+        { pos: 0, color: op.from },
+        { pos: 1, color: op.to },
+      ]
+      const angle = Math.round((op.angleDeg ?? 0) * 60000)
+      const patch = { stops, ...(op.radial ? { radial: true } : { angle }) }
+      for (const s of targets) {
+        setSlideBackground(s!, patch)
+        repaintFullBleedBackdrops(s!, session.opened.deck.size, {
+          type: 'gradient',
+          stops,
+          ...(op.radial ? { path: 'circle' as const } : { angle }),
+        })
+      }
+    } else if (op.kind === 'reset') {
+      pushHistory(session)
+      for (const s of targets) resetSlideBackground(session.opened, s!)
+    } else {
+      pushHistory(session)
+      for (const s of targets) setSlideBgGraphicsHidden(session.opened, s!, op.hidden)
     }
     session.fitWidthPx = op.fitWidthPx
     return buildAllRenderSlides(session.opened, op.fitWidthPx)
@@ -2751,6 +2899,27 @@ export function registerSlidesIpc(): void {
     return rebuilt ? { slide: rebuilt, sourceId: el.id } : null
   })
 
+  ipcMain.handle('slides:replace-picture-bytes', (e, op: ReplacePictureBytesOp) => {
+    const session = sessions.get(e.sender.id)
+    if (!session) return null
+    const slide = session.opened.deck.slides[op.slideIndex]
+    if (!slide) return null
+    pushHistory(session)
+    const ok = replacePictureBytes(
+      session.opened,
+      slide,
+      op.sourceId,
+      new Uint8Array(Buffer.from(op.base64, 'base64')),
+      op.ext,
+      op.keepSrcRect ? { keepSrcRect: true } : undefined,
+    )
+    if (!ok) {
+      session.undoStack.pop()
+      return { error: 'unsupported' as const, ext: op.ext }
+    }
+    return rebuildSlide(session, op.slideIndex)
+  })
+
   // Show a dialog to pick video/audio and embed it. Video poster frame prefers the system thumbnail (QuickLook), falling back to a solid color on failure.
   ipcMain.handle(
     'slides:insert-media',
@@ -3360,6 +3529,7 @@ export function registerSlidesIpc(): void {
     if (session.undoStack.length === 0) return null
     session.redoStack.push(takeSnapshot(session))
     restoreSnapshot(session, session.undoStack.pop()!)
+    scheduleHistoryNotify(session)
     return buildAllRenderSlides(session.opened, session.fitWidthPx)
   })
 
@@ -3370,6 +3540,7 @@ export function registerSlidesIpc(): void {
     if (session.redoStack.length === 0) return null
     session.undoStack.push(takeSnapshot(session))
     restoreSnapshot(session, session.redoStack.pop()!)
+    scheduleHistoryNotify(session)
     return buildAllRenderSlides(session.opened, session.fitWidthPx)
   })
 
@@ -3424,7 +3595,7 @@ export function registerSlidesIpc(): void {
       defaultPath: defaultName,
       filters: [{ name: 'PowerPoint', extensions: ['pptx'] }],
     }
-    const r = await showSaveDialogWithMemory(dialog, parent, options)
+    const r = await showSaveDialogWithMemory(dialog, parent, options, getDraftsDir())
     if (r.canceled || !r.filePath) return { ok: false }
     try {
       await savePptxToFile(session.opened, r.filePath)
@@ -3484,7 +3655,7 @@ export function registerSlidesIpc(): void {
       defaultPath: defaultName,
       filters: [{ name: 'PDF', extensions: ['pdf'] }],
     }
-    const r = await showSaveDialogWithMemory(dialog, parent, options)
+    const r = await showSaveDialogWithMemory(dialog, parent, options, getDraftsDir())
     return r.canceled || !r.filePath ? null : r.filePath
   })
 
@@ -3528,93 +3699,111 @@ html, body { margin: 0; padding: 0; }
   ipcMain.handle(
     'slides:print',
     async (e, op: PrintSlidesOp): Promise<{ ok: boolean; error?: string }> => {
-      const layout = op.layout ?? 'full'
-      const ratio = op.widthPx / op.heightPx
-      // Full page: page size matches the slide ratio; handouts/notes: A4 portrait holding multiple thumbnails
-      const slideH = 7.5
-      const slideW = Math.round(ratio * slideH * 1000) / 1000
-      const isFull = layout === 'full'
-      const pageW = isFull ? slideW : 8.27
-      const pageH = isFull ? slideH : 11.69
-      const perPage =
-        layout === 'handout2' ? 2 : layout === 'handout3' ? 3 : layout === 'handout6' ? 6 : 1
-      const esc = (x: string) =>
-        x.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]!)
-
-      let body: string
-      if (isFull) {
-        body = op.pngsBase64
-          .map((b64) => `<div class="page"><img src="data:image/png;base64,${b64}"></div>`)
-          .join('')
-      } else if (layout === 'notes') {
-        // Notes page: slide on top + notes text below
-        body = op.pngsBase64
-          .map(
-            (b64, i) =>
-              `<div class="page notes"><img src="data:image/png;base64,${b64}">` +
-              `<div class="note">${esc(op.notes?.[i] ?? '').replace(/\n/g, '<br>')}</div></div>`,
-          )
-          .join('')
-      } else {
-        // Handouts: perPage thumbnails per page (with 3, ruled lines on the right for handwriting)
-        const pages: string[] = []
-        for (let i = 0; i < op.pngsBase64.length; i += perPage) {
-          const cells = op.pngsBase64
-            .slice(i, i + perPage)
-            .map(
-              (b64) =>
-                `<div class="cell"><img src="data:image/png;base64,${b64}">` +
-                (perPage === 3 ? '<div class="rules"></div>' : '') +
-                '</div>',
-            )
-            .join('')
-          pages.push(`<div class="page handout h${perPage}">${cells}</div>`)
-        }
-        body = pages.join('')
-      }
-
-      const html = `<!doctype html><html><head><meta charset="utf-8"><style>
-@page { size: ${pageW}in ${pageH}in; margin: 0; }
-html, body { margin: 0; padding: 0; font-family: -apple-system, 'Segoe UI', sans-serif; }
-.page { width: ${pageW}in; height: ${pageH}in; overflow: hidden; page-break-after: always; box-sizing: border-box; }
-.page:last-child { page-break-after: auto; }
-.page > img { display: block; width: 100%; height: 100%; }
-.page.handout { padding: 0.4in; display: flex; flex-direction: column; gap: 0.24in; }
-.page.handout .cell { display: flex; gap: 0.2in; align-items: center; flex: 1; min-height: 0; }
-.page.handout .cell img { border: 1px solid #bbb; object-fit: contain; max-height: 100%; }
-.page.handout.h2 .cell img, .page.handout.h6 .cell img { width: 100%; height: auto; max-height: 100%; }
-.page.handout.h3 .cell img { width: 55%; height: auto; }
-.page.handout.h3 .rules {
-  flex: 1; align-self: stretch;
-  background: repeating-linear-gradient(#fff 0 0.28in, #ccc 0.28in calc(0.28in + 1px));
-}
-.page.handout.h6 { display: grid; grid-template-columns: 1fr 1fr; grid-auto-rows: 1fr; }
-.page.notes { padding: 0.5in; display: flex; flex-direction: column; }
-.page.notes img { width: 100%; height: auto; border: 1px solid #bbb; }
-.page.notes .note { margin-top: 0.3in; font-size: 11pt; line-height: 1.5; white-space: pre-wrap; }
-</style></head><body>${body}</body></html>`
-      const win = new BrowserWindow({ show: false, webPreferences: { sandbox: true } })
+      // Page assembly is shared with the renderer's print-preview pane (print-html.ts)
+      const html = buildPrintDocumentHtml({
+        srcs: op.pngsBase64.map((b64) => `data:image/png;base64,${b64}`),
+        ratio: op.widthPx / op.heightPx,
+        layout: op.layout ?? 'full',
+        ...(op.notes ? { notes: op.notes } : {}),
+        ...(op.orientation ? { orientation: op.orientation } : {}),
+        ...(op.frame ? { frame: true } : {}),
+      })
+      const owner = BrowserWindow.fromWebContents(e.sender) ?? dialogParent()
+      const win = new BrowserWindow({
+        show: false,
+        ...(owner && !owner.isDestroyed() ? { parent: owner } : {}),
+        ...(process.platform === 'win32'
+          ? {
+              width: 900,
+              height: 700,
+              autoHideMenuBar: true,
+              closable: false,
+              skipTaskbar: true,
+            }
+          : {}),
+        webPreferences: { sandbox: true },
+      })
       try {
         await win.loadURL('data:text/html;base64,' + Buffer.from(html, 'utf8').toString('base64'))
         await win.webContents.executeJavaScript(
           'Promise.all([document.fonts.ready, ...Array.from(document.images).map((i) => i.decode().catch(() => {}))])',
           true,
         )
-        const ok = await new Promise<boolean>((resolve) => {
-          win.webContents.print({ silent: false, printBackground: true }, (success) =>
-            resolve(success),
+        // Chromium attaches the native Windows print dialog to the window being printed.
+        // If that owner is hidden, the dialog is hidden too and the layout buttons appear inert.
+        if (process.platform === 'win32') {
+          win.show()
+          win.focus()
+        }
+        const result = await new Promise<{ success: boolean; failureReason: string }>((resolve) => {
+          win.webContents.print(
+            { silent: false, printBackground: true },
+            (success, failureReason) => resolve({ success, failureReason }),
           )
         })
-        return { ok }
+        if (!result.success) {
+          // Canceling is a normal completion, not a print failure: ok=false without an
+          // error keeps the renderer's print dialog (and its chosen options) open.
+          if (result.failureReason === 'Print job canceled') return { ok: false }
+          return { ok: false, error: result.failureReason }
+        }
+        return { ok: true }
       } catch (err) {
         return { ok: false, error: String(err) }
       } finally {
-        win.destroy()
+        if (!win.isDestroyed()) win.destroy()
       }
     },
   )
 
   ipcMain.handle('slides:recent', () => readRecent())
+
+  // ── Show fullscreen: macOS native fullscreen is an animated Space transition, so
+  // the slideshow would render windowed for ~1s mid-flight. Instead one call covers
+  // everything while the show's black root hides the relayout: the tab view bleeds
+  // over the tab strip (shell hook) and the window snaps via simpleFullScreen (same
+  // trick as the audience window in presenter-show.ts). The renderer skips HTML
+  // fullscreen on macOS entirely. Snap is skipped when the user already fullscreened
+  // the window into its own Space; Windows/Linux keep HTML fullscreen (instant there)
+  // and only need the bleed. Release is debounced: React strict-mode remounts and
+  // presenter→show handoffs flip off→on within a tick, and honoring the off
+  // immediately makes the window visibly bounce. ──
+  let showFsRelease: ReturnType<typeof setTimeout> | null = null
+  ipcMain.handle('slides:show-fullscreen', (e, on: boolean) => {
+    const win = BrowserWindow.fromWebContents(e.sender) ?? windowRefs.shellWindow
+    if (!win || win.isDestroyed()) return
+    const wc = e.sender
+    if (showFsRelease) {
+      clearTimeout(showFsRelease)
+      showFsRelease = null
+    }
+    if (on) {
+      showChrome.setBleed?.(wc, true)
+      if (process.platform === 'darwin' && !win.isFullScreen()) {
+        win.setFullScreenable(false)
+        if (!win.isSimpleFullScreen()) win.setSimpleFullScreen(true)
+      }
+      // The snap can leave the window's first responder on the shell chrome view, so
+      // keys land in the tab-strip renderer (Esc dead until a click on the show).
+      // win.focus() must NOT be used here — it focuses the shell renderer itself.
+      // Focus the tab's webContents now and once more on the next tick (the snap's
+      // responder change lands async). HTML fullscreen used to do this implicitly.
+      wc.focus()
+      setTimeout(() => {
+        if (!wc.isDestroyed()) wc.focus()
+      }, 50)
+    } else {
+      showFsRelease = setTimeout(() => {
+        showFsRelease = null
+        if (!wc.isDestroyed()) showChrome.setBleed?.(wc, false)
+        if (win.isDestroyed()) return
+        if (process.platform === 'darwin') {
+          if (win.isSimpleFullScreen()) win.setSimpleFullScreen(false)
+          win.setFullScreenable(true)
+        }
+      }, 150)
+    }
+  })
 
   // ── Chat attachments (slides:files-*) ──
   registerAttachmentIpc()
@@ -3869,7 +4058,7 @@ export function buildSlidesMenu(): Menu {
           click: () => send('zoom-reset'),
         },
         { type: 'separator' },
-        { role: 'toggleDevTools', label: labels.toggleDevTools },
+        toggleDevToolsItem(labels),
       ],
     },
   ]

@@ -31,6 +31,8 @@ export type {
 export { AI_PROVIDERS } from '@genoffice/ai-provider'
 export type { AgentToolCall, AgentToolDef } from '@genoffice/agent-core'
 
+export type UiTheme = 'light' | 'dark' | 'system'
+
 export interface OpenResult {
   path: string
   slides: RenderSlide[]
@@ -336,12 +338,24 @@ export interface EditStrokeOp {
   groupId?: string
 }
 
-/** Solid page background; slideIndex=-1 applies to all pages. */
-export interface EditBackgroundOp {
+/**
+ * Page background edit; slideIndex=-1 applies to all pages.
+ * - solid/gradient: explicit fill
+ * - image: pick=true opens the system picker; pick=false reuses the current
+ *   image background of sourceSlideIndex (e.g. "apply to all" after picking)
+ * - reset: drop the slide's own <p:bg> (falls back to layout/master)
+ * - hideGraphics: toggle <p:sld showMasterSp> (hide master/layout decorations)
+ */
+export type EditBackgroundOp = {
   slideIndex: number
-  color: string
   fitWidthPx: number
-}
+} & (
+  | { kind: 'solid'; color: string }
+  | { kind: 'gradient'; from: string; to: string; angleDeg?: number; radial?: boolean }
+  | { kind: 'image'; mode: 'stretch' | 'tile'; pick?: boolean; sourceSlideIndex?: number }
+  | { kind: 'reset' }
+  | { kind: 'hideGraphics'; hidden: boolean }
+)
 
 /** Copy the selected elements to the in-app clipboard (any type, including tables/charts/groups). */
 export interface CopyElementsOp {
@@ -655,6 +669,11 @@ export interface EditPictureSrcRectOp {
   sourceId: string
   /** Crop ratio per edge 0..1; null = remove the crop (full image) */
   srcRect: { l: number; t: number; r: number; b: number } | null
+  /** Crop confirm also shrinks the element frame to the on-screen crop frame; applied
+   * in the same undo step so one undo restores both frame and crop. Px relative to
+   * the fitWidthPx viewport (rotation is left unchanged). Requires fitWidthPx. */
+  boxPx?: { x: number; y: number; w: number; h: number }
+  fitWidthPx?: number
 }
 
 /** Group elements: merge ≥2 editable elements into one group. */
@@ -754,12 +773,14 @@ export interface AddChartOp {
   /** 'barH' = horizontal bar (mapped to kind 'bar' + barDir 'bar' in the main process) */
   kind:
     | 'bar'
+    | 'bar3D'
     | 'barStacked'
     | 'barPercentStacked'
     | 'barH'
     | 'line'
     | 'area'
     | 'pie'
+    | 'pie3D'
     | 'doughnut'
     | 'scatter'
     | 'radar'
@@ -798,6 +819,17 @@ export interface AddImageBytesOp {
   hPx: number
   fitWidthPx: number
   name?: string
+}
+
+/** Swap a picture's backing image in place: frame, z-order, border and effects survive. */
+export interface ReplacePictureBytesOp {
+  slideIndex: number
+  sourceId: string
+  /** base64 without the data: prefix */
+  base64: string
+  ext: string
+  /** Keep the crop window — only valid when the new image shares the old one's pixel geometry (e.g. background removal) */
+  keepSrcRect?: boolean
 }
 
 /** Insert renderer-recorded media bytes (screen-recording webm etc.). */
@@ -859,12 +891,14 @@ export interface EditChartOp {
   /** Change chart type (rebuilds the chart part); undefined = unchanged; 'barH' = horizontal bar */
   kind?:
     | 'bar'
+    | 'bar3D'
     | 'barStacked'
     | 'barPercentStacked'
     | 'barH'
     | 'line'
     | 'area'
     | 'pie'
+    | 'pie3D'
     | 'doughnut'
     | 'scatter'
     | 'radar'
@@ -935,6 +969,10 @@ export interface PrintSlidesOp {
   layout?: 'full' | 'handout2' | 'handout3' | 'handout6' | 'notes'
   /** Per-page notes text for the notes layout (same order as pngsBase64) */
   notes?: string[]
+  /** Paper orientation for handout/notes pages (full pages always follow the slide ratio) */
+  orientation?: 'portrait' | 'landscape'
+  /** Border around full-page slides */
+  frame?: boolean
 }
 
 /** Show sync state from presenter view -> audience window (absolute state mirror; audience seek is idempotent) */
@@ -990,8 +1028,25 @@ export interface SlidesApi {
       lang: 'zh' | 'en' | 'ja' | 'ko' | 'fr' | 'de' | 'es' | 'th' | 'id' | 'ru' | 'ar',
     ) => void,
   ) => () => void
+  /** current UI theme preference (persisted by the shell in app-settings.json) */
+  getTheme: () => Promise<UiTheme>
+  /** theme switched from the shell home page */
+  onThemeChanged: (handler: (theme: UiTheme) => void) => () => void
+  /** press on the shell chrome (tab strip is a sibling WebContentsView whose
+   *  clicks produce no DOM event here) — dismiss open popovers */
+  onChromePressed: (handler: () => void) => () => void
+  /** snap the host window in/out of instant fullscreen for the slideshow
+   *  (macOS simpleFullScreen — skips the animated Space transition) */
+  setShowFullScreen: (on: boolean) => Promise<void>
   openPptx: (fitWidthPx: number) => Promise<OpenResult | null>
   openPptxPath: (path: string, fitWidthPx: number) => Promise<OpenResult | null>
+  /** Office-private faces referenced by layouts so far; the renderer registers them as FontFaces
+   *  (files invisible to Chromium — DFonts/cloud fonts), so drawing uses the measuring font. */
+  privateFontFaces: () => Promise<
+    Array<{ id: string; family: string; bold: boolean; italic: boolean }>
+  >
+  /** Single-face sfnt bytes for one private face (null = gone/unreadable) */
+  privateFontData: (id: string) => Promise<ArrayBuffer | null>
   consumePendingOpen: (fitWidthPx: number) => Promise<OpenResult | null>
   /** New blank presentation (single blank 16:9 page, untitled) */
   newBlank: (fitWidthPx: number) => Promise<OpenResult>
@@ -1142,6 +1197,10 @@ export interface SlidesApi {
   ) => Promise<
     { slide: RenderSlide; sourceId: string } | { error: 'unsupported'; ext: string } | null
   >
+  /** Swap a picture's backing image in place (frame/z-order/effects survive) */
+  replacePictureBytes: (
+    op: ReplacePictureBytesOp,
+  ) => Promise<RenderSlide | { error: 'unsupported'; ext: string } | null>
   /** Show the system dialog to pick a video/audio file and embed it into the current page */
   insertMedia: (
     slideIndex: number,
@@ -1275,6 +1334,8 @@ export interface SlidesApi {
   ) => Promise<{ ok: boolean; path?: string; error?: string; slides?: RenderSlide[] }>
   /** The close guard chose "Save": the main process asks the renderer to run the full save flow */
   onCloseSaveRequest: (handler: () => void) => () => void
+  /** Undo/redo stack occupancy pushed by the main process (drives the QAT button gray states) */
+  onHistoryChanged: (handler: (state: { canUndo: boolean; canRedo: boolean }) => void) => () => void
   reportCloseSaveResult: (ok: boolean) => void
   /** Mirror the autosave toggle state to the main process: files with it on save silently on close, no dialog */
   setAutoSavePref: (on: boolean) => void
@@ -1323,6 +1384,13 @@ export interface SlidesApi {
     hPx: number
     fitWidthPx: number
   }) => Promise<{ slide: RenderSlide; sourceId: string } | null>
+  /** Download a URL and swap it into an existing picture in place (frame/z-order/effects survive) */
+  replacePictureUrl: (op: {
+    slideIndex: number
+    sourceId: string
+    url: string
+    keepSrcRect?: boolean
+  }) => Promise<RenderSlide | null>
   /** gsk (Genspark) AI image generation/editing, returns the image URL (error prompts login when logged out) */
   generateImage: (op: {
     prompt: string

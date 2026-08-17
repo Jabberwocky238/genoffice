@@ -1,6 +1,7 @@
 import { useState } from 'react'
 
 import { transposeChartSeries, type ChartVisualState } from '../domain/chart-visual'
+import { ColorDropdown } from './ColorDropdown'
 import { useI18n, type StringKey, type TFunc } from './i18n/locale'
 import type { ChartEditData, ChartElementRef, ChartVectorRead } from './WorkbookVisuals'
 
@@ -150,7 +151,7 @@ export function ChartFormatPane({
     <div className="chart-format-pane">
       <header>
         <span>{t('appFormatHeader', { target: elementLabel(t, element, chart) })}</span>
-        <button title={t('appClose')} onClick={onClose}>
+        <button data-tip={t('appClose')} aria-label={t('appClose')} onClick={onClose}>
           ✕
         </button>
       </header>
@@ -159,10 +160,9 @@ export function ChartFormatPane({
           <strong>{element.kind === 'series' ? t('appSeries') : t('appDataPoint')}</strong>
           <label>
             {t('appFillColor')}
-            <input
-              type="color"
-              key={`${element.kind}-${element.seriesIndex}-${element.kind === 'point' ? element.pointIndex : 'ser'}`}
-              defaultValue={
+            <ColorDropdown
+              label={t('appFillColor')}
+              value={
                 (element.kind === 'point'
                   ? chart.series[element.seriesIndex]?.pointColors?.find(
                       (entry) => entry.index === element.pointIndex,
@@ -171,8 +171,8 @@ export function ChartFormatPane({
                 chart.series[element.seriesIndex]?.color ??
                 '#4472c4'
               }
-              onChange={(event) => {
-                const color = event.target.value
+              onPick={(color) => {
+                if (!color) return
                 if (element.kind === 'series') {
                   onEdit({ seriesColors: { [String(element.seriesIndex)]: color } })
                 } else {
@@ -513,21 +513,24 @@ export function SelectDataDialog({
                     />
                     <span>
                       <button
-                        title={t('appMoveUp')}
+                        data-tip={t('appMoveUp')}
+                        aria-label={t('appMoveUp')}
                         disabled={index === 0}
                         onClick={() => moveRow(index, -1)}
                       >
                         ↑
                       </button>
                       <button
-                        title={t('appMoveDown')}
+                        data-tip={t('appMoveDown')}
+                        aria-label={t('appMoveDown')}
                         disabled={index === rows.length - 1}
                         onClick={() => moveRow(index, 1)}
                       >
                         ↓
                       </button>
                       <button
-                        title={t('appRemoveSeries')}
+                        data-tip={t('appRemoveSeries')}
+                        aria-label={t('appRemoveSeries')}
                         onClick={() =>
                           setRows((previous) => previous.filter((_, at) => at !== index))
                         }

@@ -18,6 +18,8 @@ interface Props {
   editor: Editor | null
   /** scroll container of the editor canvas, for repositioning on scroll */
   scrollRef: React.RefObject<HTMLElement | null>
+  /** Reposition the viewport-anchored menu after document zoom changes. */
+  zoom: number
 }
 
 function Btn({
@@ -31,11 +33,14 @@ function Btn({
   onClick: () => void
   children: ReactNode
 }) {
+  // data-tip drives the fast custom tooltip (the native title is too slow to
+  // explain icon-only buttons)
   return (
     <button
       type="button"
       className={`tm-btn${danger ? ' danger' : ''}`}
-      title={title}
+      aria-label={title}
+      data-tip={title}
       onMouseDown={(e) => e.preventDefault()}
       onClick={onClick}
     >
@@ -50,7 +55,7 @@ function Btn({
  * column insert & delete, header-row toggle, delete table (no merge — GFM
  * tables cannot serialize spans).
  */
-export function TableMenu({ editor, scrollRef }: Props) {
+export function TableMenu({ editor, scrollRef, zoom }: Props) {
   const { t } = useI18n()
   const [rect, setRect] = useState<{ top: number; left: number } | null>(null)
 
@@ -88,7 +93,7 @@ export function TableMenu({ editor, scrollRef }: Props) {
       scroller?.removeEventListener('scroll', reposition)
       window.removeEventListener('resize', reposition)
     }
-  }, [editor, inTable, scrollRef])
+  }, [editor, inTable, scrollRef, zoom])
 
   if (!editor || !inTable || !rect) return null
   const run = (fn: (c: ReturnType<Editor['chain']>) => ReturnType<Editor['chain']>) =>
@@ -107,7 +112,7 @@ export function TableMenu({ editor, scrollRef }: Props) {
       <Btn title={t('tableRowBelow')} onClick={() => run((c) => c.addRowAfter())}>
         <IconRowInsertBelow size={ICON} />
       </Btn>
-      <Btn title={t('tableDeleteRow')} onClick={() => run((c) => c.deleteRow())}>
+      <Btn title={t('tableDeleteRow')} danger onClick={() => run((c) => c.deleteRow())}>
         <IconRowDelete size={ICON} />
       </Btn>
       <span className="tm-sep" />
@@ -117,7 +122,7 @@ export function TableMenu({ editor, scrollRef }: Props) {
       <Btn title={t('tableColRight')} onClick={() => run((c) => c.addColumnAfter())}>
         <IconColInsertRight size={ICON} />
       </Btn>
-      <Btn title={t('tableDeleteCol')} onClick={() => run((c) => c.deleteColumn())}>
+      <Btn title={t('tableDeleteCol')} danger onClick={() => run((c) => c.deleteColumn())}>
         <IconColDelete size={ICON} />
       </Btn>
       <span className="tm-sep" />

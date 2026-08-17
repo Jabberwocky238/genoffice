@@ -19,6 +19,12 @@
   z-index: 10;
 }
 
+/* While a Home popover is open the strip must deliver presses (drag regions
+   swallow them), so outside-press dismissal can see presses on the blank band */
+html.genoffice-popover-open .tab-bar {
+  -webkit-app-region: no-drag;
+}
+
 /* room for the macOS traffic lights (titleBarStyle: hiddenInset) */
 .tab-bar-drag-spacer {
   width: 78px;
@@ -321,5 +327,15 @@
   :root:not([data-theme='light']):not([data-theme='dark']) .tab-new-btn:hover,
   :root:not([data-theme='light']):not([data-theme='dark']) .tab-overflow-btn:hover {
     background: rgba(255, 255, 255, 0.1);
+  }
+}
+/* Motion accessibility: suppress all animation for users who opt out */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }

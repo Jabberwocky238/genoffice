@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { execSync, spawn } from 'node:child_process'
 import {
   copyFileSync,
   cpSync,
@@ -16,11 +16,12 @@ import {
   dialog,
   ipcMain,
   nativeImage,
+  nativeTheme,
   session,
   shell,
   webContents,
 } from 'electron'
-import type { MenuItemConstructorOptions, NativeImage } from 'electron'
+import type { MenuItemConstructorOptions, NativeImage, WebContents } from 'electron'
 import menuDocxIcon1x from './assets/menu-docx.png?asset'
 import menuDocxIcon2x from './assets/menu-docx@2x.png?asset'
 import menuXlsxIcon1x from './assets/menu-xlsx.png?asset'
@@ -35,16 +36,31 @@ import menuHomeIcon1x from './assets/menu-home.png?asset'
 import menuHomeIcon2x from './assets/menu-home@2x.png?asset'
 import { createI18n, isLang, normalizeLang, setUiLang, type Lang } from '@genoffice/i18n'
 import {
+  DEFAULT_SAVE_DIR_KEY,
+  GITHUB_REPO_URL,
   appMenuLabels,
   contextMenuLabels,
   editMenuTemplate,
   installContextMenu,
   installNavigationGuard,
+  isUsableSaveDir,
   showOpenDialogWithMemory,
   showSaveDialogWithMemory,
   windowMenuTemplate,
 } from '@genoffice/electron-utils'
 import { readAppSettings, writeAppSetting } from './app-settings'
+import {
+  LAST_RUN_VERSION_KEY,
+  STAR_PROMPT_KEY,
+  asStarPromptState,
+  isUpgradeLaunch,
+  shouldShowStarPrompt,
+  shouldShowUpgradeStarPrompt,
+  withDocOpen,
+  withFirstRun,
+  withResolved,
+  withShown,
+} from './star-prompt'
 import {
   clearCloudProjectsStore,
   cloudProjectExternalUrl,
@@ -117,6 +133,7 @@ import {
   setSlidesExtraFileMenuItems,
   setSlidesOpenedHook,
   setSlidesShellWindow,
+  setSlidesShowBleed,
   slidesFileRenamed,
 } from '../../../slides/src/main/slides-main'
 import {
@@ -125,6 +142,7 @@ import {
   pdfIsDirty,
   requestPdfClose,
   requestPdfSaveAs,
+  sendPdfPrintRequest,
   setPdfSaveAsInFlight,
 } from '../../../pdf/src/main/pdf-main'
 import {
@@ -133,6 +151,7 @@ import {
   requestMarkdownClose,
   requestMarkdownSave,
   sendMarkdownExportRequest,
+  sendMarkdownPrintRequest,
   setMarkdownDocxExportedHook,
   setMarkdownFileSavedHook,
 } from '../../../markdown/src/main/markdown-main'
@@ -141,6 +160,7 @@ import type {
   RecentEntry,
   RecentPage,
   RenameResult,
+  StarPromptShow,
   UiTheme,
 } from '../shared/home-api'
 import { HOME_CHANNELS } from '../shared/home-api'
@@ -224,6 +244,7 @@ configurePdfRuntime({
   preloadPath: join(PDF_OUT, 'preload', 'index.js'),
   rendererUrl: process.env.PDF_RENDERER_URL,
   rendererFile: join(PDF_OUT, 'renderer', 'index.html'),
+  openGeneratedPath: (path) => openDocumentPath(path),
 })
 configureMarkdownRuntime({
   preloadPath: join(MARKDOWN_OUT, 'preload', 'index.js'),
@@ -283,6 +304,60 @@ function currentTheme(): UiTheme {
 // invite link, which stays out of this repo and rotates server-side.
 const GENTEAM_URL = 'https://genoffice.ai/join'
 
+// Genspark credit-usage page opened from the account menu's credits row.
+// Kept main-side so the renderer never supplies the URL.
+const CREDIT_USAGE_URL = 'https://www.genspark.ai/credit-usage'
+
+// ---- "star us on GitHub" prompt (see star-prompt.ts for the rules) ----
+
+const readStarPrompt = () =>
+  asStarPromptState(readAppSettings(APP_SETTINGS_PATH())[STAR_PROMPT_KEY])
+const writeStarPrompt = (state: ReturnType<typeof readStarPrompt>) =>
+  writeAppSetting(APP_SETTINGS_PATH(), STAR_PROMPT_KEY, state)
+
+/** set at startup when this is the first launch after an upgrade; consumed by
+ * the first starPromptShouldShow query of the session */
+let upgradeStarPromptPending = false
+
+/** a granted show, cached for the session: repeated queries (React StrictMode
+ * double-effects, AppFrame remounts) must return the same answer instead of
+ * burning another lifetime show or flipping to a snoozed "false" */
+let starPromptSessionGrant: StarPromptShow | null = null
+
+/** every successful document open counts toward the prompt's value threshold */
+function recordStarPromptDocOpen(): void {
+  try {
+    const state = readStarPrompt()
+    const next = withDocOpen(state)
+    if (next !== state) writeStarPrompt(next)
+  } catch {
+    // settings write failures must never break opening a document
+  }
+}
+
+// Stargazer count for the settings About pane; fetched main-side (the
+// renderer CSP has no api.github.com) and cached per session — the exact
+// number is decoration, staleness is fine.
+let cachedGithubStars: number | null = null
+
+async function fetchGithubStars(): Promise<number | null> {
+  if (cachedGithubStars !== null) return cachedGithubStars
+  try {
+    const response = await fetch('https://api.github.com/repos/genspark-ai/genoffice', {
+      headers: { Accept: 'application/vnd.github+json' },
+      signal: AbortSignal.timeout(5000),
+    })
+    if (!response.ok) return null
+    const body: unknown = await response.json()
+    const count = (body as { stargazers_count?: unknown }).stargazers_count
+    if (typeof count !== 'number' || !Number.isFinite(count)) return null
+    cachedGithubStars = count
+    return count
+  } catch {
+    return null
+  }
+}
+
 const tMain = createI18n({
   zh: {
     menuFile: '文件',
@@ -297,6 +372,7 @@ const tMain = createI18n({
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: '导出为 PDF…',
     menuOpenInDocs: '转换为 Docs 文档并打开',
+    menuPrint: '打印…',
     menuOpen: '打开…',
     menuSave: '保存',
     menuSaveAs: '另存为…',
@@ -334,6 +410,8 @@ const tMain = createI18n({
     pdfDocxFailedMsg: '导出为 Word 失败',
     pdfDocxNoCliMsg: '无法登录 Genspark：缺少必需组件（gsk），请重新安装应用。',
     pdfDocxBusyMsg: '正在转换中，请等待当前导出完成。',
+    dlgPickSaveDir: '选择默认保存位置',
+    errSaveDirUnusable: '所选文件夹不可写，无法用作默认保存位置',
   },
   en: {
     menuFile: 'File',
@@ -347,7 +425,8 @@ const tMain = createI18n({
     menuNewSlide: 'AI Slides',
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: 'Export as PDF…',
-    menuOpenInDocs: 'Convert & Open in AI Docs',
+    menuOpenInDocs: 'Convert and Open in Docs',
+    menuPrint: 'Print…',
     menuOpen: 'Open…',
     menuSave: 'Save',
     menuSaveAs: 'Save As…',
@@ -388,6 +467,9 @@ const tMain = createI18n({
     pdfDocxNoCliMsg:
       'Cannot sign in to Genspark: a required component (gsk) is missing. Please reinstall the app.',
     pdfDocxBusyMsg: 'A Word export is already in progress. Please wait for it to finish.',
+    dlgPickSaveDir: 'Choose Default Save Location',
+    errSaveDirUnusable:
+      'The selected folder is not writable and cannot be used as the default save location',
   },
   ja: {
     menuFile: 'ファイル',
@@ -402,6 +484,7 @@ const tMain = createI18n({
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: 'PDF として書き出す…',
     menuOpenInDocs: 'Docs 文書に変換して開く',
+    menuPrint: '印刷…',
     menuOpen: '開く…',
     menuSave: '保存',
     menuSaveAs: '名前を付けて保存…',
@@ -442,6 +525,9 @@ const tMain = createI18n({
     pdfDocxNoCliMsg:
       'Genspark にサインインできません：必要なコンポーネント（gsk）が見つかりません。アプリを再インストールしてください。',
     pdfDocxBusyMsg: 'Word への書き出しが進行中です。完了までお待ちください。',
+    dlgPickSaveDir: '既定の保存先を選択',
+    errSaveDirUnusable:
+      '選択したフォルダーは書き込みできないため、既定の保存先として使用できません',
   },
   ko: {
     menuFile: '파일',
@@ -456,6 +542,7 @@ const tMain = createI18n({
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: 'PDF로 내보내기…',
     menuOpenInDocs: 'Docs 문서로 변환하여 열기',
+    menuPrint: '인쇄…',
     menuOpen: '열기…',
     menuSave: '저장',
     menuSaveAs: '다른 이름으로 저장…',
@@ -496,6 +583,8 @@ const tMain = createI18n({
     pdfDocxNoCliMsg:
       'Genspark에 로그인할 수 없습니다. 필수 구성 요소(gsk)가 없습니다. 앱을 다시 설치해 주세요.',
     pdfDocxBusyMsg: 'Word 내보내기가 이미 진행 중입니다. 완료될 때까지 기다려 주세요.',
+    dlgPickSaveDir: '기본 저장 위치 선택',
+    errSaveDirUnusable: '선택한 폴더에 쓸 수 없어 기본 저장 위치로 사용할 수 없습니다',
   },
   fr: {
     menuFile: 'Fichier',
@@ -509,7 +598,8 @@ const tMain = createI18n({
     menuNewSlide: 'AI Slides',
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: 'Exporter en PDF…',
-    menuOpenInDocs: 'Convertir et ouvrir dans AI Docs',
+    menuOpenInDocs: 'Convertir et ouvrir dans Docs',
+    menuPrint: 'Imprimer…',
     menuOpen: 'Ouvrir…',
     menuSave: 'Enregistrer',
     menuSaveAs: 'Enregistrer sous…',
@@ -550,6 +640,9 @@ const tMain = createI18n({
     pdfDocxNoCliMsg:
       "Connexion à Genspark impossible : un composant requis (gsk) est manquant. Veuillez réinstaller l'application.",
     pdfDocxBusyMsg: "Un export en Word est déjà en cours. Veuillez attendre qu'il se termine.",
+    dlgPickSaveDir: "Choisir l'emplacement d'enregistrement par défaut",
+    errSaveDirUnusable:
+      "Le dossier sélectionné n'est pas accessible en écriture et ne peut pas servir d'emplacement d'enregistrement par défaut",
   },
   de: {
     menuFile: 'Datei',
@@ -563,7 +656,8 @@ const tMain = createI18n({
     menuNewSlide: 'AI Slides',
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: 'Als PDF exportieren…',
-    menuOpenInDocs: 'In AI Docs umwandeln und öffnen',
+    menuOpenInDocs: 'In Docs umwandeln und öffnen',
+    menuPrint: 'Drucken…',
     menuOpen: 'Öffnen…',
     menuSave: 'Speichern',
     menuSaveAs: 'Speichern unter…',
@@ -604,6 +698,9 @@ const tMain = createI18n({
     pdfDocxNoCliMsg:
       'Anmeldung bei Genspark nicht möglich: Eine erforderliche Komponente (gsk) fehlt. Bitte installieren Sie die App neu.',
     pdfDocxBusyMsg: 'Ein Word-Export läuft bereits. Bitte warten Sie, bis er abgeschlossen ist.',
+    dlgPickSaveDir: 'Standard-Speicherort auswählen',
+    errSaveDirUnusable:
+      'Der ausgewählte Ordner ist nicht beschreibbar und kann nicht als Standard-Speicherort verwendet werden',
   },
   es: {
     menuFile: 'Archivo',
@@ -617,7 +714,8 @@ const tMain = createI18n({
     menuNewSlide: 'AI Slides',
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: 'Exportar como PDF…',
-    menuOpenInDocs: 'Convertir y abrir en AI Docs',
+    menuOpenInDocs: 'Convertir y abrir en Docs',
+    menuPrint: 'Imprimir…',
     menuOpen: 'Abrir…',
     menuSave: 'Guardar',
     menuSaveAs: 'Guardar como…',
@@ -658,6 +756,9 @@ const tMain = createI18n({
     pdfDocxNoCliMsg:
       'No se puede iniciar sesión en Genspark: falta un componente necesario (gsk). Reinstale la aplicación.',
     pdfDocxBusyMsg: 'Ya hay una exportación a Word en curso. Espera a que termine.',
+    dlgPickSaveDir: 'Elegir ubicación de guardado predeterminada',
+    errSaveDirUnusable:
+      'La carpeta seleccionada no admite escritura y no puede usarse como ubicación de guardado predeterminada',
   },
   th: {
     menuFile: 'ไฟล์',
@@ -671,7 +772,8 @@ const tMain = createI18n({
     menuNewSlide: 'AI Slides',
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: 'ส่งออกเป็น PDF…',
-    menuOpenInDocs: 'แปลงและเปิดใน AI Docs',
+    menuOpenInDocs: 'แปลงและเปิดใน Docs',
+    menuPrint: 'พิมพ์…',
     menuOpen: 'เปิด…',
     menuSave: 'บันทึก',
     menuSaveAs: 'บันทึกเป็น…',
@@ -711,6 +813,8 @@ const tMain = createI18n({
     pdfDocxNoCliMsg:
       'ไม่สามารถลงชื่อเข้าใช้ Genspark ได้: ไม่พบคอมโพเนนต์ที่จำเป็น (gsk) โปรดติดตั้งแอปใหม่',
     pdfDocxBusyMsg: 'กำลังส่งออกเป็น Word อยู่ โปรดรอให้เสร็จสิ้นก่อน',
+    dlgPickSaveDir: 'เลือกตำแหน่งบันทึกเริ่มต้น',
+    errSaveDirUnusable: 'โฟลเดอร์ที่เลือกไม่สามารถเขียนได้ จึงใช้เป็นตำแหน่งบันทึกเริ่มต้นไม่ได้',
   },
   id: {
     menuFile: 'File',
@@ -724,7 +828,8 @@ const tMain = createI18n({
     menuNewSlide: 'AI Slides',
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: 'Ekspor sebagai PDF…',
-    menuOpenInDocs: 'Konversi & buka di AI Docs',
+    menuOpenInDocs: 'Konversi dan buka di Docs',
+    menuPrint: 'Cetak…',
     menuOpen: 'Buka…',
     menuSave: 'Simpan',
     menuSaveAs: 'Simpan Sebagai…',
@@ -765,6 +870,9 @@ const tMain = createI18n({
     pdfDocxNoCliMsg:
       'Tidak dapat masuk ke Genspark: komponen yang diperlukan (gsk) tidak ditemukan. Silakan instal ulang aplikasi.',
     pdfDocxBusyMsg: 'Ekspor ke Word sedang berlangsung. Harap tunggu hingga selesai.',
+    dlgPickSaveDir: 'Pilih Lokasi Penyimpanan Default',
+    errSaveDirUnusable:
+      'Folder yang dipilih tidak dapat ditulis dan tidak bisa digunakan sebagai lokasi penyimpanan default',
   },
   ru: {
     menuFile: 'Файл',
@@ -778,7 +886,8 @@ const tMain = createI18n({
     menuNewSlide: 'AI Slides',
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: 'Экспортировать в PDF…',
-    menuOpenInDocs: 'Преобразовать и открыть в AI Docs',
+    menuOpenInDocs: 'Преобразовать и открыть в Docs',
+    menuPrint: 'Печать…',
     menuOpen: 'Открыть…',
     menuSave: 'Сохранить',
     menuSaveAs: 'Сохранить как…',
@@ -819,6 +928,9 @@ const tMain = createI18n({
     pdfDocxNoCliMsg:
       'Не удаётся войти в Genspark: отсутствует необходимый компонент (gsk). Переустановите приложение.',
     pdfDocxBusyMsg: 'Экспорт в Word уже выполняется. Дождитесь его завершения.',
+    dlgPickSaveDir: 'Выбрать папку сохранения по умолчанию',
+    errSaveDirUnusable:
+      'Выбранная папка недоступна для записи и не может использоваться как папка сохранения по умолчанию',
   },
   ar: {
     menuFile: 'ملف',
@@ -832,7 +944,8 @@ const tMain = createI18n({
     menuNewSlide: 'AI Slides',
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: 'تصدير بتنسيق PDF…',
-    menuOpenInDocs: 'التحويل والفتح في AI Docs',
+    menuOpenInDocs: 'التحويل والفتح في Docs',
+    menuPrint: 'طباعة…',
     menuOpen: 'فتح…',
     menuSave: 'حفظ',
     menuSaveAs: 'حفظ باسم…',
@@ -872,6 +985,8 @@ const tMain = createI18n({
     pdfDocxNoCliMsg:
       'تعذّر تسجيل الدخول إلى Genspark: المكوّن المطلوب (gsk) مفقود. يُرجى إعادة تثبيت التطبيق.',
     pdfDocxBusyMsg: 'يجري حاليًا تصدير إلى Word. يُرجى الانتظار حتى يكتمل.',
+    dlgPickSaveDir: 'اختيار موقع الحفظ الافتراضي',
+    errSaveDirUnusable: 'المجلد المحدد غير قابل للكتابة ولا يمكن استخدامه كموقع حفظ افتراضي',
   },
   pt: {
     menuFile: 'Arquivo',
@@ -885,7 +1000,8 @@ const tMain = createI18n({
     menuNewSlide: 'AI Slides',
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: 'Exportar como PDF…',
-    menuOpenInDocs: 'Converter e abrir no AI Docs',
+    menuOpenInDocs: 'Converter e abrir no Docs',
+    menuPrint: 'Imprimir…',
     menuOpen: 'Abrir…',
     menuSave: 'Salvar',
     menuSaveAs: 'Salvar Como…',
@@ -926,6 +1042,9 @@ const tMain = createI18n({
     pdfDocxNoCliMsg:
       'Não é possível iniciar sessão no Genspark: falta um componente necessário (gsk). Reinstale o aplicativo.',
     pdfDocxBusyMsg: 'Já há uma exportação para Word em andamento. Aguarde a conclusão.',
+    dlgPickSaveDir: 'Escolher local de salvamento padrão',
+    errSaveDirUnusable:
+      'A pasta selecionada não permite gravação e não pode ser usada como local de salvamento padrão',
   },
   it: {
     menuFile: 'File',
@@ -939,7 +1058,8 @@ const tMain = createI18n({
     menuNewSlide: 'AI Slides',
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: 'Esporta come PDF…',
-    menuOpenInDocs: 'Converti e apri in AI Docs',
+    menuOpenInDocs: 'Converti e apri in Docs',
+    menuPrint: 'Stampa…',
     menuOpen: 'Apri…',
     menuSave: 'Salva',
     menuSaveAs: 'Salva con nome…',
@@ -980,6 +1100,9 @@ const tMain = createI18n({
     pdfDocxNoCliMsg:
       "Impossibile accedere a Genspark: manca un componente necessario (gsk). Reinstallare l'app.",
     pdfDocxBusyMsg: "Un'esportazione in Word è già in corso. Attendi il completamento.",
+    dlgPickSaveDir: 'Scegli la posizione di salvataggio predefinita',
+    errSaveDirUnusable:
+      'La cartella selezionata non è scrivibile e non può essere usata come posizione di salvataggio predefinita',
   },
   pl: {
     menuFile: 'Plik',
@@ -993,7 +1116,8 @@ const tMain = createI18n({
     menuNewSlide: 'AI Slides',
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: 'Eksportuj jako PDF…',
-    menuOpenInDocs: 'Konwertuj i otwórz w AI Docs',
+    menuOpenInDocs: 'Konwertuj i otwórz w Docs',
+    menuPrint: 'Drukuj…',
     menuOpen: 'Otwórz…',
     menuSave: 'Zapisz',
     menuSaveAs: 'Zapisz jako…',
@@ -1034,6 +1158,9 @@ const tMain = createI18n({
     pdfDocxNoCliMsg:
       'Nie można zalogować się do Genspark: brakuje wymaganego komponentu (gsk). Zainstaluj aplikację ponownie.',
     pdfDocxBusyMsg: 'Eksport do formatu Word już trwa. Poczekaj na jego zakończenie.',
+    dlgPickSaveDir: 'Wybierz domyślną lokalizację zapisu',
+    errSaveDirUnusable:
+      'Wybrany folder nie pozwala na zapis i nie może być domyślną lokalizacją zapisu',
   },
   nl: {
     menuFile: 'Bestand',
@@ -1047,7 +1174,8 @@ const tMain = createI18n({
     menuNewSlide: 'AI Slides',
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: 'Exporteren als PDF…',
-    menuOpenInDocs: 'Converteren en openen in AI Docs',
+    menuOpenInDocs: 'Converteren en openen in Docs',
+    menuPrint: 'Afdrukken…',
     menuOpen: 'Openen…',
     menuSave: 'Opslaan',
     menuSaveAs: 'Opslaan als…',
@@ -1088,6 +1216,9 @@ const tMain = createI18n({
     pdfDocxNoCliMsg:
       'Kan niet inloggen bij Genspark: een vereist onderdeel (gsk) ontbreekt. Installeer de app opnieuw.',
     pdfDocxBusyMsg: 'Er is al een Word-export bezig. Wacht tot deze is voltooid.',
+    dlgPickSaveDir: 'Standaard opslaglocatie kiezen',
+    errSaveDirUnusable:
+      'De geselecteerde map is niet beschrijfbaar en kan niet als standaard opslaglocatie worden gebruikt',
   },
   ms: {
     menuFile: 'Fail',
@@ -1101,7 +1232,8 @@ const tMain = createI18n({
     menuNewSlide: 'AI Slides',
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: 'Eksport sebagai PDF…',
-    menuOpenInDocs: 'Tukar & buka dalam AI Docs',
+    menuOpenInDocs: 'Tukar dan buka dalam Docs',
+    menuPrint: 'Cetak…',
     menuOpen: 'Buka…',
     menuSave: 'Simpan',
     menuSaveAs: 'Simpan Sebagai…',
@@ -1142,6 +1274,9 @@ const tMain = createI18n({
     pdfDocxNoCliMsg:
       'Tidak dapat log masuk ke Genspark: komponen yang diperlukan (gsk) tiada. Sila pasang semula aplikasi.',
     pdfDocxBusyMsg: 'Eksport ke Word sedang dijalankan. Sila tunggu sehingga selesai.',
+    dlgPickSaveDir: 'Pilih Lokasi Simpanan Lalai',
+    errSaveDirUnusable:
+      'Folder yang dipilih tidak boleh ditulis dan tidak dapat digunakan sebagai lokasi simpanan lalai',
   },
   he: {
     menuFile: 'קובץ',
@@ -1155,7 +1290,8 @@ const tMain = createI18n({
     menuNewSlide: 'AI Slides',
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: 'ייצוא כ-PDF…',
-    menuOpenInDocs: 'המרה ופתיחה ב-AI Docs',
+    menuOpenInDocs: 'המרה ופתיחה ב-Docs',
+    menuPrint: 'הדפסה…',
     menuOpen: 'פתיחה…',
     menuSave: 'שמירה',
     menuSaveAs: 'שמירה בשם…',
@@ -1193,6 +1329,9 @@ const tMain = createI18n({
     pdfDocxFailedMsg: 'הייצוא כ-Word נכשל',
     pdfDocxNoCliMsg: 'לא ניתן להתחבר ל-Genspark: רכיב נדרש (gsk) חסר. נא להתקין מחדש את האפליקציה.',
     pdfDocxBusyMsg: 'ייצוא ל-Word כבר מתבצע. נא להמתין לסיומו.',
+    dlgPickSaveDir: 'בחירת מיקום שמירה כברירת מחדל',
+    errSaveDirUnusable:
+      'התיקייה שנבחרה אינה ניתנת לכתיבה ולא ניתן להשתמש בה כמיקום שמירה כברירת מחדל',
   },
   hi: {
     menuFile: 'फ़ाइल',
@@ -1206,7 +1345,8 @@ const tMain = createI18n({
     menuNewSlide: 'AI Slides',
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: 'PDF के रूप में निर्यात…',
-    menuOpenInDocs: 'AI Docs में बदलें और खोलें',
+    menuOpenInDocs: 'Docs में बदलें और खोलें',
+    menuPrint: 'प्रिंट करें…',
     menuOpen: 'खोलें…',
     menuSave: 'सहेजें',
     menuSaveAs: 'इस रूप में सहेजें…',
@@ -1247,6 +1387,9 @@ const tMain = createI18n({
     pdfDocxNoCliMsg:
       'Genspark में साइन इन नहीं किया जा सकता: आवश्यक घटक (gsk) मौजूद नहीं है। कृपया ऐप को फिर से इंस्टॉल करें।',
     pdfDocxBusyMsg: 'Word के रूप में निर्यात पहले से चल रहा है। कृपया पूरा होने तक प्रतीक्षा करें।',
+    dlgPickSaveDir: 'डिफ़ॉल्ट सहेजने का स्थान चुनें',
+    errSaveDirUnusable:
+      'चयनित फ़ोल्डर में लिखा नहीं जा सकता, इसलिए इसे डिफ़ॉल्ट सहेजने के स्थान के रूप में उपयोग नहीं किया जा सकता',
   },
   'zh-TW': {
     menuFile: '檔案',
@@ -1261,6 +1404,7 @@ const tMain = createI18n({
     menuNewMarkdown: 'AI Markdown',
     menuExportPdf: '匯出為 PDF…',
     menuOpenInDocs: '轉換為 Docs 文件並開啟',
+    menuPrint: '列印…',
     menuOpen: '開啟…',
     menuSave: '儲存',
     menuSaveAs: '另存新檔…',
@@ -1298,6 +1442,8 @@ const tMain = createI18n({
     pdfDocxFailedMsg: '匯出為 Word 失敗',
     pdfDocxNoCliMsg: '無法登入 Genspark：缺少必要元件（gsk），請重新安裝應用程式。',
     pdfDocxBusyMsg: '正在轉換中，請等待目前的匯出完成。',
+    dlgPickSaveDir: '選擇預設儲存位置',
+    errSaveDirUnusable: '所選資料夾無法寫入，無法作為預設儲存位置',
   },
 })
 
@@ -1384,6 +1530,9 @@ function createShellWindow(): void {
     },
   })
   shellWindow = win
+  // dragging the window by the tab strip's blank (draggable) area produces no
+  // DOM event anywhere — will-move is the only signal to dismiss popovers
+  win.on('will-move', () => broadcastChromePressed())
 
   const manager = new TabManager(
     win,
@@ -1408,6 +1557,7 @@ function createShellWindow(): void {
   setDocsShellWindow(win)
   setSheetsShellWindow(win)
   setSlidesShellWindow(win)
+  setSlidesShowBleed((wc, on) => manager.setContentBleed(wc, on))
   setDocsShellHooks({
     openTab: (openPath, options) => manager.openDocsTab(openPath, options),
     listTabs: () =>
@@ -1570,6 +1720,12 @@ function notifyUnsupportedFile(filePath: string): void {
 
 /** the single router: extension decides which module owns the file; false = nothing opened */
 function openDocumentPath(filePath: string): boolean {
+  const opened = routeDocumentPath(filePath)
+  if (opened) recordStarPromptDocOpen()
+  return opened
+}
+
+function routeDocumentPath(filePath: string): boolean {
   if (!existsSync(filePath) || !tabManager) return false
   if (DOCX_RE.test(filePath)) {
     recordRecentFile(filePath)
@@ -1656,6 +1812,8 @@ function surfaceNewTabError(err: unknown): void {
 function newDocTab(): void {
   try {
     tabManager?.openDocsTab(undefined, { newBlank: true })
+    // creating a document is as much a value moment as opening one
+    recordStarPromptDocOpen()
   } catch (err) {
     surfaceNewTabError(err)
   }
@@ -1664,6 +1822,7 @@ function newDocTab(): void {
 function newSlideTab(): void {
   try {
     tabManager?.openSlidesTab()
+    recordStarPromptDocOpen()
   } catch (err) {
     surfaceNewTabError(err)
   }
@@ -1672,6 +1831,7 @@ function newSlideTab(): void {
 function newMarkdownTab(): void {
   try {
     tabManager?.openMarkdownTab()
+    recordStarPromptDocOpen()
   } catch (err) {
     surfaceNewTabError(err)
   }
@@ -1712,7 +1872,9 @@ function registerHomeIpc(): void {
     if (!loadGenofficeAuth()) return { loggedIn: false }
     await proxyBootstrap
     const info = await gskLoginInfo()
-    return info ? { loggedIn: true, email: info.email } : { loggedIn: true }
+    return info
+      ? { loggedIn: true, email: info.email, creditBalance: info.creditBalance }
+      : { loggedIn: true }
   })
 
   // login progress is streamed to the requesting renderer; the auth URL is
@@ -1935,19 +2097,90 @@ function registerHomeIpc(): void {
   })
 
   ipcMain.handle(HOME_CHANNELS.getTheme, (): UiTheme => currentTheme())
+  // editor tabs ask via the app-wide channel (symmetric with app:get-language)
+  ipcMain.handle('app:get-theme', (): UiTheme => currentTheme())
 
   ipcMain.handle(HOME_CHANNELS.setTheme, (_event, theme: unknown) => {
     if (theme !== 'light' && theme !== 'dark' && theme !== 'system') return
     if (theme === currentTheme()) return
     cachedTheme = theme
     writeAppSetting(APP_SETTINGS_PATH(), 'theme', theme)
+    nativeTheme.themeSource = theme
     for (const wc of webContents.getAllWebContents()) wc.send('app:theme-changed', theme)
+  })
+
+  // effective folder where new/untitled files land; the editor mains resolve
+  // the same setting themselves (configuredDefaultSaveDir via docs' defaultSaveDir)
+  ipcMain.handle(HOME_CHANNELS.getDefaultSaveDir, (): string => defaultSaveDir())
+
+  ipcMain.handle(HOME_CHANNELS.pickDefaultSaveDir, async (): Promise<string | null> => {
+    const result = await showOpenDialogWithMemory(dialog, shellWindow, {
+      title: tm('dlgPickSaveDir'),
+      defaultPath: defaultSaveDir(),
+      properties: ['openDirectory', 'createDirectory'],
+    })
+    const picked = result.filePaths[0]
+    if (result.canceled || !picked) return null
+    if (!isUsableSaveDir(picked)) {
+      showErrorDialog(shellWindow, tm('errSaveDirUnusable'), picked)
+      return null
+    }
+    writeAppSetting(APP_SETTINGS_PATH(), DEFAULT_SAVE_DIR_KEY, picked)
+    return picked
   })
 
   ipcMain.handle(HOME_CHANNELS.openGenTeam, () => {
     shell.openExternal(GENTEAM_URL).catch(() => {
       // no browser handler available; nothing actionable for the user here
     })
+  })
+
+  ipcMain.handle(HOME_CHANNELS.openCreditUsage, () => {
+    shell.openExternal(CREDIT_USAGE_URL).catch(() => {
+      // no browser handler available; nothing actionable for the user here
+    })
+  })
+
+  ipcMain.handle(HOME_CHANNELS.openGitHubRepo, () => {
+    shell.openExternal(GITHUB_REPO_URL).catch(() => {
+      // no browser handler available; nothing actionable for the user here
+    })
+  })
+
+  ipcMain.handle(HOME_CHANNELS.githubStars, () => fetchGithubStars())
+
+  // returning true also counts as "shown": the renderer displays it
+  // unconditionally, so no separate mark-shown round-trip is needed
+  ipcMain.handle(HOME_CHANNELS.starPromptShouldShow, (): StarPromptShow => {
+    if (starPromptSessionGrant) return starPromptSessionGrant
+    const now = Date.now()
+    const state = readStarPrompt()
+    const docOpens = state.docOpens ?? 0
+    // dev preview of the card without waiting out the value thresholds
+    // (same pattern as GENOFFICE_FAKE_UPDATE); nothing is recorded
+    if (!app.isPackaged && process.env.GENOFFICE_FORCE_STAR_PROMPT) return { show: true, docOpens }
+    const grant = (): StarPromptShow => {
+      writeStarPrompt(withShown(state, now))
+      starPromptSessionGrant = { show: true, docOpens }
+      return starPromptSessionGrant
+    }
+    // first launch after an upgrade: skip the value gates once for a
+    // never-prompted user (they are a proven repeat user already)
+    if (upgradeStarPromptPending) {
+      upgradeStarPromptPending = false
+      if (shouldShowUpgradeStarPrompt(state)) return grant()
+    }
+    if (!shouldShowStarPrompt(state, now)) return { show: false, docOpens }
+    return grant()
+  })
+
+  ipcMain.handle(HOME_CHANNELS.starPromptAction, (_event, action: unknown) => {
+    if (action !== 'starred' && action !== 'later') return
+    // the card was reacted to — drop the session grant so a later query (new
+    // shell window on macOS) re-evaluates the real rules (snooze / resolved)
+    starPromptSessionGrant = null
+    // 'later' needs no write: the display was already counted by the query
+    if (action === 'starred') writeStarPrompt(withResolved(readStarPrompt()))
   })
 
   const cloudProjectsStorePath = () => join(app.getPath('userData'), 'cloud-projects.json')
@@ -2007,7 +2240,21 @@ const TAB_MENU_ICON: Record<TabKind, keyof MenuIconSet> = {
   markdown: 'md',
 }
 
+// tab views see neither DOM events nor a focus change when the user clicks the
+// shell chrome — relay the press so open popovers in documents can dismiss.
+// The pressed document must be excluded: it already dismissed (or is opening)
+// its own popovers via its local pointerdown listeners, and the async IPC
+// round-trip would otherwise close a popover that very press just opened
+// (home row menus died this way: pointerdown → broadcast → menu unmounts
+// before the click event ever reached the menu item).
+function broadcastChromePressed(exclude?: WebContents): void {
+  for (const wc of webContents.getAllWebContents()) {
+    if (wc !== exclude) wc.send('app:chrome-pressed')
+  }
+}
+
 function registerTabsIpc(): void {
+  ipcMain.on(TABS_CHANNELS.chromePressed, (event) => broadcastChromePressed(event.sender))
   ipcMain.handle(TABS_CHANNELS.list, () => tabManager?.list() ?? [])
   ipcMain.handle(TABS_CHANNELS.activate, (_event, id: string) => tabManager?.activateTab(id))
   ipcMain.handle(TABS_CHANNELS.close, (_event, id: string) => tabManager?.closeTab(id))
@@ -2166,6 +2413,15 @@ function buildPdfMenu(): void {
         },
         { type: 'separator' },
         {
+          label: tm('menuPrint'),
+          accelerator: 'CmdOrCtrl+P',
+          click: () => {
+            const tab = tabManager?.activePdfTab()
+            if (tab) sendPdfPrintRequest(tab.webContents)
+          },
+        },
+        { type: 'separator' },
+        {
           label: tm('menuClose'),
           accelerator: 'CmdOrCtrl+W',
           click: () => tabManager?.closeActiveTab(),
@@ -2240,6 +2496,15 @@ function buildMarkdownMenu(): void {
           click: () => {
             const tab = tabManager?.activeMarkdownTab()
             if (tab) sendMarkdownExportRequest(tab.webContents, 'docs')
+          },
+        },
+        { type: 'separator' },
+        {
+          label: tm('menuPrint'),
+          accelerator: 'CmdOrCtrl+P',
+          click: () => {
+            const tab = tabManager?.activeMarkdownTab()
+            if (tab) sendMarkdownPrintRequest(tab.webContents)
           },
         },
         { type: 'separator' },
@@ -2528,13 +2793,45 @@ registerTabsIpc()
 // sheets' project:resolveChat goes through the handler registered by docs-main; the sessionId reverse lookup hooks in here
 setSessionPathResolver(resolveSheetsSessionPath)
 
-app.whenReady().then(() => {
-  const hasLock = app.requestSingleInstanceLock(
-    pendingLaunchPath ? { launchPath: pendingLaunchPath } : {},
-  )
+/** Dev-only pid marker for the takeover below; scoped to userData like the lock itself. */
+const devPidFile = () => join(app.getPath('userData'), 'dev-instance.pid')
+
+app.whenReady().then(async () => {
+  const lockData = () => (pendingLaunchPath ? { launchPath: pendingLaunchPath } : {})
+  let hasLock = app.requestSingleInstanceLock(lockData())
+  if (!hasLock && !app.isPackaged) {
+    // Dev watch restart: electron-vite SIGTERMs the previous instance and spawns this
+    // one immediately. Chromium turns that SIGTERM into a graceful quit (Node's
+    // process.on('SIGTERM') never fires in the main process), and the quit can wedge
+    // in the close-confirmation flow — the zombie then keeps the single-instance lock,
+    // this instance quits, and electron-vite's on-close handler exits with it, killing
+    // the renderer dev server (blank shell window until a manual dev restart).
+    // The previous instance is doomed either way: kill it and take over the lock.
+    try {
+      const oldPid = Number(readFileSync(devPidFile(), 'utf-8').trim())
+      if (Number.isFinite(oldPid) && oldPid > 0 && oldPid !== process.pid) {
+        // pid-recycling guard: only kill if that pid is still an Electron process
+        const cmd = execSync(`ps -o command= -p ${oldPid}`).toString()
+        if (cmd.includes('Electron')) process.kill(oldPid, 'SIGKILL')
+      }
+    } catch {
+      // no previous instance recorded / already gone (ps exits non-zero)
+    }
+    for (let i = 0; i < 20 && !hasLock; i++) {
+      await new Promise((r) => setTimeout(r, 150))
+      hasLock = app.requestSingleInstanceLock(lockData())
+    }
+  }
   if (!hasLock) {
     app.quit()
     return
+  }
+  if (!app.isPackaged) {
+    try {
+      writeFileSync(devPidFile(), String(process.pid))
+    } catch {
+      // best-effort: without the marker the next restart just retries the lock
+    }
   }
 
   proxyBootstrap = installMainProcessProxy()
@@ -2544,6 +2841,31 @@ app.whenReady().then(() => {
   // mutable lang, whose 'zh' default otherwise wins the race for whichever
   // tab loads first (e.g. sheets booting in Chinese while docs shows English).
   currentLang()
+  // native menus/dialogs/scrollbars follow the persisted theme from first paint
+  nativeTheme.themeSource = currentTheme()
+  // stamp the star-prompt install-age clock on the first launch carrying the feature,
+  // and detect upgrade launches (version changed since the previous run)
+  try {
+    const settings = readAppSettings(APP_SETTINGS_PATH())
+    const starState = readStarPrompt()
+    const stamped = withFirstRun(starState, Date.now())
+    if (stamped !== starState) writeStarPrompt(stamped)
+
+    const prevVersion =
+      typeof settings[LAST_RUN_VERSION_KEY] === 'string'
+        ? (settings[LAST_RUN_VERSION_KEY] as string)
+        : null
+    const currentVersion = app.getVersion()
+    upgradeStarPromptPending = isUpgradeLaunch(
+      prevVersion,
+      currentVersion,
+      settings.onboardingSeen === true,
+    )
+    if (prevVersion !== currentVersion)
+      writeAppSetting(APP_SETTINGS_PATH(), LAST_RUN_VERSION_KEY, currentVersion)
+  } catch {
+    // settings write failures must never block startup
+  }
   startSheetsCaptureServer()
   createShellWindow()
   // deferred to ready: labels need currentLang(), which reads app.getLocale()

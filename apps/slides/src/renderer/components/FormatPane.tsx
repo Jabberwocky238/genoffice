@@ -5,10 +5,10 @@
  * inputs via key.
  */
 import React, { useEffect, useRef, useState } from 'react'
-import type { RenderNode, ShapeRenderNode } from '@genoffice/pptx-render'
+import type { PictureRenderNode, RenderNode, ShapeRenderNode } from '@genoffice/pptx-render'
 import type { GradientFillSpec, LinkTargetOp } from '../../shared/ipc'
 import { useI18n } from '../i18n/locale'
-import { armColorInput } from '../color-input'
+import { ColorWell } from './ColorWell'
 import { IconSidebarCollapse } from './icons'
 
 interface Props {
@@ -107,11 +107,12 @@ export function FormatPane({
   const canTransform = !!node && TRANSFORMABLE.has(node.type)
   const shape =
     node && (node.type === 'shape' || node.type === 'text') ? (node as ShapeRenderNode) : null
+  const pic = node && node.type === 'picture' ? (node as PictureRenderNode) : null
   const fillColor = shape?.fill.kind === 'solid' ? toHex6(shape.fill.color) : null
   const fillAlpha = shape?.fill.kind === 'solid' ? alphaOf(shape.fill.color) : 255
   // 0..100 transparency shown in the dropdown (0 = opaque)
   const fillTransparency = Math.round(((255 - fillAlpha) / 255) * 100)
-  const stroke = shape?.stroke
+  const stroke = (shape ?? pic)?.stroke
   const strokeWidthPt = stroke ? Math.max(0.5, Math.round(stroke.widthPt * 2) / 2) : 1
   const strokeColor = stroke ? toHex6(stroke.color) : '#000000'
   const strokeDash = stroke?.dashPreset ?? 'solid'
@@ -196,7 +197,12 @@ export function FormatPane({
       <div className="ai-panel-header">
         <span className="ai-panel-title">{t('paneFormatTitle')}</span>
         <div className="ai-panel-header-actions">
-          <button className="ai-header-btn" onClick={onCollapse} title={t('paneFormatClose')}>
+          <button
+            className="ai-header-btn"
+            onClick={onCollapse}
+            data-tip={t('paneFormatClose')}
+            aria-label={t('paneFormatClose')}
+          >
             <IconSidebarCollapse size={15} />
           </button>
         </div>
@@ -247,7 +253,7 @@ export function FormatPane({
                 <button
                   className="fp-btn"
                   disabled={!pictureCanCutout}
-                  title={pictureCanCutout ? t('paneFormatCutoutTip') : t('paneFormatCutoutNA')}
+                  data-tip={pictureCanCutout ? t('paneFormatCutoutTip') : t('paneFormatCutoutNA')}
                   onClick={() => onPictureCutout?.()}
                 >
                   {t('paneCutoutTitle')}
@@ -260,16 +266,10 @@ export function FormatPane({
             <>
               <div className="fp-section">{t('paneFormatFill')}</div>
               <div className="fp-row">
-                <input
-                  key={`${node.sourceId}:${fillColor ?? 'none'}`}
-                  type="color"
-                  className="fp-color"
-                  defaultValue={fillColor ?? '#ffffff'}
-                  onPointerDown={(e) => armColorInput(e.currentTarget)}
-                  onChange={(e) =>
-                    debouncedFill(node.sourceId, fillValue(e.target.value, fillTransparency))
-                  }
-                  title={t('paneFormatSolidFill')}
+                <ColorWell
+                  value={fillColor ?? '#ffffff'}
+                  label={t('paneFormatSolidFill')}
+                  onPick={(hex) => debouncedFill(node.sourceId, fillValue(hex, fillTransparency))}
                 />
                 <button
                   className={`fp-btn ${shape.fill.kind === 'none' ? 'active' : ''}`}
@@ -332,20 +332,12 @@ export function FormatPane({
               )}
               <div className="fp-section">{t('paneFormatGradient')}</div>
               <div className="fp-row">
-                <input
-                  type="color"
-                  className="fp-color"
+                <ColorWell
                   value={gradFrom}
-                  onChange={(e) => setGradFrom(e.target.value)}
-                  title={t('paneFormatGradientFrom')}
+                  label={t('paneFormatGradientFrom')}
+                  onPick={setGradFrom}
                 />
-                <input
-                  type="color"
-                  className="fp-color"
-                  value={gradTo}
-                  onChange={(e) => setGradTo(e.target.value)}
-                  title={t('paneFormatGradientTo')}
-                />
+                <ColorWell value={gradTo} label={t('paneFormatGradientTo')} onPick={setGradTo} />
                 {(
                   [
                     ['→', 0, false],
@@ -357,7 +349,8 @@ export function FormatPane({
                   <button
                     key={label}
                     className="fp-btn"
-                    title={radial ? t('paneFormatGradientRadial') : `${angleDeg}°`}
+                    data-tip={radial ? t('paneFormatGradientRadial') : `${angleDeg}°`}
+                    aria-label={radial ? t('paneFormatGradientRadial') : `${angleDeg}°`}
                     onClick={() =>
                       onFill(node.sourceId, {
                         gradient: {
@@ -376,18 +369,14 @@ export function FormatPane({
             </>
           )}
 
-          {shape && (
+          {(shape || pic) && (
             <>
               <div className="fp-section">{t('paneFormatOutline')}</div>
               <div className="fp-row">
-                <input
-                  key={`${node.sourceId}:s:${strokeColor}`}
-                  type="color"
-                  className="fp-color"
-                  defaultValue={strokeColor}
-                  onPointerDown={(e) => armColorInput(e.currentTarget)}
-                  onChange={(e) => commitStroke(node.sourceId, { color: e.target.value })}
-                  title={t('paneFormatOutlineColor')}
+                <ColorWell
+                  value={strokeColor}
+                  label={t('paneFormatOutlineColor')}
+                  onPick={(hex) => commitStroke(node.sourceId, { color: hex })}
                 />
                 <label className="fp-field" style={{ flex: 1 }}>
                   <span>{t('paneFormatPt')}</span>
@@ -448,9 +437,7 @@ export function FormatPane({
                   )}
                   {s.values.map((_, pi) => (
                     <div className="fp-row fp-chart-point" key={pi}>
-                      <input
-                        className="fp-color"
-                        type="color"
+                      <ColorWell
                         value={toHex6(
                           chartData.pointColors[si]?.[pi] ??
                             (chartData.kind === 'pie'
@@ -458,8 +445,8 @@ export function FormatPane({
                               : (chartData.seriesColors[si] ??
                                 CHART_PALETTE[si % CHART_PALETTE.length]!)),
                         )}
-                        onPointerDown={(e) => armColorInput(e.currentTarget)}
-                        onChange={(e) => debouncedPointColor(si, pi, e.target.value)}
+                        label={chartData.categories[pi] || `#${pi + 1}`}
+                        onPick={(hex) => debouncedPointColor(si, pi, hex)}
                       />
                       <span className="fp-chart-point-label">
                         {chartData.categories[pi] || `#${pi + 1}`}
@@ -477,7 +464,7 @@ export function FormatPane({
               <div className="fp-row">
                 <span
                   className="fp-link-target"
-                  title={link?.kind === 'url' ? link.url : undefined}
+                  data-tip={link?.kind === 'url' ? link.url : undefined}
                 >
                   {link
                     ? link.kind === 'url'
