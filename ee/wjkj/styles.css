@@ -1,0 +1,132 @@
+.wjkj-sidebar-footer .account-entry {
+  margin-top: 0;
+}
+
+.wjkj-sidebar-footer {
+  margin-top: auto;
+  flex-shrink: 0;
+}
+
+.ai-settings-entry {
+  margin-bottom: 8px;
+}
+
+.ai-settings-modal {
+  width: min(520px, 90vw);
+}
+
+.ai-settings-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.ai-settings-heading h3 {
+  margin-bottom: 4px;
+}
+
+.ai-settings-heading p {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.ai-settings-modal .icon-btn {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: 22px/1 sans-serif;
+  cursor: pointer;
+}
+
+.ai-settings-modal .icon-btn:hover {
+  background: var(--surface-subtle);
+}
+
+.ai-settings-form {
+  display: grid;
+  gap: 14px;
+}
+
+.ai-settings-form label {
+  display: grid;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ai-settings-form input,
+.ai-settings-form select {
+  width: 100%;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+}
+
+.ai-settings-form input:focus,
+.ai-settings-form select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgb(35 103 236 / 12%);
+}
+
+.ai-settings-loading {
+  padding: 28px 0;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.ai-settings-error {
+  margin-top: 12px;
+  color: var(--color-error);
+  font-size: 12px;
+}
+
+.ai-settings-modal .primary-btn,
+.ai-settings-modal .secondary-btn {
+  min-width: 76px;
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.ai-settings-modal .primary-btn {
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+.ai-settings-modal .primary-btn:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.ai-settings-modal .primary-btn:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.ai-settings-modal .secondary-btn {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.ai-settings-modal .secondary-btn:hover {
+  background: var(--surface-subtle);
+}

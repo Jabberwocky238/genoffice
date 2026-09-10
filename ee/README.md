@@ -1,8 +1,9 @@
 # GenOffice Enterprise (`ee/`)
 
-This directory is reserved for future enterprise modules (for example
-private deployment and offline license verification). It is intentionally
-empty today except for this notice and the license.
+Enterprise modules live here, behind the enterprise license boundary.
+
+- [WJKJ](wjkj/README.md): shared AI provider settings, model suggestions,
+  and the home sidebar configuration entry.
 
 ## License boundary
 

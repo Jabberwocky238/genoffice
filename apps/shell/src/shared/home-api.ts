@@ -1,5 +1,5 @@
 import type { UpdateChannel } from './update-api'
-import type { AiSettings } from '@genoffice/ai-provider'
+import type { WjkjAiSettingsApi } from '../../../../ee/wjkj/api'
 
 /** UI language; kept self-contained here (mirrors Lang in @genoffice/i18n) */
 export type UiLanguage =
@@ -58,7 +58,7 @@ export interface RecentPage {
   totalAll: number
 }
 
-export interface HomeApi {
+export interface HomeApi extends WjkjAiSettingsApi {
   /** unified recents across document types, newest first (paged) */
   recents(query?: RecentQuery): Promise<RecentPage>
   /** starred files (independent of the recent list), newest first (paged) */
@@ -144,10 +144,6 @@ export interface HomeApi {
   cloudProjectsSync(): Promise<CloudProjectsSnapshot | null>
   /** open a cloud project (relative '/agents?id=...' URL) in the default browser */
   openCloudProject(projectUrl: string): Promise<void>
-  /** shared AI provider/model settings used by every editor module */
-  getAiSettings(): Promise<AiSettings>
-  /** persist shared AI provider/model settings */
-  setAiSettings(settings: AiSettings): Promise<void>
 }
 
 /** 'starred' = went to GitHub or said "already starred" (never prompt again);
@@ -290,8 +286,6 @@ export const HOME_CHANNELS = {
   cloudProjects: 'home:cloud-projects',
   cloudProjectsCached: 'home:cloud-projects-cached',
   openCloudProject: 'home:open-cloud-project',
-  getAiSettings: 'ai:get-settings',
-  setAiSettings: 'ai:set-settings',
 } as const
 
 export const PROJECT_CHANNELS = {

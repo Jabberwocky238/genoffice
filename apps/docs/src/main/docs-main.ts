@@ -1,3 +1,4 @@
+import { resolveWjkjAiSettings } from '../../../../ee/wjkj/main'
 import { createHash } from 'node:crypto'
 import {
   existsSync,
@@ -40,8 +41,6 @@ import {
   AiTimeoutError,
   isAiNetworkError,
   chatForProvider,
-  defaultAiSettings,
-  resolveAiSettings,
   setRescueFetch,
   streamForProvider,
   type AiChatRequest,
@@ -2468,7 +2467,7 @@ const activeAiStreams = new Map<string, AbortController>()
 export function registerAiIpc(): void {
   ipcMain.handle('ai:get-settings', (): AiSettings => {
     const stored = readJson<Partial<AiSettings> & LegacyAiSettings>(SETTINGS_PATH(), {})
-    return resolveAiSettings(stored, defaultAiSettings())
+    return resolveWjkjAiSettings(stored)
   })
 
   // Genspark account (gsk login state): auth source for AI features; the frontend uses it to prompt login when logged out

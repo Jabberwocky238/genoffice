@@ -1,3 +1,4 @@
+import { resolveWjkjAiSettings } from '../../../../ee/wjkj/main'
 /**
  * AI IPC for the slides main process, extracted from slides-main.ts:
  * settings persistence, the streaming proxy (main process does the networking
@@ -11,8 +12,6 @@ import {
   AiCreditsError,
   AiTimeoutError,
   isAiNetworkError,
-  defaultAiSettings,
-  resolveAiSettings,
   setRescueFetch,
   streamForProvider,
   type AiSettings,
@@ -64,7 +63,7 @@ export function registerAiIpc(): void {
 
   ipcMain.handle('ai:get-settings', (): AiSettings => {
     const stored = readJson<Partial<AiSettings> & LegacyAiSettings>(AI_SETTINGS_PATH(), {})
-    return resolveAiSettings(stored, defaultAiSettings())
+    return resolveWjkjAiSettings(stored)
   })
 
   // Genspark account (gsk login state): the auth source for AI features; when logged out the frontend uses this to guide login

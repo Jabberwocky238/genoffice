@@ -1,3 +1,4 @@
+import { resolveWjkjAiSettings } from '../../../../ee/wjkj/main'
 import { createHash, randomUUID } from 'node:crypto'
 import {
   createReadStream,
@@ -56,8 +57,6 @@ import {
   AiTimeoutError,
   isAiNetworkError,
   chatForProvider,
-  defaultAiSettings,
-  resolveAiSettings,
   setRescueFetch,
   streamForProvider,
   type AiProviderId,
@@ -2204,7 +2203,7 @@ export function registerSheetsAiIpc(): void {
   ipcMain.handle(IPC_CHANNELS.aiGetSettings, (event): AiSettings => {
     sessionFor(event)
     const stored = readJson<Partial<AiSettings> & LegacyAiSettings>(SETTINGS_PATH(), {})
-    return resolveAiSettings(stored, defaultAiSettings())
+    return resolveWjkjAiSettings(stored)
   })
 
   // Genspark account (gsk login state): the auth source for AI features; the
