@@ -4,6 +4,8 @@ import {
   TABLE_HEADER_FILL,
   buildBlankDocx,
   generateTableModelXml,
+  latexToOmml,
+  mathParagraphXml,
   parseDocx,
   saveDocx,
 } from '@genoffice/docx-engine'
@@ -21,6 +23,9 @@ import type {
 
 /** Resolve an authored image src to embeddable bytes; null → fall back to alt text */
 export type ImageLoader = (src: string) => Promise<NewImage | null>
+
+/** Rasterize a ```mermaid block; null → the source is exported as code */
+export type DiagramRenderer = (source: string) => Promise<NewImage | null>
 
 /** widest image that fits the A4 text column */
 export const DOCX_MAX_IMAGE_PX = 620
@@ -44,6 +49,12 @@ function runsFromInline(content: JSONContent[] | undefined): Run[] {
   for (const child of content ?? []) {
     if (child.type === 'hardBreak') {
       runs.push({ text: '\n' })
+      continue
+    }
+    if (child.type === 'inlineMath') {
+      // Run[] cannot carry OMML — keep the LaTeX source visible instead
+      const latex = String(child.attrs?.latex ?? '')
+      if (latex) runs.push({ text: `$${latex}$`, font: CODE_FONT })
       continue
     }
     if (child.type !== 'text' || !child.text) continue
@@ -74,7 +85,9 @@ interface WalkContext {
   restartNums: NonNullable<NonNullable<SaveOptions['numbering']>['restartNums']>
   nextOrderedNumId: number
   loadImage: ImageLoader
+  renderDiagram?: DiagramRenderer
   pendingImages: Array<{ index: number; src: string; alt: string }>
+  pendingDiagrams: Array<{ index: number; source: string }>
 }
 
 function mergeFormat(base: ParaFormat | undefined, extra: ParaFormat): ParaFormat {
@@ -201,13 +214,19 @@ function walkBlock(ctx: WalkContext, node: JSONContent, base?: ParaFormat): void
         walkBlock(ctx, child, mergeFormat(base, { indentLeft: INDENT_STEP, borders: 'l' }))
       }
       break
-    case 'codeBlock':
-      pushParagraph(ctx, {
+    case 'codeBlock': {
+      const source = plainText(node)
+      const code: GeneratedBlock = {
         type: 'paragraph',
-        runs: [{ text: plainText(node), font: CODE_FONT, sizeHalfPoints: 19 }],
+        runs: [{ text: source, font: CODE_FONT, sizeHalfPoints: 19 }],
         format: mergeFormat(base, { shadingFill: CODE_FILL }),
-      })
+      }
+      if (node.attrs?.language === 'mermaid' && ctx.renderDiagram && source.trim()) {
+        ctx.pendingDiagrams.push({ index: ctx.blocks.length, source })
+      }
+      pushParagraph(ctx, code)
       break
+    }
     case 'horizontalRule':
       pushParagraph(ctx, {
         type: 'paragraph',
@@ -226,6 +245,20 @@ function walkBlock(ctx: WalkContext, node: JSONContent, base?: ParaFormat): void
     case 'table':
       ctx.blocks.push({ kind: 'xml', xml: generateTableModelXml(mapTable(node)) })
       break
+    case 'blockMath': {
+      const latex = String(node.attrs?.latex ?? '')
+      try {
+        ctx.blocks.push({ kind: 'xml', xml: mathParagraphXml(latexToOmml(latex)) })
+      } catch {
+        // LaTeX outside the OMML converter's subset: keep the source visible
+        pushParagraph(ctx, {
+          type: 'paragraph',
+          runs: [{ text: `$$${latex}$$`, font: CODE_FONT }],
+          format: base,
+        })
+      }
+      break
+    }
     default: {
       // unknown block: keep its text so nothing silently disappears
       const text = plainText(node)
@@ -238,15 +271,23 @@ function walkBlock(ctx: WalkContext, node: JSONContent, base?: ParaFormat): void
 export async function mapDocToSaveBlocks(
   doc: JSONContent,
   loadImage: ImageLoader,
+  renderDiagram?: DiagramRenderer,
 ): Promise<DocxMapping> {
   const ctx: WalkContext = {
     blocks: [],
     restartNums: [],
     nextOrderedNumId: 100,
     loadImage,
+    renderDiagram,
     pendingImages: [],
+    pendingDiagrams: [],
   }
   for (const node of doc.content ?? []) walkBlock(ctx, node)
+
+  for (const pending of ctx.pendingDiagrams) {
+    const image = await ctx.renderDiagram!(pending.source).catch(() => null)
+    if (image) ctx.blocks[pending.index] = { kind: 'image', image }
+  }
 
   for (const pending of ctx.pendingImages) {
     const image = await loadImage(pending.src).catch(() => null)
@@ -272,8 +313,9 @@ export async function mapDocToSaveBlocks(
 export async function exportDocxBytes(
   doc: JSONContent,
   loadImage: ImageLoader,
+  renderDiagram?: DiagramRenderer,
 ): Promise<Uint8Array> {
-  const mapping = await mapDocToSaveBlocks(doc, loadImage)
+  const mapping = await mapDocToSaveBlocks(doc, loadImage, renderDiagram)
   const parsed = await parseDocx(await buildBlankDocx())
   return saveDocx(parsed, mapping.blocks, mapping.options)
 }

@@ -88,6 +88,29 @@ describe('textless preset shapes render as display boxes', () => {
   })
 })
 
+describe('pattern-filled rectangles (dml-shape-fillpattern)', () => {
+  it('a textless full-height rect with a:pattFill renders with its foreground color', async () => {
+    const patt =
+      '<a:pattFill prst="ltHorz"><a:fgClr><a:srgbClr val="9BFF66"/></a:fgClr>' +
+      '<a:bgClr><a:srgbClr val="FFFFFF"/></a:bgClr></a:pattFill>'
+    const doc = await parseDocx(
+      await buildDocx({
+        bodyXml: anchorParagraph(wsp({ prst: 'rect', cx: 1905000, cy: 794520, ln: patt })),
+      }),
+    )
+    const box = doc.blocks[0].textboxes?.[0]
+    expect(box).toBeTruthy()
+    expect(box!.fill).toBe('9BFF66')
+  })
+
+  it('a near-flat textless rect stays on the decorative thin-rule path', async () => {
+    const doc = await parseDocx(
+      await buildDocx({ bodyXml: anchorParagraph(wsp({ prst: 'rect', cx: 1905000, cy: 9525 })) }),
+    )
+    expect(doc.blocks[0].textboxes).toBeUndefined()
+  })
+})
+
 describe('anchored connectors', () => {
   it('a flipV straightConnector with a tail arrow renders as a diagonal lineArrow', async () => {
     const doc = await parseDocx(
@@ -291,5 +314,19 @@ describe('wpg group children', () => {
     expect(star.widthPx).toBe(Math.round(Math.round(762000 / 9525) * sx))
     expect(star.heightPx).toBe(Math.round(Math.round(723900 / 9525) * sy))
     expect(arrow.offsetXEmu).toBe(100000 + Math.round((2038350 - 1323975) * sx))
+    expect(star.inlineExtentPx).toBeUndefined()
+  })
+
+  it('an inline group reserves its extent height for the anchor line (children still float)', async () => {
+    const inline = GROUP_PARA.replace(
+      /<wp:anchor[^>]*>[\s\S]*?<wp:wrapNone\/>/,
+      '<wp:inline><wp:extent cx="1476375" cy="723900"/>',
+    ).replace('</wp:anchor>', '</wp:inline>')
+    const doc = await parseDocx(await buildDocx({ bodyXml: inline }))
+    const [star, arrow] = doc.blocks[0].textboxes!
+    expect(star.floating).toBe(true)
+    expect(star.inlineExtentPx).toBe(Math.round(723900 / 9525))
+    expect(arrow.inlineExtentPx).toBe(Math.round(723900 / 9525))
+    expect(star.offsetXEmu).toBe(0)
   })
 })

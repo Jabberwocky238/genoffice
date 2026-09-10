@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import type { AiProviderId, AiSettings } from '../../packages/ai-provider/src/types'
 import type { WjkjAiSettingsApi } from './api'
-import { WJKJ_AI_PROVIDERS } from './providers'
+import { AI_PROVIDERS } from '@genoffice/ai-provider/browser'
+import { validateWjkjAiSettings } from './settings'
 import './styles.css'
 
 export function AiSettingsEntry({ api, lang }: { api: WjkjAiSettingsApi; lang: string }) {
@@ -11,10 +12,11 @@ export function AiSettingsEntry({ api, lang }: { api: WjkjAiSettingsApi; lang: s
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
 
-  const providerMeta = WJKJ_AI_PROVIDERS.find((item) => item.id === settings?.provider)
+  const providerMeta = AI_PROVIDERS.find((item) => item.id === settings?.provider)
   const config = settings ? settings.providers[settings.provider] : null
 
   const show = () => {
+    setSettings(null)
     setOpen(true)
     setError('')
     void api
@@ -25,7 +27,9 @@ export function AiSettingsEntry({ api, lang }: { api: WjkjAiSettingsApi; lang: s
       )
   }
 
-  const updateConfig = (patch: Partial<{ apiKey: string; model: string; baseUrl: string }>) => {
+  const updateConfig = (
+    patch: Partial<{ apiKey: string; model: string; baseUrl: string; cliPath: string }>,
+  ) => {
     setSettings((current) => {
       if (!current) return current
       return {
@@ -45,12 +49,17 @@ export function AiSettingsEntry({ api, lang }: { api: WjkjAiSettingsApi; lang: s
 
   const save = async () => {
     if (!settings || !config) return
-    if (!config.model.trim()) {
-      setError(zh ? '请输入模型名称。' : 'Enter a model name.')
-      return
-    }
-    if (settings.provider === 'custom' && !config.baseUrl?.trim()) {
-      setError(zh ? '自定义提供方需要 Base URL。' : 'A custom provider requires a Base URL.')
+    const validation = validateWjkjAiSettings(settings)
+    if (validation) {
+      setError(
+        validation === 'model'
+          ? zh
+            ? '请输入模型名称。'
+            : 'Enter a model name.'
+          : zh
+            ? '此提供方需要 Base URL。'
+            : 'This provider requires a Base URL.',
+      )
       return
     }
     setSaving(true)
@@ -101,13 +110,22 @@ export function AiSettingsEntry({ api, lang }: { api: WjkjAiSettingsApi; lang: s
 
             {settings && config ? (
               <div className="ai-settings-form">
+                {providerMeta?.needsCliPath && (
+                  <label>
+                    <span>{zh ? 'CLI 路径（可选）' : 'CLI path (optional)'}</span>
+                    <input
+                      value={config.cliPath ?? ''}
+                      onChange={(event) => updateConfig({ cliPath: event.target.value })}
+                    />
+                  </label>
+                )}
                 <label>
                   <span>{zh ? '提供方' : 'Provider'}</span>
                   <select
                     value={settings.provider}
                     onChange={(event) => selectProvider(event.target.value as AiProviderId)}
                   >
-                    {WJKJ_AI_PROVIDERS.map((provider) => (
+                    {AI_PROVIDERS.map((provider) => (
                       <option key={provider.id} value={provider.id}>
                         {provider.label}
                       </option>
@@ -130,7 +148,7 @@ export function AiSettingsEntry({ api, lang }: { api: WjkjAiSettingsApi; lang: s
                   </datalist>
                 </label>
 
-                {settings.provider === 'custom' && (
+                {settings.provider !== 'genspark' && !providerMeta?.needsCliPath && (
                   <label>
                     <span>Base URL</span>
                     <input
@@ -141,7 +159,7 @@ export function AiSettingsEntry({ api, lang }: { api: WjkjAiSettingsApi; lang: s
                   </label>
                 )}
 
-                {settings.provider !== 'genspark' && (
+                {settings.provider !== 'genspark' && !providerMeta?.needsCliPath && (
                   <label>
                     <span>API Key</span>
                     <input

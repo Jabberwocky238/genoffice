@@ -11,9 +11,18 @@ import React, {
   useState,
   type ReactNode,
 } from 'react'
-import type { AnimEffectKind, AnimTrigger, TransitionKind } from '../../shared/ipc'
+import type { AnimEffectKind, GradientFillSpec, TransitionKind } from '../../shared/ipc'
 import type { ChartStyleInfo } from '@genoffice/pptx-render'
-import { useDismissablePopover } from '@genoffice/ui'
+import {
+  useDismissablePopover,
+  useRibbonCollapse,
+  Dropdown,
+  RibbonCollapseButton,
+  THEME_COLORS,
+  THEME_COLOR_SHADES,
+  STANDARD_COLORS,
+} from '@genoffice/ui'
+import { getRecentColors, pushRecentColor } from '../recent-colors'
 import { ICON_COLORS } from '../insert-presets'
 import { THEME_PRESETS, type SlideThemePreset } from '../themes'
 import { restoreEditSelection } from '../TextEditOverlay'
@@ -76,13 +85,27 @@ import {
   IconPathDiagonal,
   IconPathCircle,
   IconPathZigzag,
+  IconShapes,
   IconShapeStyle,
   IconFillColor,
+  IconObjFlipH,
+  IconObjFlipV,
+  IconReplacePicture,
+  IconRotateLeft,
+  IconRotateRight,
 } from './icons'
 // brand-supplied Review AI icon art (44px = 22px @2x), color baked in
 import iconSpelling from '../assets/icon-spelling.png'
 import iconTranslate from '../assets/icon-translate.png'
 import iconTransparency from '../assets/icon-transparency.png'
+import texPaper from '../assets/textures/paper.png'
+import texCanvas from '../assets/textures/canvas.png'
+import texWood from '../assets/textures/wood.png'
+import texMarble from '../assets/textures/marble.png'
+import texGranite from '../assets/textures/granite.png'
+import texDenim from '../assets/textures/denim.png'
+import texCork from '../assets/textures/cork.png'
+import texParchment from '../assets/textures/parchment.png'
 import iconCrop from '../assets/icon-crop.png'
 import { ChartTypeDialog } from './ChartTypeDialog'
 import {
@@ -90,7 +113,6 @@ import {
   Group,
   RbCaret,
   RIBBON_SHAPE_STYLES,
-  TEXT_COLORS,
   closeSiblingPanels,
   type Props,
   type RibbonPanelKey,
@@ -100,6 +122,7 @@ export type { FormatCmd, SlidesViewMode } from './ribbon-shared'
 import type { FormatCmd } from './ribbon-shared'
 import { RibbonHomeTab } from './RibbonHomeTab'
 import { RibbonInsertTab } from './RibbonInsertTab'
+import { ShapeGalleryContent } from './ShapeGalleryPopover'
 import { autoContextTabForElement, contextTabForElement, type ContextTab } from './context-tabs'
 
 const IS_MAC = navigator.platform.toLowerCase().includes('mac')
@@ -713,6 +736,347 @@ function RbCheck({
   )
 }
 
+/** Bundled seamless texture-fill presets (tiled at natural size when applied). */
+const FILL_TEXTURES: Array<{ url: string; tipKey: StringKey }> = [
+  { url: texPaper, tipKey: 'ribbonTexturePaper' },
+  { url: texCanvas, tipKey: 'ribbonTextureCanvas' },
+  { url: texWood, tipKey: 'ribbonTextureWood' },
+  { url: texMarble, tipKey: 'ribbonTextureMarble' },
+  { url: texGranite, tipKey: 'ribbonTextureGranite' },
+  { url: texDenim, tipKey: 'ribbonTextureDenim' },
+  { url: texCork, tipKey: 'ribbonTextureCork' },
+  { url: texParchment, tipKey: 'ribbonTextureParchment' },
+]
+
+/** Bundled asset → raw base64 (for shipping texture bytes over IPC). */
+async function urlToBase64(url: string): Promise<string> {
+  const bytes = new Uint8Array(await (await fetch(url)).arrayBuffer())
+  let bin = ''
+  for (let i = 0; i < bytes.length; i += 0x8000)
+    bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
+  return btoa(bin)
+}
+
+/** Right-pointing chevron on the gradient/texture submenu rows. */
+/** Table border weight picker (the old <select> was uncontrolled; the picked value lives here). */
+function BorderWeightDropdown({
+  tip,
+  onPick,
+}: {
+  readonly tip?: string
+  readonly onPick: (pt: number) => void
+}) {
+  const [val, setVal] = useState('1')
+  return (
+    <Dropdown
+      className="rb-border-weight-dd"
+      value={val}
+      tip={tip}
+      options={['0.5', '1', '1.5', '2.25', '3'].map((v) => ({ value: v, label: `${v}pt` }))}
+      onPick={(v) => {
+        setVal(v)
+        onPick(Number(v))
+      }}
+    />
+  )
+}
+
+function RbSubCaret() {
+  return (
+    <svg
+      className="rbf-sub-caret"
+      width="10"
+      height="10"
+      viewBox="0 0 24 24"
+      fill="none"
+      aria-hidden="true"
+    >
+      <path
+        d="M9.25 5.5 15.75 12l-6.5 6.5"
+        stroke="currentColor"
+        strokeWidth="2.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  )
+}
+
+/** #RRGGBB blended toward `to` by t (0..1); gradient preset variants. */
+function mixHex(from: string, to: string, t: number): string {
+  const pf = parseInt(from.slice(1), 16)
+  const pt = parseInt(to.slice(1), 16)
+  const ch = (shift: number) => {
+    const a = (pf >> shift) & 255
+    const b = (pt >> shift) & 255
+    return Math.round(a + (b - a) * t)
+  }
+  return `#${((ch(16) << 16) | (ch(8) << 8) | ch(0)).toString(16).padStart(6, '0').toUpperCase()}`
+}
+
+/**
+ * PowerPoint-style shape fill popup: no-fill, theme colors + shades, standard
+ * colors, recent colors, more-colors native picker, then picture / gradient
+ * variants / texture. Color sections reuse the shared picker's gcp-* styling
+ * (the popup root carries .gcp-palette); previews/values are document colors,
+ * set inline.
+ */
+function ShapeFillMenu({
+  currentFill,
+  onPickFill,
+  onPickImage,
+  onMoreGradient,
+  onClose,
+}: {
+  /** Selected shape's solid fill #RRGGBB, 'none' when the shape has no fill (null = non-solid) */
+  currentFill: string | null | undefined
+  onPickFill: (fill: string | GradientFillSpec) => void
+  onPickImage:
+    ((mode: 'stretch' | 'tile', source?: { base64: string; ext: string }) => void) | undefined
+  /** "More Gradients…": opens the format pane's gradient editor */
+  onMoreGradient: (() => void) | undefined
+  onClose: () => void
+}) {
+  const { t } = useI18n()
+  const recent = getRecentColors()
+  const isNoFill = currentFill === 'none'
+  const current = !currentFill || isNoFill ? null : currentFill.toUpperCase()
+  // Gradient/texture preset flyout: opens beside its row on hover, survives the
+  // pointer crossing the gap via a short close delay
+  const [flyout, setFlyout] = useState<{
+    kind: 'gradient' | 'texture'
+    x: number
+    y: number
+  } | null>(null)
+  const flyoutTimer = useRef<number | null>(null)
+  const cancelFlyoutClose = () => {
+    if (flyoutTimer.current) window.clearTimeout(flyoutTimer.current)
+    flyoutTimer.current = null
+  }
+  const scheduleFlyoutClose = () => {
+    cancelFlyoutClose()
+    flyoutTimer.current = window.setTimeout(() => setFlyout(null), 150)
+  }
+  const openFlyout = (kind: 'gradient' | 'texture', e: React.MouseEvent<HTMLElement>) => {
+    cancelFlyoutClose()
+    const r = e.currentTarget.getBoundingClientRect()
+    setFlyout({
+      kind,
+      x: Math.min(r.right + 4, window.innerWidth - 270),
+      y: Math.min(r.top - 8, window.innerHeight - (kind === 'texture' ? 160 : 190)),
+    })
+  }
+  useEffect(() => cancelFlyoutClose, [])
+  const pickHex = (hex: string) => {
+    onClose()
+    pushRecentColor(hex)
+    onPickFill(hex)
+  }
+  const swatch = (bare: string, title: string, key?: string) => (
+    <button
+      key={key ?? bare}
+      type="button"
+      className={`gcp-swatch ${current === `#${bare.toUpperCase()}` ? 'selected' : ''}`}
+      title={title}
+      style={{ background: `#${bare}` }}
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={() => pickHex(`#${bare}`)}
+    />
+  )
+  // Gradient variants: light/dark rows built from the shape's color (fallback: last used, then Office blue)
+  const base = current ?? recent[0] ?? '#4472C4'
+  const variants = [
+    { from: mixHex(base, '#FFFFFF', 0.7), to: base, tip: t('ribbonGradientLight') },
+    { from: base, to: mixHex(base, '#000000', 0.5), tip: t('ribbonGradientDark') },
+  ]
+  // OOXML angle (0°=left→right, 90°=top→bottom) with its CSS preview equivalent
+  const dirs: Array<{ angleDeg?: number; radial?: boolean; css: string; tip: string }> = [
+    { angleDeg: 90, css: 'linear-gradient(180deg', tip: t('ribbonGradientDirDown') },
+    { angleDeg: 0, css: 'linear-gradient(90deg', tip: t('ribbonGradientDirRight') },
+    { angleDeg: 45, css: 'linear-gradient(135deg', tip: t('ribbonGradientDirDiag') },
+    { radial: true, css: 'radial-gradient(circle', tip: t('ribbonGradientDirRadial') },
+  ]
+  return (
+    <div className="rb-drop gcp-palette rb-fill-menu" onMouseDown={(e) => e.stopPropagation()}>
+      <button
+        type="button"
+        className={`gcp-auto ${isNoFill ? 'selected' : ''}`}
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={() => {
+          onClose()
+          onPickFill('none')
+        }}
+      >
+        {t('paneFormatNoFill')}
+      </button>
+      <div className="gcp-section-title">{t('ribbonThemeColorsSection')}</div>
+      <div className="gcp-theme-base">{THEME_COLORS.map((c) => swatch(c.hex, c.name))}</div>
+      <div className="gcp-theme-shades">
+        {THEME_COLOR_SHADES.flatMap((row, r) =>
+          row.map((hex, c) => swatch(hex, `#${hex}`, `${r}-${c}-${hex}`)),
+        )}
+      </div>
+      <div className="gcp-section-title">{t('ribbonStandardColors')}</div>
+      <div className="gcp-standard-row">{STANDARD_COLORS.map((c) => swatch(c.hex, c.name))}</div>
+      {recent.length > 0 && (
+        <>
+          <div className="gcp-section-title">{t('ribbonRecentColors')}</div>
+          <div className="gcp-standard-row">
+            {recent.map((hex, i) => swatch(hex.slice(1), hex, `recent-${i}-${hex}`))}
+          </div>
+        </>
+      )}
+      <div className="rbf-actions">
+        <label className="rbf-row">
+          {t('ribbonMoreFillColors')}
+          <input
+            type="color"
+            defaultValue={(current ?? '#ffffff').toLowerCase()}
+            onPointerDown={(e) => armColorInput(e.currentTarget)}
+            onChange={(e) => {
+              pushRecentColor(e.target.value)
+              onPickFill(e.target.value)
+            }}
+          />
+        </label>
+        {onPickImage && (
+          <button
+            type="button"
+            className="rbf-row"
+            onClick={() => {
+              onClose()
+              onPickImage('stretch')
+            }}
+          >
+            {t('ribbonFillPicture')}
+          </button>
+        )}
+        <button
+          type="button"
+          className="rbf-row rbf-row-sub"
+          onMouseEnter={(e) => openFlyout('gradient', e)}
+          onMouseLeave={scheduleFlyoutClose}
+          onClick={(e) => openFlyout('gradient', e)}
+        >
+          {t('paneFormatGradient')}
+          <RbSubCaret />
+        </button>
+        {onPickImage && (
+          <button
+            type="button"
+            className="rbf-row rbf-row-sub"
+            onMouseEnter={(e) => openFlyout('texture', e)}
+            onMouseLeave={scheduleFlyoutClose}
+            onClick={(e) => openFlyout('texture', e)}
+          >
+            {t('ribbonFillTexture')}
+            <RbSubCaret />
+          </button>
+        )}
+      </div>
+      {flyout && (
+        <div
+          className="rbf-flyout"
+          style={{ left: flyout.x, top: flyout.y }}
+          onMouseEnter={cancelFlyoutClose}
+          onMouseLeave={scheduleFlyoutClose}
+        >
+          {flyout.kind === 'gradient' ? (
+            <>
+              <div className="rbf-actions rbf-actions-top">
+                <button
+                  type="button"
+                  className="rbf-row"
+                  onClick={() => {
+                    onClose()
+                    onPickFill(base)
+                  }}
+                >
+                  {t('ribbonNoGradient')}
+                </button>
+              </div>
+              {variants.map((v, vi) => (
+                <React.Fragment key={vi}>
+                  <div className="gcp-section-title">{v.tip}</div>
+                  <div className="rbf-gradients">
+                    {dirs.map((d, di) => (
+                      <button
+                        key={`${vi}-${di}`}
+                        type="button"
+                        className="rbf-gradient-tile"
+                        title={d.tip}
+                        style={{ background: `${d.css}, ${v.from}, ${v.to})` }}
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => {
+                          onClose()
+                          onPickFill({
+                            gradient: {
+                              from: v.from,
+                              to: v.to,
+                              ...(d.radial ? { radial: true } : { angleDeg: d.angleDeg! }),
+                            },
+                          })
+                        }}
+                      />
+                    ))}
+                  </div>
+                </React.Fragment>
+              ))}
+              {onMoreGradient && (
+                <div className="rbf-actions">
+                  <button
+                    type="button"
+                    className="rbf-row"
+                    onClick={() => {
+                      onClose()
+                      onMoreGradient()
+                    }}
+                  >
+                    {t('ribbonGradientMore')}
+                  </button>
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              <div className="rbf-textures">
+                {FILL_TEXTURES.map((tex) => (
+                  <button
+                    key={tex.tipKey}
+                    type="button"
+                    className="rbf-texture-tile"
+                    title={t(tex.tipKey)}
+                    style={{ backgroundImage: `url(${tex.url})`, backgroundSize: '64px 64px' }}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => {
+                      onClose()
+                      void urlToBase64(tex.url).then((base64) =>
+                        onPickImage?.('tile', { base64, ext: 'png' }),
+                      )
+                    }}
+                  />
+                ))}
+              </div>
+              <div className="rbf-actions">
+                <button
+                  type="button"
+                  className="rbf-row"
+                  onClick={() => {
+                    onClose()
+                    onPickImage?.('tile')
+                  }}
+                >
+                  {t('ribbonTextureMore')}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function Ribbon({
   hasDoc,
   deckEmpty,
@@ -763,12 +1127,14 @@ export function Ribbon({
   onTextColor,
   curBulletChar,
   curAlign,
+  curRtl,
   curFontFamily,
   curFontSizePt,
   curFontSizeMixed,
   onFontFamily,
   onFontSize,
   onAlign,
+  onDirection,
   onStrike,
   onTextToggle,
   onElementTextColor,
@@ -848,12 +1214,17 @@ export function Ribbon({
   contextPictureCanCutout,
   contextPictureStroke,
   onPictureStroke,
+  onChangeShape,
   onShapeStyle,
   onShapeFill,
+  onShapeFillImage,
+  contextShapeFill,
   onPictureCrop,
   cropActive,
   onPictureOpacity,
   onPictureCutout,
+  onPictureReplace,
+  onPictureRotate,
   onEditTableStyle,
   tableStyleFlags,
   tableActiveCell,
@@ -864,8 +1235,6 @@ export function Ribbon({
   canDistribute,
 }: Props) {
   const { t } = useI18n()
-  // Shapes get their own format tab; text-bearing shapes do not auto-activate it
-  // (users are usually after Home's text controls when selecting them).
   const contextTab = contextTabForElement(contextElementType ?? null)
   const autoContextTab = autoContextTabForElement(contextElementType ?? null)
 
@@ -880,6 +1249,7 @@ export function Ribbon({
   const [slideSizeOpen, setSlideSizeOpen] = useState(false)
   const [transparencyOpen, setTransparencyOpen] = useState(false)
   const [pictureBorderOpen, setPictureBorderOpen] = useState(false)
+  const [changeShapeOpen, setChangeShapeOpen] = useState(false)
   const [shapeStyleOpen, setShapeStyleOpen] = useState(false)
   const [shapeFillOpen, setShapeFillOpen] = useState(false)
   // Debounced picture-border commit: color drags fire repeatedly, and a pending
@@ -958,6 +1328,7 @@ export function Ribbon({
     if (!keep.includes('slideSize')) setSlideSizeOpen(false)
     if (!keep.includes('transparency')) setTransparencyOpen(false)
     if (!keep.includes('pictureBorder')) setPictureBorderOpen(false)
+    if (!keep.includes('changeShape')) setChangeShapeOpen(false)
     if (!keep.includes('shapeStyle')) setShapeStyleOpen(false)
     if (!keep.includes('shapeFill')) setShapeFillOpen(false)
     if (!keep.includes('table')) setTableOpen(false)
@@ -987,6 +1358,7 @@ export function Ribbon({
     slideShowOpen ||
     paraOpen ||
     pictureBorderOpen ||
+    changeShapeOpen ||
     shapeStyleOpen ||
     shapeFillOpen ||
     layoutPickOpen ||
@@ -1007,6 +1379,7 @@ export function Ribbon({
   // Expanded/collapsed widths are cached per group so the required width is
   // computable in every state (before the first fold the collapsed width is
   // an estimate, corrected by measurement as soon as the group first folds).
+  const collapse = useRibbonCollapse('ai-slides-ribbon-collapsed')
   const bodyRef = useRef<HTMLDivElement | null>(null)
   const inlineWidthsRef = useRef(new Map<string, number>())
   const collapsedWidthsRef = useRef(new Map<string, number>())
@@ -1020,6 +1393,8 @@ export function Ribbon({
     const order = COLLAPSE_ORDER[tab] ?? []
     if (!order.length) return
     const evaluate = () => {
+      // hidden (collapsed ribbon): offsets read 0 and would poison the width caches
+      if (!el.clientWidth) return
       const kids = Array.from(el.children) as HTMLElement[]
       if (!kids.length) return
       const first = kids[0]!
@@ -1070,22 +1445,20 @@ export function Ribbon({
     return () => ro.disconnect()
   }, [tab, collapsedGroups])
 
-  // Contextual tab auto-switch: jump in for dedicated object tools, but not text-bearing shapes.
-  // Track visibility separately so a manually opened picture-format tab still closes on deselect.
+  // Contextual tab auto-switch: pictures/tables/charts jump to their format
+  // tab; shapes only reveal Shape Format (PowerPoint parity, so Home stays put for
+  // text formatting). Leaving a tab that is no longer offered falls back to Home.
   const prevContextTab = useRef<ContextTab | null>(null)
-  const prevAutoContextTab = useRef<ContextTab | null>(null)
   useEffect(() => {
     const previousContextTab = prevContextTab.current
-    const previousAutoContextTab = prevAutoContextTab.current
-    if (autoContextTab && autoContextTab !== previousAutoContextTab) {
-      setTab(autoContextTab)
-    } else if (!autoContextTab && previousAutoContextTab) {
-      setTab((cur) => (cur === previousAutoContextTab ? 'home' : cur))
-    } else if (!contextTab && previousContextTab) {
-      setTab((cur) => (cur === previousContextTab ? 'home' : cur))
+    if (contextTab !== previousContextTab) {
+      if (autoContextTab) {
+        setTab(autoContextTab)
+      } else if (previousContextTab) {
+        setTab((cur) => (cur === previousContextTab ? 'home' : cur))
+      }
     }
     prevContextTab.current = contextTab
-    prevAutoContextTab.current = autoContextTab
   }, [contextTab, autoContextTab])
 
   /** Insert tab dropdown big button (click toggles, content stopPropagation) */
@@ -1215,6 +1588,7 @@ export function Ribbon({
     closePanels,
     curBulletChar,
     curAlign,
+    curRtl,
     curFontFamily,
     curFontSizeMixed,
     curFontSizePt,
@@ -1233,6 +1607,7 @@ export function Ribbon({
     onAddSlideWithLayout,
     onAiPreset,
     onAlign,
+    onDirection,
     onArrange,
     onFlip,
     onCopy,
@@ -1323,11 +1698,12 @@ export function Ribbon({
   }
 
   return (
-    <div className="ribbon">
+    <div className={`ribbon ${collapse.rootClass}`} ref={collapse.rootRef}>
       <div
         className={`ribbon-tabs ${IN_TAB ? '' : IS_MAC ? 'ribbon-tabs-mac' : 'ribbon-tabs-win'}${
           anyPanelOpen ? ' ribbon-tabs-nodrag' : ''
         }`}
+        onDoubleClick={collapse.onTabsDoubleClick}
       >
         {!IS_MAC && (
           <div className="file-tab-wrap">
@@ -1459,6 +1835,7 @@ export function Ribbon({
             key={tb}
             className={`ribbon-tab ${tab === tb ? 'active' : ''}`}
             onClick={() => {
+              collapse.onTabPress(tab === tb)
               setTab(tb)
               setFileOpen(false)
             }}
@@ -1470,7 +1847,10 @@ export function Ribbon({
           <button
             key={contextTab}
             className={`ribbon-tab ribbon-tab-context ${tab === contextTab ? 'active' : ''}`}
-            onClick={() => setTab(contextTab)}
+            onClick={() => {
+              collapse.onTabPress(tab === contextTab)
+              setTab(contextTab)
+            }}
             data-tip={t(TAB_LABEL[contextTab])}
           >
             {t(TAB_LABEL[contextTab])}
@@ -1479,7 +1859,7 @@ export function Ribbon({
         <span className="ribbon-tabs-spacer" />
       </div>
 
-      <div className="ribbon-body" ref={bodyRef}>
+      <div className="ribbon-body" data-ribbon-body="" ref={bodyRef}>
         {tab === 'home' ? (
           <RibbonHomeTab rb={tabCtx} />
         ) : tab === 'insert' ? (
@@ -1935,16 +2315,19 @@ export function Ribbon({
               <div className="rb-anim-timing">
                 <label>
                   {t('ribbonAnimStart')}
-                  <select
+                  <Dropdown
                     disabled={!timingAnim}
                     value={timingAnim?.trigger ?? 'onClick'}
-                    onChange={(e) => onAnimTiming({ trigger: e.target.value as AnimTrigger })}
-                    data-tip={t('ribbonAnimTriggerTip')}
-                  >
-                    <option value="onClick">{t('ribbonAnimOnClick')}</option>
-                    <option value="withPrev">{t('ribbonAnimWithPrev')}</option>
-                    <option value="afterPrev">{t('ribbonAnimAfterPrev')}</option>
-                  </select>
+                    tip={t('ribbonAnimTriggerTip')}
+                    options={(
+                      [
+                        ['onClick', t('ribbonAnimOnClick')],
+                        ['withPrev', t('ribbonAnimWithPrev')],
+                        ['afterPrev', t('ribbonAnimAfterPrev')],
+                      ] as const
+                    ).map(([k, label]) => ({ value: k, label }))}
+                    onPick={(trigger) => onAnimTiming({ trigger })}
+                  />
                 </label>
                 <label>
                   {t('ribbonAnimDuration')}
@@ -2324,6 +2707,13 @@ export function Ribbon({
                 onClick={() => onEditTableStyle?.({ bandRow: true })}
                 offClick={() => onEditTableStyle?.({ bandRow: false })}
               />
+              <TableToggleBtn
+                label={t('ribbonTableRtl')}
+                on={tableStyleFlags?.rtl ?? false}
+                disabled={!onEditTableStyle}
+                onClick={() => onEditTableStyle?.({ rtl: true })}
+                offClick={() => onEditTableStyle?.({ rtl: false })}
+              />
             </Group>
             <div className="ribbon-sep" />
             <Group label={tableActiveCell ? t('ribbonGroupShadingCell') : t('ribbonGroupShading')}>
@@ -2402,18 +2792,10 @@ export function Ribbon({
                   onChange={(e) => onEditTableStyle?.({ borderColor: e.target.value })}
                 />
                 <span className="rb-label">{t('ribbonBorderWeightLabel')}</span>
-                <select
-                  className="rb-select-sm"
-                  defaultValue="1"
-                  data-tip={t('ribbonBorderWeightTip')}
-                  onChange={(e) => onEditTableStyle?.({ borderWidthPt: Number(e.target.value) })}
-                >
-                  <option value="0.5">0.5pt</option>
-                  <option value="1">1pt</option>
-                  <option value="1.5">1.5pt</option>
-                  <option value="2.25">2.25pt</option>
-                  <option value="3">3pt</option>
-                </select>
+                <BorderWeightDropdown
+                  tip={t('ribbonBorderWeightTip')}
+                  onPick={(pt) => onEditTableStyle?.({ borderWidthPt: pt })}
+                />
               </div>
             </Group>
           </>
@@ -2671,6 +3053,17 @@ export function Ribbon({
                 </span>
                 <span>{t('ribbonRemoveBg')}</span>
               </button>
+              <button
+                className="rb-big"
+                data-tip={t('ribbonReplacePicture')}
+                disabled={!onPictureReplace || contextElementType !== 'picture'}
+                onClick={onPictureReplace}
+              >
+                <span className="rb-big-icon">
+                  <IconReplacePicture size={BIG} />
+                </span>
+                <span>{t('ribbonReplacePicture')}</span>
+              </button>
               <div className="rb-drop-wrap">
                 <button
                   className={`rb-big ${transparencyOpen ? 'active' : ''}`}
@@ -2791,9 +3184,79 @@ export function Ribbon({
                 <span>{t('ribbonCrop')}</span>
               </button>
             </Group>
+            <div className="ribbon-sep" />
+            <Group label={t('ribbonGroupArrange')}>
+              <div className="rb-col">
+                {(
+                  [
+                    [90, 'ribbonRotateRight', IconRotateRight],
+                    [-90, 'ribbonRotateLeft', IconRotateLeft],
+                  ] as const
+                ).map(([delta, key, Icon]) => (
+                  <button
+                    key={key}
+                    className="rb-small"
+                    disabled={!onPictureRotate || contextElementType !== 'picture'}
+                    onClick={() => onPictureRotate?.(delta)}
+                  >
+                    <Icon size={18} />
+                    <span>{t(key)}</span>
+                  </button>
+                ))}
+              </div>
+              <div className="rb-col">
+                {(
+                  [
+                    ['h', 'ribbonFlipH', IconObjFlipH],
+                    ['v', 'ribbonFlipV', IconObjFlipV],
+                  ] as const
+                ).map(([axis, key, Icon]) => (
+                  <button
+                    key={key}
+                    className="rb-small"
+                    disabled={!onFlip || contextElementType !== 'picture'}
+                    onClick={() => onFlip?.(axis)}
+                  >
+                    <Icon size={18} />
+                    <span>{t(key)}</span>
+                  </button>
+                ))}
+              </div>
+            </Group>
           </>
         ) : tab === 'shapeFormat' ? (
           <>
+            <Group label={t('ribbonShapes')}>
+              <div className="rb-drop-wrap">
+                <button
+                  className={`rb-big ${changeShapeOpen ? 'active' : ''}`}
+                  disabled={!onChangeShape}
+                  data-tip={t('ribbonChangeShape')}
+                  onMouseDown={(e) => {
+                    e.stopPropagation()
+                    closeSiblingPanels(e, closePanels, 'changeShape')
+                  }}
+                  onClick={() => setChangeShapeOpen((v) => !v)}
+                >
+                  <span className="rb-big-icon">
+                    <IconShapes size={BIG} />
+                    <RbCaret />
+                  </span>
+                  <span>{t('ribbonChangeShape')}</span>
+                </button>
+                {changeShapeOpen && (
+                  <div className="rb-drop" onMouseDown={(e) => e.stopPropagation()}>
+                    <ShapeGalleryContent
+                      onPick={(prst) => {
+                        setChangeShapeOpen(false)
+                        onChangeShape?.(prst)
+                      }}
+                    />
+                  </div>
+                )}
+              </div>
+            </Group>
+            <div className="ribbon-sep" />
             <Group label={t('ribbonGroupShapeStyle')}>
               <div className="rb-drop-wrap">
                 <button
@@ -2857,42 +3320,15 @@ export function Ribbon({
                   <span>{t('paneFormatFill')}</span>
                 </button>
                 {shapeFillOpen && (
-                  <div className="rb-drop rb-menu" onMouseDown={(e) => e.stopPropagation()}>
-                    <label className="rb-menu-input">
-                      {t('paneFormatSolidFill')}
-                      <input
-                        type="color"
-                        defaultValue="#ffffff"
-                        onPointerDown={(e) => armColorInput(e.currentTarget)}
-                        onChange={(e) => onShapeFill?.(e.target.value)}
-                      />
-                    </label>
-                    <div className="rb-menu-sep" />
-                    <div className="ctx-swatches-row">
-                      {TEXT_COLORS.map((c) => (
-                        <button
-                          key={c}
-                          className="ctx-swatch"
-                          style={{ background: c }}
-                          data-tip={c}
-                          aria-label={c}
-                          onClick={() => {
-                            setShapeFillOpen(false)
-                            onShapeFill?.(c)
-                          }}
-                        />
-                      ))}
-                    </div>
-                    <div className="rb-menu-sep" />
-                    <button
-                      onClick={() => {
-                        setShapeFillOpen(false)
-                        onShapeFill?.('none')
-                      }}
-                    >
-                      {t('paneFormatNoFill')}
-                    </button>
-                  </div>
+                  <ShapeFillMenu
+                    currentFill={contextShapeFill ?? null}
+                    onPickFill={(fill) => onShapeFill?.(fill)}
+                    onPickImage={onShapeFillImage}
+                    onMoreGradient={() => {
+                      if (!formatOpen) onToggleFormat()
+                    }}
+                    onClose={() => setShapeFillOpen(false)}
+                  />
                 )}
               </div>
             </Group>
@@ -2997,6 +3433,10 @@ export function Ribbon({
           </>
         ) : null}
       </div>
+      <RibbonCollapseButton
+        state={collapse}
+        labels={{ collapse: t('ribbonCollapse'), pin: t('ribbonPin') }}
+      />
     </div>
   )
 }

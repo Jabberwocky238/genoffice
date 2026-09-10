@@ -4,6 +4,8 @@
 
 import JSZip from 'jszip'
 
+import { encodeXlsxEscapes } from './xlsx-escapes'
+
 const DELIMITERS = [',', ';', '\t'] as const
 
 // Excel writes CSV in the system's legacy charset, not UTF-8 (GBK on Chinese
@@ -184,7 +186,7 @@ export function buildWorksheetXml(rows: readonly (readonly string[])[]): string 
       cells.push(
         isNumericCell(value)
           ? `<c r="${reference}"><v>${value}</v></c>`
-          : `<c r="${reference}" t="inlineStr"><is><t xml:space="preserve">${escapeXml(value)}</t></is></c>`,
+          : `<c r="${reference}" t="inlineStr"><is><t xml:space="preserve">${escapeXml(encodeXlsxEscapes(value))}</t></is></c>`,
       )
     })
     if (cells.length > 0) lines.push(`<row r="${rowIndex + 1}">${cells.join('')}</row>`)
@@ -201,6 +203,17 @@ export async function csvToXlsxBuffer(csvText: string, sheetName = 'Sheet1'): Pr
   const rows = parseCsv(csvText)
   if (rows.length === 0) throw new Error('The CSV file has no data rows.')
   return xlsxBufferFromRows(rows, sheetName)
+}
+
+/**
+ * xlsx from the app's OWN comma-serialized sheet grid (AI create_document):
+ * unlike the import path above, the delimiter is fixed to comma — cell text
+ * may legitimately hold more semicolons/tabs than commas (csvField quotes
+ * neither), and sniffing would then split the wrong columns — and an
+ * all-empty grid becomes a valid blank workbook instead of an import error.
+ */
+export async function sheetCsvToXlsxBuffer(csvText: string, sheetName = 'Sheet1'): Promise<Buffer> {
+  return xlsxBufferFromRows(parseCsv(csvText, ','), sheetName)
 }
 
 /** minimal empty workbook: the backing file for a "new blank spreadsheet" tab */

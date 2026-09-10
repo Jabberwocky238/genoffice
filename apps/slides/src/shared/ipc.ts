@@ -1,3 +1,4 @@
+import type { AiPanelPrefs } from '@genoffice/ui'
 /**
  * slides main-process <-> renderer IPC contract (Phase 3: open/save/edit, AI not included yet).
  *
@@ -28,10 +29,39 @@ export type {
   AiStreamRequest,
   GenSparkAccountStatus,
 } from '@genoffice/ai-provider'
-export { AI_PROVIDERS } from '@genoffice/ai-provider'
+export { AI_PROVIDERS } from '@genoffice/ai-provider/browser'
 export type { AgentToolCall, AgentToolDef } from '@genoffice/agent-core'
 
 export type UiTheme = 'light' | 'dark' | 'system'
+
+/** shell-wide AutoSave default; updatedAt is 0 until the user has ever set it */
+export interface AutoSaveDefault {
+  on: boolean
+  updatedAt: number
+}
+
+/** Effects patch for setEffects (mirrors pptx-engine's EffectsPatch): null clears an
+ * effect, undefined leaves it untouched. Distances/radii in EMU (12700 per pt),
+ * colors #RRGGBB or #RRGGBBAA. */
+export interface SetEffectsPatch {
+  /** inner = <a:innerShdw>; sx/sy/kxDeg/kyDeg/algn are the outerShdw perspective attributes */
+  shadow?: {
+    color: string
+    blurRad: number
+    dist: number
+    dirDeg: number
+    inner?: boolean
+    sx?: number
+    sy?: number
+    kxDeg?: number
+    kyDeg?: number
+    algn?: string
+  } | null
+  glow?: { color: string; radius: number } | null
+  /** startA/endPos as 0..1 fractions, blurRad/dist in EMU */
+  reflection?: { blurRad: number; startA: number; endPos: number; dist: number } | null
+  softEdge?: number | null
+}
 
 export interface OpenResult {
   path: string
@@ -136,6 +166,85 @@ export interface EditParagraph {
   lineSpacingPct?: number
   spaceBeforePt?: number
   spaceAfterPt?: number
+  /** Paragraph base direction toggled during this edit session (false = explicit LTR) */
+  rtl?: boolean
+}
+
+/** One geometry primitive collected by the edit-script sandbox (px, viewport space). */
+export interface ScriptBoxOp {
+  id: string
+  x: number
+  y: number
+  w: number
+  h: number
+  rotation: number
+  /** Group child: converted to child-space EMU by the main-process shim */
+  groupId?: string
+}
+
+/** setStyle's style-override fields (pass only what changes; align is paragraph-level, the rest override per run). */
+export interface ScriptStylePatch {
+  fontSize?: number
+  color?: string
+  bold?: boolean
+  italic?: boolean
+  underline?: boolean
+  fontFamily?: string
+  align?: 'left' | 'center' | 'right'
+}
+
+/** One non-geometry primitive collected by the edit-script sandbox, in script call order. */
+export type ScriptEditOp = (
+  | { kind: 'text'; paragraphs: EditParagraph[] }
+  | { kind: 'style'; style: ScriptStylePatch }
+  | { kind: 'fill'; fill: string }
+  | { kind: 'stroke'; stroke: { color: string; widthPt: number } | null }
+) & { id: string; groupId?: string }
+
+/** A raw op transaction from the AI batch surface (ops are validated by the registry; coordinates are document-space EMU). */
+export interface ApplyTxnOp {
+  ops: unknown[]
+  /** atomic (default): all-or-nothing. per_op: independent, failures skip. */
+  isolation?: 'atomic' | 'per_op'
+  /** Validate and return the plan without touching the deck. */
+  dryRun?: boolean
+}
+
+export interface ApplyTxnResult {
+  applied: boolean
+  dryRun?: boolean
+  /** dry-run: one line per validated op */
+  plan?: string[]
+  failures?: Array<{ index: number; error: string }>
+  /** compact journal echo: op name, target, ids minted by additive ops */
+  records?: Array<{ op: string; target?: string; created?: string[] }>
+  /** full deck after a mutation (a transaction may touch any slide) */
+  slides?: RenderSlide[]
+}
+
+/** The whole edit script as one atomic transaction (surface px; the main-process shim converts). */
+/**
+ * A run that ended without a usable reply. These never reach the chat history —
+ * agent-core rolls a failed turn out of the model context, so storing it there
+ * would feed it back on the next reopen. This lands in a separate log instead,
+ * which is the only trace left of a model that loops or a stream that dies.
+ */
+export interface AiRunFailure {
+  kind: 'error' | 'stopped'
+  /** What was sent to the model, so the log alone explains what triggered it */
+  instruction: string
+  /** Whatever the model had streamed before it ended (truncated by the main process) */
+  streamed: string
+  error?: string
+  tools?: string[]
+  durationMs?: number
+}
+
+export interface ApplyEditScriptOp {
+  slideIndex: number
+  fitWidthPx: number
+  boxes: ScriptBoxOp[]
+  edits: ScriptEditOp[]
 }
 
 /**
@@ -194,6 +303,8 @@ export interface SetElementParagraphFormatOp {
   spaceBeforePt?: number
   spaceAfterPt?: number
   align?: 'left' | 'center' | 'right' | 'justify'
+  /** Paragraph base direction (false = explicit LTR) */
+  rtl?: boolean
   /** Indent level increment/decrement (multi-level lists; applies to all paragraphs) */
   indentDelta?: 1 | -1
   /** In-group editing: all sourceIds are direct children of that group */
@@ -317,7 +428,19 @@ export interface FlipElementOp {
 /** Fill edit: solid color value #RRGGBB or 'none'. */
 /** Gradient fill (UI two colors + direction; radial=radial) */
 export interface GradientFillSpec {
-  gradient: { from: string; to: string; angleDeg?: number; radial?: boolean }
+  gradient: {
+    from: string
+    to: string
+    /** Full stop list (overrides from/to when present); colors may carry #RRGGBBAA alpha */
+    stops?: Array<{ pos: number; color: string }>
+    angleDeg?: number
+    /** Legacy alias for path: 'circle' */
+    radial?: boolean
+    /** Path gradient kind (PPT: radial/rectangular/path); linear when absent */
+    path?: 'circle' | 'rect' | 'shape'
+    /** Path gradient focus point (0..1 fractions; default center 0.5/0.5) */
+    center?: { x: number; y: number }
+  }
 }
 
 export interface EditFillOp {
@@ -329,11 +452,35 @@ export interface EditFillOp {
   groupId?: string
 }
 
-/** Stroke edit: null = no stroke; widthPt is the line width (points); dash is an OOXML prstDash preset ('solid' clears it, undefined keeps the file's value). */
+/**
+ * Picture/texture fill: the main process shows the system image picker once and
+ * applies the pick to every target (one media part, one rel per slide).
+ * mode 'tile' = texture-style repeat at natural size, 'stretch' = fit bounds.
+ */
+export interface EditFillImageOp {
+  slideIndex: number
+  targets: Array<{ sourceId: string; groupId?: string }>
+  mode: 'stretch' | 'tile'
+  /** Inline image bytes (bundled texture presets); when set, no picker dialog is shown */
+  source?: { base64: string; ext: string }
+}
+
+/** Stroke edit: null = no stroke; widthPt is the line width (points); dash is an OOXML prstDash
+ * preset ('solid' clears it, undefined keeps the file's value); cap/join/compound likewise keep
+ * the file's bytes when undefined. color may carry alpha (#RRGGBBAA) for line transparency;
+ * gradient turns the line into a gradient line (color then only feeds fallbacks). */
 export interface EditStrokeOp {
   slideIndex: number
   sourceId: string
-  stroke: { color: string; widthPt: number; dash?: string } | null
+  stroke: {
+    color: string
+    widthPt: number
+    dash?: string
+    cap?: 'flat' | 'rnd' | 'sq'
+    join?: 'round' | 'bevel' | 'miter'
+    compound?: 'sng' | 'dbl' | 'thickThin' | 'thinThick' | 'tri'
+    gradient?: { stops: Array<{ pos: number; color: string }>; angleDeg: number }
+  } | null
   /** In-group editing: sourceId is a direct child of that group */
   groupId?: string
 }
@@ -872,6 +1019,8 @@ export interface EditTableStyleOp {
   firstRow?: boolean
   /** Banded rows toggle */
   bandRow?: boolean
+  /** Right-to-left table toggle (tblPr rtl: mirrored grid) */
+  rtl?: boolean
   /** Shading color #RRGGBB or 'none' (null = unchanged) */
   shadingColor?: string | null
   /** Border color #RRGGBB (null = unchanged) */
@@ -1032,6 +1181,12 @@ export interface SlidesApi {
   getTheme: () => Promise<UiTheme>
   /** theme switched from the shell home page */
   onThemeChanged: (handler: (theme: UiTheme) => void) => () => void
+  /** shell-wide AutoSave default (see useAutoSavePref) */
+  getAutoSaveDefault: () => Promise<AutoSaveDefault>
+  onAutoSaveDefaultChanged: (handler: (value: AutoSaveDefault) => void) => () => void
+  /** AI panel text size + chat-input spellcheck (Settings → General in the shell) */
+  getAiPanelPrefs: () => Promise<AiPanelPrefs>
+  onAiPanelPrefsChanged: (handler: (prefs: AiPanelPrefs) => void) => () => void
   /** press on the shell chrome (tab strip is a sibling WebContentsView whose
    *  clicks produce no DOM event here) — dismiss open popovers */
   onChromePressed: (handler: () => void) => () => void
@@ -1047,16 +1202,34 @@ export interface SlidesApi {
   >
   /** Single-face sfnt bytes for one private face (null = gone/unreadable) */
   privateFontData: (id: string) => Promise<ArrayBuffer | null>
+  /** Curated downloadable (OFL) font catalog with per-family install state */
+  fontCatalog: () => Promise<
+    Array<{
+      family: string
+      script: 'latin' | 'ja' | 'ko' | 'sc' | 'tc'
+      installed: boolean
+      downloading: boolean
+    }>
+  >
+  /** Download a catalog family into the user font store; layouts refresh via deck-changed */
+  fontDownload: (family: string) => Promise<{ ok: boolean; error?: string }>
+  /** File picker → install local font files into the user font store */
+  fontInstallLocal: () => Promise<{ families: string[] }>
+  /** Families this deck references that are missing locally but downloadable */
+  fontMissing: () => Promise<string[]>
+  /** The user font store changed (download/local install): re-sync private FontFaces */
+  onFontsChanged: (handler: () => void) => () => void
   consumePendingOpen: (fitWidthPx: number) => Promise<OpenResult | null>
   /** New blank presentation (single blank 16:9 page, untitled) */
   newBlank: (fitWidthPx: number) => Promise<OpenResult>
-  /** HTML pipeline generation: mode="append" merges with the previously generated pages and rebuilds wholesale (appendedFrom = existing page count);
-   *  mode="replace_at" redoes page atIndex in place from single-page HTML (other pages untouched, undoable, replacedIndex = that page's index);
-   *  mode="insert_at" inserts a new page at atIndex from single-page HTML (later pages shift back, undoable, insertedIndex = that page's index);
+  /** Land generated pages: each pageMarkers entry is a marker (cloudpptx:<path>) redeemable for a one-slide pptx.
+   *  mode="append" merges the new pages onto the existing deck (appendedFrom = existing page count);
+   *  mode="replace_at" redoes page atIndex in place from a single marker (other pages untouched, undoable, replacedIndex = that page's index);
+   *  mode="insert_at" inserts a new page at atIndex from a single marker (later pages shift back, undoable, insertedIndex = that page's index);
    *  when the pipeline fails it falls back to element-level mode, fallbackReason explains why;
    *  deckName = the deck name AI derived from user input, used as the filename when saving a new draft (falls back to timestamp naming) */
-  htmlToPptx: (
-    pagesHtml: string[],
+  landGeneratedPages: (
+    pageMarkers: string[],
     fitWidthPx: number,
     mode?: 'replace' | 'append' | 'replace_at' | 'insert_at',
     atIndex?: number,
@@ -1073,7 +1246,7 @@ export interface SlidesApi {
   >
   /** Whether cloud single-page generation (gsk slide_generate) is available (GENOFFICE_CLOUD_SLIDE=1 + gsk login) */
   cloudGenStatus: () => Promise<{ enabled: boolean }>
-  /** Cloud single-page generation: brief → one-slide pptx temp file; the marker goes into an htmlToPptx pagesHtml slot in place of HTML */
+  /** Cloud single-page generation: brief → one-slide pptx temp file; the marker goes into a landGeneratedPages pageMarkers slot */
   cloudGeneratePage: (op: {
     brief: string
     title?: string
@@ -1083,6 +1256,10 @@ export interface SlidesApi {
     width?: number
     height?: number
   }) => Promise<{ ok: boolean; marker?: string; error?: string }>
+  /** Local single-page generation: a JSON slide spec (LLM output) built directly into a one-slide pptx; same marker kind as the cloud path */
+  localGeneratePage: (op: {
+    specJson: string
+  }) => Promise<{ ok: boolean; marker?: string; error?: string; imageFailures?: string[] }>
   editText: (op: EditTextOp) => Promise<RenderSlide | null>
   /** Change font/size on selected elements wholesale (elements without text ignored; returns null if all ignored) */
   setElementFont: (op: SetElementFontOp) => Promise<RenderSlide | null>
@@ -1110,12 +1287,47 @@ export interface SlidesApi {
   /** Whole-picture opacity */
   editPictureOpacity: (op: EditPictureOpacityOp) => Promise<RenderSlide | null>
   /** Shape picture fill (the main process shows the image picker dialog; cancel returns null) */
-  editImageFill: (op: { slideIndex: number; sourceId: string }) => Promise<RenderSlide | null>
+  editImageFill: (op: EditFillImageOp) => Promise<RenderSlide | null>
+  /** Change a shape's preset geometry (keeps transform/fill/outline/text); returns the updated page.
+   * groupId targets a child inside a group (in-group editing). */
+  changeShape: (op: {
+    slideIndex: number
+    sourceId: string
+    prst: string
+    groupId?: string
+  }) => Promise<RenderSlide | null>
+  /** Preset-geometry adjust values ("yellow handle" drag). preview follows the
+   * edit-transform gesture semantics: one whole drag = one undo step. */
+  setShapeAdjust: (op: {
+    slideIndex: number
+    sourceId: string
+    adjust: Record<string, number>
+    groupId?: string
+    preview?: boolean
+  }) => Promise<RenderSlide | null>
   /** Text box vertical alignment */
   setTextAnchor: (op: {
     slideIndex: number
     sourceId: string
     anchor: 'top' | 'middle' | 'bottom'
+  }) => Promise<RenderSlide | null>
+  /** Shape/picture effects (shadow / glow / soft edge); null clears an effect */
+  setEffects: (op: {
+    slideIndex: number
+    sourceId: string
+    effects: SetEffectsPatch
+  }) => Promise<RenderSlide | null>
+  /** Text box body properties (direction / autofit / internal margins / wrap) */
+  setTextBodyProps: (op: {
+    slideIndex: number
+    sourceId: string
+    props: {
+      vert?: 'horz' | 'eaVert' | 'vert' | 'vert270' | 'wordArtVert'
+      autofit?: 'none' | 'shrink' | 'resize'
+      /** Internal margins (EMU); only the provided sides are written */
+      insets?: Partial<{ l: number; t: number; r: number; b: number }>
+      wrap?: boolean
+    }
   }) => Promise<RenderSlide | null>
   /** External clipboard content probe (internal/slide = last copy came from this app) */
   clipboardExternal: () => Promise<
@@ -1146,6 +1358,8 @@ export interface SlidesApi {
   ) => Promise<{ slides: RenderSlide[]; index: number; sourceId?: string } | null>
   /** Is there a slide on the clipboard? (drives the Paste Slide menu item) */
   hasSlideClipboard: () => Promise<boolean>
+  /** Is there anything a paste would act on (internal elements/slide, or external image/text)? Drives the Paste menu item */
+  clipboardProbe: () => Promise<boolean>
   /** Delete a slide (refused when only one page remains); returns the full RenderSlide array */
   deleteSlide: (slideIndex: number) => Promise<RenderSlide[] | null>
   /** Bring element to front/back or move one layer forward/backward */
@@ -1168,6 +1382,8 @@ export interface SlidesApi {
   flipElements: (op: FlipElementOp) => Promise<RenderSlide | null>
   /** Returns the full affected RenderSlide array (when applied to all pages) */
   editBackground: (op: EditBackgroundOp) => Promise<RenderSlide[] | null>
+  /** Show the system image picker and return the file's bytes (for Replace Picture); cancel returns null */
+  pickPictureFile: () => Promise<{ base64: string; ext: string } | null>
   /** Show the system image picker and insert into the current page; returns the updated page + new element id, cancel returns null, undecodable format returns the error */
   insertImage: (
     slideIndex: number,
@@ -1284,6 +1500,12 @@ export interface SlidesApi {
       The outermost end registers an AI rollback point and returns its id (null when nothing changed). */
   beginHistoryBatch: () => Promise<boolean>
   endHistoryBatch: () => Promise<number | null>
+  /** Apply an edit script's collected primitives as ONE atomic op transaction (the executor rolls back on any failure); returns the rebuilt slide or a guided error */
+  applyEditScript: (
+    op: ApplyEditScriptOp,
+  ) => Promise<{ slide: RenderSlide } | { error: string } | null>
+  /** AI batch surface: apply raw ops as one transaction (atomic/per_op, dry-run supported) */
+  applyTxn: (op: ApplyTxnOp) => Promise<ApplyTxnResult | null>
   /** Roll the deck back to an AI rollback point; returns the restored full RenderSlide array, null when the id is unknown */
   aiSnapshotRestore: (id: number) => Promise<RenderSlide[] | null>
   /** Undo/redo (main-process snapshot history): returns the restored full RenderSlide array, null when nothing to undo */
@@ -1336,6 +1558,10 @@ export interface SlidesApi {
   onCloseSaveRequest: (handler: () => void) => () => void
   /** Undo/redo stack occupancy pushed by the main process (drives the QAT button gray states) */
   onHistoryChanged: (handler: (state: { canUndo: boolean; canRedo: boolean }) => void) => () => void
+  /** Another window attached to the same file changed the deck (shared session): fresh render state to apply */
+  onDeckChanged: (
+    handler: (state: { slides: RenderSlide[]; size: { cx: number; cy: number } }) => void,
+  ) => () => void
   reportCloseSaveResult: (ok: boolean) => void
   /** Mirror the autosave toggle state to the main process: files with it on save silently on close, no dialog */
   setAutoSavePref: (on: boolean) => void
@@ -1353,6 +1579,8 @@ export interface SlidesApi {
   aiGskStatus: (withEmail?: boolean) => Promise<GenSparkAccountStatus>
   /** Open the browser to log into Genspark (fire-and-forget; aiGskStatus turns logged-in once done) */
   aiGskLogin: () => Promise<void>
+  /** Record a run that ended without a usable reply, for post-mortem (fire-and-forget, never throws) */
+  aiLogRunFailure: (entry: AiRunFailure) => Promise<void>
   webSearch: (
     query: string,
     maxResults?: number,
@@ -1360,6 +1588,8 @@ export interface SlidesApi {
     results: Array<{ title: string; url: string; snippet: string }>
     answer?: string
     method: string
+    /** failure reason when method === 'error' */
+    error?: string
   }>
   imageSearch: (
     query: string,
@@ -1374,6 +1604,8 @@ export interface SlidesApi {
       height?: number
     }>
     method: string
+    /** failure reason when method === 'error' */
+    error?: string
   }>
   insertImageUrl: (op: {
     slideIndex: number

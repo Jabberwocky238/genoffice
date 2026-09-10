@@ -1,6 +1,10 @@
 import { z } from 'zod'
 import type { AgentToolCall, AgentToolDef } from '@genoffice/agent-core'
-import { workbookOperationSchema, type WorkbookOperation } from '../../domain/workbook-dsl'
+import {
+  copyTargetBounds,
+  workbookOperationSchema,
+  type WorkbookOperation,
+} from '../../domain/workbook-dsl'
 import {
   columnLabel,
   parseRange,
@@ -15,6 +19,7 @@ import type {
   ChangePlan,
 } from '../../domain/workbook.types'
 import { t } from '../i18n/locale'
+import { formatRangeAggregate, type RangeAggregate } from './aggregate'
 import { guideCatalogSummary, loadGuides } from './guides'
 
 /**
@@ -37,6 +42,8 @@ export interface SheetRef {
    * after structural changes within the session */
   readonly rows?: number
   readonly columns?: number
+  /** Worksheet XML above the gateway save-patch cap: readable, never editable. */
+  readonly readOnlyOversized?: boolean
 }
 
 export interface ChartRef {
@@ -46,8 +53,26 @@ export interface ChartRef {
   readonly sheetId: string
 }
 
+/**
+ * The user's selection captured when they sent the message. The grid selection
+ * is live: users keep clicking around while the AI works, so reading it at
+ * tool-call time would silently retarget "this column" mid-run.
+ */
+export interface FrozenSelection {
+  /** A1 notation on the sheet it was taken from, clamped to the data extent so
+   *  a whole-column click is not reported as a million rows */
+  readonly a1: string
+  readonly sheetId: string
+  /** header names when the selection covers whole columns */
+  readonly columns?: readonly string[]
+}
+
 export interface ActiveSheetInfo {
   readonly mode: 'demo' | 'lazy' | 'none'
+  /** lazy mode only: the file is too large for a full load — cached values
+   * stream in per viewport, and the live formula engine never sees the whole
+   * data (formula writes over the file's sheets are gated) */
+  readonly streaming?: boolean | undefined
   readonly sheetId: string
   readonly sheetName: string
   /** demo mode only: current revision, needed for the CAS-checked plan() call */
@@ -58,8 +83,14 @@ export interface ActiveSheetInfo {
   readonly loadedRange?: string | undefined
   /** every sheet in the workbook, active one included */
   readonly sheets: readonly SheetRef[]
-  /** current selection in A1 notation, when one exists */
+  /** the selection to interpret "this column / these rows" against, in A1
+   * notation (sheet-qualified when it is not the active sheet) */
   readonly selection?: string | undefined
+  /** the selection above is the send-time snapshot rather than a live read */
+  readonly selectionFrozen?: boolean | undefined
+  /** header names of the columns the selection covers, when it covers whole
+   * ones — what the user means by "this column" */
+  readonly selectionColumns?: readonly string[] | undefined
   /** merged ranges on the active sheet (A1 notation) */
   readonly merges?: readonly string[] | undefined
   /** charts in the workbook (imported files only) */
@@ -140,6 +171,34 @@ export interface TraceDependentsOutcome {
   readonly error?: string
 }
 
+/** every file type create_document can produce */
+export type CreateDocumentFileType = 'xlsx' | 'csv' | 'docx' | 'pdf' | 'md' | 'html'
+
+/** create_document request handed to the App: xlsx/csv name a worksheet to
+ * export; docx/pdf/md/html carry AI-authored content (routed to the docs flow).
+ * Members keep singleton discriminants so the type narrows properly. */
+export type CreateDocumentToolRequest =
+  | { type: 'xlsx'; sheetId?: string | undefined; title?: string | undefined }
+  | { type: 'csv'; sheetId?: string | undefined; title?: string | undefined }
+  | { type: 'docx'; title: string; content: string }
+  | { type: 'pdf'; title: string; content: string }
+  | { type: 'md'; title: string; content: string }
+  | { type: 'html'; title: string; content: string }
+
+export type CreateDocumentToolOutcome =
+  | {
+      ok: true
+      /** final file name including extension (title may default to the sheet name) */
+      name: string
+      /** absolute path when the file was written directly (docx opens a tab that saves itself) */
+      path?: string
+      /** xlsx/csv: the exported worksheet's name */
+      sheetName?: string
+      /** xlsx/csv: the sheet holds formulas — the file keeps computed values only */
+      hadFormulas?: boolean
+    }
+  | { ok: false; error: string }
+
 export interface SheetsSkillDeps {
   getActiveSheetInfo(): ActiveSheetInfo
   /** Ensure a lazy workbook range is present in Univer before reading it. */
@@ -170,17 +229,31 @@ export interface SheetsSkillDeps {
     sheetId: string | undefined,
     address: string,
   ): TraceDependentsOutcome | Promise<TraceDependentsOutcome>
+  /** Batched statistics over a large range (lazy mode streams it through the
+   * sidecar without loading the grid) — the supported path for distinct
+   * counts / frequency questions that must never become COUNTIF formulas. */
+  aggregateRange?(
+    sheetId: string | undefined,
+    range: RangeBounds,
+  ): Promise<{ ok: true; aggregate: RangeAggregate } | { ok: false; error: string }>
   /** `applied` resolves with the real apply result (the lazy path applies async);
    * the tool awaits it so the model never hears "applied" for a batch that failed */
   proposeOperations(
     operations: readonly WorkbookOperation[],
     summary: string,
   ): { ok: true; plan: ChangePlan; applied?: Promise<ApplyOutcome> } | { ok: false; error: string }
+  /** AI create_document: write a new standalone file (xlsx/csv from a
+   * worksheet; docx/pdf/md from content) into the default save folder and
+   * open it in a new tab (ai/create-document.ts). */
+  createDocument?(request: CreateDocumentToolRequest): Promise<CreateDocumentToolOutcome>
 }
 
 const MAX_READ_ADDRESSES = 100
 /** Max cells per streamed block; the App's ensureRangeLoaded enforces it too. */
 export const MAX_READ_RANGE_CELLS = 2000
+const MAX_AGGREGATE_CELLS = 1_000_000
+const MAX_AGGREGATE_TOP_VALUES = 50
+const DEFAULT_AGGREGATE_TOP_VALUES = 10
 /** Read-back after write: max number of formula cells whose results are read back */
 const MAX_READBACK_FORMULAS = 10
 /** Read-back after write: wait time (ms) for Univer's async formula recalc */
@@ -214,6 +287,33 @@ export const WORKBOOK_TOOLS: AgentToolDef[] = [
           type: 'string',
           description:
             'Sheet to read from (id from get_workbook_context); reads the active sheet when omitted',
+        },
+      },
+      required: ['range'],
+    },
+  },
+  {
+    name: 'aggregate_range',
+    description:
+      'Compute statistics for a range without reading or modifying it cell by cell: non-empty count, distinct-value count, ' +
+      'numeric sum/average/min/max, and the most frequent values. Handles very large ranges (up to 1,000,000 cells) efficiently. ' +
+      'ALWAYS use this for questions like "how many distinct suppliers/customers", value distributions, or column totals on large sheets — ' +
+      'never loop read_range over big data and never write COUNTIF/SUMPRODUCT distinct-count formulas (they are rejected as too expensive). ' +
+      'Aggregate one column at a time for meaningful distinct counts.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        range: {
+          type: 'string',
+          description: 'Range like "D2:D88588" (typically one column, excluding the header)',
+        },
+        sheetId: {
+          type: 'string',
+          description: 'Target sheet id; the active sheet when omitted',
+        },
+        topValues: {
+          type: 'number',
+          description: 'How many most-frequent values to return (0-50, default 10)',
         },
       },
       required: ['range'],
@@ -335,8 +435,9 @@ export const WORKBOOK_TOOLS: AgentToolDef[] = [
     name: 'select_range',
     description:
       "Select a range in the grid and scroll the user's view to it, activating its sheet. " +
-      'Use when pointing the user at a location ("the issue is in C42") so the spot is visible on screen. ' +
-      'Pure view navigation — changes no data.',
+      'Pure view navigation — changes no data, but it does replace whatever the user had selected. ' +
+      'Use it only when they asked to be moved ("take me there", "select those rows"); to merely point at a ' +
+      'location, cite it as [C42](sheetnav://C42) in your reply and let them click.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -392,7 +493,7 @@ export const WORKBOOK_TOOLS: AgentToolDef[] = [
       '{op:"set_cell",sheetId,address,value} | {op:"set_formula",sheetId,address,formula(starts with =)} | ' +
       '{op:"clear_cell",sheetId,address} | {op:"rename_sheet",sheetId,name}. ' +
       'Field definitions for the remaining operations live in the guides — load_guide before using them: ' +
-      'writing(set_range/clear_range/find_replace) | formatting(format_range) | ' +
+      'writing(set_range/fill_range/copy_range/convert_to_values/clear_range/find_replace) | formatting(format_range) | ' +
       'layout(sort_range/merge_cells/unmerge_cells/set_row_height/set_col_width/set_rows_hidden/set_cols_hidden/set_freeze/set_page_setup) | ' +
       'structure(insert_rows/delete_rows/insert_cols/delete_cols/add_sheet/delete_sheet/' +
       'duplicate_sheet/set_sheet_hidden/move_sheet/protect_sheet) | ' +
@@ -401,7 +502,10 @@ export const WORKBOOK_TOOLS: AgentToolDef[] = [
       'table(add_table/add_table_row/add_table_column/delete_table_row/delete_table_column/delete_table) | ' +
       'data(set_hyperlink/set_filter/clear_filter/set_filter_criteria/add_conditional_format/' +
       'clear_conditional_formats/set_data_validation/set_note/add_defined_name/delete_defined_name). ' +
-      'Limits: structural operations (row/column insert-delete, sheet add/delete/duplicate/move/hide) cannot share a batch with other classes; at most 2000 expanded cell changes; ' +
+      'Limits: structural operations (row/column insert-delete, sheet add/delete/duplicate/move/hide) cannot share a batch with other classes; at most 2000 expanded cell changes — ' +
+      'except the range-level bulk ops fill_range / copy_range / convert_to_values / clear_range / find_replace / sort_range / format_range, which handle up to 200,000 cells in one op ' +
+      '(use fill_range to fill a formula or pattern down a whole column instead of huge set_range batches, ' +
+      'copy_range to duplicate a large block once, convert_to_values to freeze formulas into their computed values); ' +
       'sheetId must be an id returned by get_workbook_context.',
     inputSchema: {
       type: 'object',
@@ -414,6 +518,41 @@ export const WORKBOOK_TOOLS: AgentToolDef[] = [
         summary: { type: 'string', description: 'One-sentence summary of this batch of changes' },
       },
       required: ['operations', 'summary'],
+    },
+  },
+  {
+    name: 'create_document',
+    description:
+      'Create a NEW standalone file in the default save folder and open it in a new tab; the current workbook is not modified. ' +
+      "Types 'xlsx' (default) and 'csv' export ONE worksheet of THIS workbook: pass sheetId (defaults to the active sheet); the file gets the sheet's current displayed values (formula results; formulas and formatting are not carried over) and content must be omitted. " +
+      'To split a workbook into separate files, call once per sheet. To export data that is not in a sheet yet, write it into a new sheet first (add_sheet + set_range), then export that sheet. ' +
+      "Types 'docx' and 'pdf' take simple HTML in content (<h1>-<h6>, <p>, <ul>/<ol>/<li>, <table>, <pre>, <blockquote>; inline <strong>/<em>/<u>/<s>); type 'md' takes Markdown source; type 'html' takes a complete standalone HTML page (opens in the HTML editor) — use these when the user wants a report/summary as its own document. " +
+      'title becomes the file name; xlsx/csv default it to the worksheet name.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        type: {
+          type: 'string',
+          enum: ['xlsx', 'csv', 'docx', 'pdf', 'md', 'html'],
+          description: "target file type (default 'xlsx')",
+        },
+        sheetId: {
+          type: 'string',
+          description:
+            'xlsx/csv only: the worksheet to export (id from get_workbook_context); defaults to the active sheet',
+        },
+        title: {
+          type: 'string',
+          description:
+            'file name without extension (required for docx/pdf/md; xlsx/csv default to the sheet name)',
+        },
+        content: {
+          type: 'string',
+          description:
+            'docx/pdf: simple HTML; md: Markdown source. Forbidden for xlsx/csv — their data comes from the worksheet',
+        },
+      },
+      required: [],
     },
   },
 ]
@@ -459,7 +598,7 @@ function parseReadSheetId(
  * when the range lies entirely outside it (nothing to stream — cells there
  * are empty by definition). Sheets without a known extent pass through. */
 function clampToExtent(bounds: RangeBounds, sheet: SheetRef | undefined): RangeBounds | null {
-  if (!sheet?.rows || !sheet.columns) return bounds
+  if (sheet?.rows === undefined || sheet.columns === undefined) return bounds
   const endRow = Math.min(bounds.endRow, sheet.rows - 1)
   const endColumn = Math.min(bounds.endColumn, sheet.columns - 1)
   if (endRow < bounds.startRow || endColumn < bounds.startColumn) return null
@@ -468,6 +607,18 @@ function clampToExtent(bounds: RangeBounds, sheet: SheetRef | undefined): RangeB
 
 const RANGE_NOT_LOADED =
   'The requested cells could not be fully loaded; retry after workbook indexing completes.'
+
+/** mirror of the docs/pdf tool-echo guard: reject tool-protocol output pasted
+ * as document content (create_document docx/pdf) */
+function contentEchoError(content: string): string | null {
+  if (/<\/?tool_response>/i.test(content)) {
+    return 'content contains a literal <tool_response> tag — that is tool-protocol output, not document content; retry with the actual document HTML'
+  }
+  if (/"index"\s*:\s*\d+\s*,\s*"type"\s*:\s*"/.test(content)) {
+    return 'content contains a raw JSON dump, not an HTML fragment; retry with simple HTML (e.g. <p>…</p>)'
+  }
+  return null
+}
 
 /** Shared input validation for the two formula-audit tools. */
 function parseAuditAddress(
@@ -494,16 +645,28 @@ function parseAuditAddress(
 export function buildWorkbookContext(deps: SheetsSkillDeps): string {
   const info = deps.getActiveSheetInfo()
   if (info.mode === 'none') return 'No workbook is currently open.'
-  const dims = (sheet: SheetRef): string =>
-    sheet.rows && sheet.columns
-      ? `, data extent about ${sheet.rows} rows × ${sheet.columns} columns`
-      : ''
+  const dims = (sheet: SheetRef): string => {
+    if (sheet.rows === undefined || sheet.columns === undefined) return ''
+    if (sheet.rows === 0 || sheet.columns === 0) return ', no data (empty sheet)'
+    return `, data extent about ${sheet.rows} rows × ${sheet.columns} columns`
+  }
   const active = info.sheets.find((sheet) => sheet.id === info.sheetId)
   const lines = [
     `Active sheet: ${info.sheetName} (id=${info.sheetId}${active ? dims(active) : ''})`,
     info.mode === 'demo'
       ? `Mode: demo workbook, current revision=${info.revision}`
-      : 'Mode: imported real xlsx file (some regions may still be streaming in)',
+      : info.streaming
+        ? 'Mode: imported file in LARGE-FILE STREAMING MODE — the file is too big for a full load, so the grid ' +
+          'materializes the viewed region on demand. Consequences: (1) formulas you write stay live — their ' +
+          'referenced file cells are loaded into the engine automatically — but only within a session budget of ' +
+          '~50,000 referenced cells; batches beyond it are rejected: compute with aggregate_range and write static ' +
+          'values instead; (2) to extract/split rows, use copy_range with filterColumn/filterValues (copies matching ' +
+          'rows as static values, reading the real file data) into a sheet created with add_sheet rows/columns sized ' +
+          'to the expected data (aggregate_range gives per-value counts) — never FILTER-formula spills; ' +
+          '(3) add_pivot, refresh_pivot, duplicate_sheet, and filter edits are unavailable on the ' +
+          "file's sheets; sort_range works, but ranges of 2000 cells or fewer must be read_range'd (loaded) first. " +
+          'Sheets added this session are fully live and exempt from all of this.'
+        : 'Mode: imported real xlsx file (some regions may still be streaming in)',
   ]
   if (active?.rows && active.columns) {
     lines.push(
@@ -516,8 +679,28 @@ export function buildWorkbookContext(deps: SheetsSkillDeps): string {
       `All sheets: ${info.sheets.map((sheet) => `${sheet.name} (id=${sheet.id}${dims(sheet)})`).join(', ')}`,
     )
   }
+  const oversized = info.sheets.filter((sheet) => sheet.readOnlyOversized)
+  if (oversized.length > 0) {
+    lines.push(
+      `READ-ONLY sheets: ${oversized.map((sheet) => sheet.name).join(', ')} — the worksheet XML is above ` +
+        'the save-patch limit, so edits there can never be saved and every mutating op on them is rejected. ' +
+        'Read them freely (read_range/aggregate_range/copy_range source) and write results to other sheets.',
+    )
+  }
   if (info.selection) {
-    lines.push(`Current selection: ${info.selection}`)
+    const named = info.selectionColumns ?? []
+    // The range alone leaves the model to re-derive which column the user meant
+    // from the header row; name it here so "this column" resolves by meaning.
+    const columns = named.length
+      ? ` (the whole ${named.map((name) => `"${name}"`).join(', ')} column${named.length > 1 ? 's' : ''})`
+      : ''
+    lines.push(
+      info.selectionFrozen
+        ? `User selection: ${info.selection}${columns} — captured when the user sent this message, so it is ` +
+            'what "this column / these rows / the selected part" refers to. It stays fixed for the ' +
+            'whole run even if the user clicks elsewhere while you work.'
+        : `Current selection: ${info.selection}${columns}`,
+    )
   }
   if (info.loadedRange) {
     lines.push(`Currently loaded viewport: ${info.loadedRange} (not the worksheet data extent)`)
@@ -654,15 +837,16 @@ export function executeWorkbookTool(
       if ('fail' in parsedSheet) return parsedSheet.fail
       const sheetId = parsedSheet.sheetId
       const target = info.sheets.find((sheet) => sheet.id === (sheetId ?? info.sheetId))
-      if (
-        target?.rows !== undefined &&
-        target.columns !== undefined &&
-        (bounds.endRow >= target.rows || bounds.endColumn >= target.columns)
-      ) {
-        return fail(
-          t('aiToolReadRange'),
-          `The requested range is outside the worksheet data extent A1:${columnLabel(target.columns - 1)}${target.rows}.`,
-        )
+      if (target?.rows !== undefined && target.columns !== undefined) {
+        if (target.rows === 0 || target.columns === 0) {
+          return fail(t('aiToolReadRange'), 'The worksheet has no data (empty extent).')
+        }
+        if (bounds.endRow >= target.rows || bounds.endColumn >= target.columns) {
+          return fail(
+            t('aiToolReadRange'),
+            `The requested range is outside the worksheet data extent A1:${columnLabel(target.columns - 1)}${target.rows}.`,
+          )
+        }
       }
       const executeRead = (): ToolExecution => {
         const normalizedRange = `${formatAddress(bounds.startRow, bounds.startColumn)}:${formatAddress(bounds.endRow, bounds.endColumn)}`
@@ -722,6 +906,49 @@ export function executeWorkbookTool(
         )
       }
       return executeRead()
+    }
+
+    case 'aggregate_range': {
+      const raw = call.input.range
+      if (typeof raw !== 'string' || !raw.trim())
+        return fail(t('aiToolAggregate'), 'range must be a non-empty string')
+      const rangeLabel = raw.trim().toUpperCase()
+      let bounds
+      try {
+        bounds = parseRange(rangeLabel)
+      } catch {
+        return fail(t('aiToolAggregate'), `Cannot parse range: ${raw}`)
+      }
+      if (rangeCellCount(bounds) > MAX_AGGREGATE_CELLS) {
+        return fail(
+          t('aiToolAggregate'),
+          `The range contains more than ${MAX_AGGREGATE_CELLS.toLocaleString('en-US')} cells; aggregate one column (or a smaller block) at a time.`,
+        )
+      }
+      if (!deps.aggregateRange) {
+        return fail(t('aiToolAggregate'), 'aggregate_range is not available in this context.')
+      }
+      const parsedSheet = parseReadSheetId(
+        call.input,
+        deps.getActiveSheetInfo(),
+        t('aiToolAggregate'),
+      )
+      if ('fail' in parsedSheet) return parsedSheet.fail
+      const sheetId = parsedSheet.sheetId
+      const topRaw = call.input.topValues
+      const topValues =
+        typeof topRaw === 'number' && Number.isFinite(topRaw)
+          ? Math.min(Math.max(Math.floor(topRaw), 0), MAX_AGGREGATE_TOP_VALUES)
+          : DEFAULT_AGGREGATE_TOP_VALUES
+      return deps.aggregateRange(sheetId, bounds).then((outcome) =>
+        outcome.ok
+          ? {
+              output: formatRangeAggregate(rangeLabel, outcome.aggregate, topValues),
+              mutated: false,
+              summary: t('aiToolAggregateOf', { range: rangeLabel }),
+            }
+          : fail(t('aiToolAggregate'), outcome.error),
+      )
     }
 
     case 'load_guide': {
@@ -1059,9 +1286,11 @@ export function executeWorkbookTool(
       const outcome = deps.proposeOperations(operations, summaryInput.trim())
       if (!outcome.ok) return fail(t('aiToolPropose'), outcome.error)
       const summary = summaryInput.trim()
-      const finish = (): ToolExecution | Promise<ToolExecution> => {
-        const warnings =
-          outcome.plan.warnings.length > 0 ? `\nNote: ${outcome.plan.warnings.join('; ')}` : ''
+      const finish = (
+        appliedNotices: readonly string[] = [],
+      ): ToolExecution | Promise<ToolExecution> => {
+        const notes = [...outcome.plan.warnings, ...appliedNotices]
+        const warnings = notes.length > 0 ? `\nNote: ${notes.join('; ')}` : ''
         const opCount =
           outcome.plan.cellChanges.length +
           outcome.plan.formatChanges.length +
@@ -1071,7 +1300,23 @@ export function executeWorkbookTool(
         // Read-back after write (write → verify): formula cells fetch their
         // computed values after the async recalc, so the AI sees real results and
         // errors like #REF!/#DIV/0! instead of just what it wrote.
-        const formulaCells = outcome.plan.cellChanges.filter((c) => c.after.formula)
+        const formulaCells: { sheetId: string; address: string }[] = outcome.plan.cellChanges
+          .filter((c) => c.after.formula)
+          .map((c) => ({ sheetId: c.sheetId, address: c.address }))
+        // fill_range / copy_range apply as range-level bulk writes (no
+        // per-cell plan entries), so read back each target's corners to
+        // confirm the write actually landed and its shifted formulas compute.
+        for (const op of operations) {
+          if (op.op !== 'fill_range' && op.op !== 'copy_range') continue
+          const bounds = op.op === 'fill_range' ? parseRange(op.target) : copyTargetBounds(op)
+          const first = formatAddress(bounds.startRow, bounds.startColumn)
+          formulaCells.push({ sheetId: op.sheetId, address: first })
+          // A filtered copy's real extent is smaller than the worst-case
+          // bounds (and it writes no formulas) — read back only the anchor.
+          if (op.op === 'copy_range' && op.filterColumn !== undefined) continue
+          const last = formatAddress(bounds.endRow, bounds.endColumn)
+          if (last !== first) formulaCells.push({ sheetId: op.sheetId, address: last })
+        }
         if (formulaCells.length === 0) {
           return { output: base, mutated: true, summary }
         }
@@ -1115,16 +1360,82 @@ export function executeWorkbookTool(
       }
       if (!outcome.applied) return finish()
       return outcome.applied.then((applied) => {
-        if (applied.ok) return finish()
+        if (applied.ok) return finish(applied.notices)
         const reason = applied.reason ?? 'unknown reason'
         return fail(
           t('aiToolPropose'),
           applied.partiallyApplied
             ? `Apply failed MID-BATCH — operations before the failing one were already committed: ${reason}. ` +
-                'Read the affected ranges to see the current state before continuing; the whole partial batch is one undo step (⌘Z / [Undo]).'
+                'Read the affected ranges to see the current state before continuing; ' +
+                (applied.undoDropped
+                  ? 'the committed part is too large for the undo history — ⌘Z will NOT revert it.'
+                  : 'the whole partial batch is one undo step (⌘Z / [Undo]).')
             : `Apply failed — the workbook is UNCHANGED: ${reason}. ` +
                 'Do not tell the user the changes were made; adjust the operations and retry, or explain the failure.',
         )
+      })
+    }
+
+    case 'create_document': {
+      const summary = t('aiToolCreateDocument')
+      const create = deps.createDocument
+      if (!create) return fail(summary, 'create_document is not available in this context.')
+      const typeRaw = call.input.type === undefined ? 'xlsx' : String(call.input.type)
+      if (
+        typeRaw !== 'xlsx' &&
+        typeRaw !== 'csv' &&
+        typeRaw !== 'docx' &&
+        typeRaw !== 'pdf' &&
+        typeRaw !== 'md' &&
+        typeRaw !== 'html'
+      ) {
+        return fail(summary, 'type must be one of xlsx/csv/docx/pdf/md/html')
+      }
+      const title = typeof call.input.title === 'string' ? call.input.title.trim() : ''
+      if (typeRaw === 'xlsx' || typeRaw === 'csv') {
+        if (typeof call.input.content === 'string' && call.input.content.trim() !== '') {
+          return fail(
+            summary,
+            'content is forbidden for xlsx/csv — they export a worksheet. To create a file from new data, ' +
+              'write it into a sheet first (add_sheet + set_range via propose_operations), then export that sheet.',
+          )
+        }
+        const parsedSheet = parseReadSheetId(call.input, deps.getActiveSheetInfo(), summary)
+        if ('fail' in parsedSheet) return parsedSheet.fail
+        return create({
+          type: typeRaw,
+          sheetId: parsedSheet.sheetId,
+          ...(title ? { title } : {}),
+        }).then((outcome) => {
+          if (!outcome.ok) return fail(summary, outcome.error)
+          const note = outcome.hadFormulas
+            ? ' Note: the sheet contains formulas — the new file holds their current computed values only (no formulas or formatting).'
+            : ''
+          return {
+            output:
+              `Created ${outcome.name}${outcome.path ? ` at ${outcome.path}` : ''} from sheet ` +
+              `"${outcome.sheetName ?? ''}" and opened it in a new tab. The current workbook is unchanged.${note}`,
+            mutated: false,
+            summary: t('aiToolCreatedDocument', { name: outcome.name }),
+          }
+        })
+      }
+      if (!title) return fail(summary, 'title must not be empty')
+      const content = String(call.input.content ?? '')
+      if (!content.trim()) return fail(summary, 'content must not be empty')
+      if (typeRaw !== 'md') {
+        const echo = contentEchoError(content)
+        if (echo) return fail(summary, echo)
+      }
+      return create({ type: typeRaw, title, content }).then((outcome) => {
+        if (!outcome.ok) return fail(summary, outcome.error)
+        return {
+          output: outcome.path
+            ? `Created the new document at ${outcome.path} and opened it in a new tab.`
+            : `Created the new document "${outcome.name}" in a new tab; it saves itself into the default folder.`,
+          mutated: false,
+          summary: t('aiToolCreatedDocument', { name: outcome.name }),
+        }
       })
     }
 

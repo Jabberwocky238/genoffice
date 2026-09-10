@@ -4,6 +4,7 @@ import { NodeSelection, Plugin, PluginKey, TextSelection } from '@tiptap/pm/stat
 import type { EditorView } from '@tiptap/pm/view'
 import { installPopoverDismiss } from '@genoffice/ui'
 import { t } from '../i18n/locale'
+import { moveSelectedBlocks, uiOp } from './ops'
 
 /**
  * Notion-style block gutter: a `+` (insert below, opens the slash menu) and a
@@ -70,6 +71,8 @@ function dragHandlePlugin(editor: Editor): Plugin {
       menu.className = 'md-block-menu'
       menu.style.display = 'none'
 
+      const previousContainerPosition = container?.style.position ?? ''
+      const setContainerPosition = Boolean(container && !container.style.position)
       if (container) {
         container.style.position ||= 'relative'
         container.append(handle, menu)
@@ -170,10 +173,17 @@ function dragHandlePlugin(editor: Editor): Plugin {
         run: () => void
       }> = [
         { labelKey: 'blockAddBelow', run: () => onPlusClick() },
-        { labelKey: 'blockDuplicate', run: () => void editor.commands.duplicateBlock() },
-        { labelKey: 'blockMoveUp', run: () => void editor.commands.moveBlockUp() },
-        { labelKey: 'blockMoveDown', run: () => void editor.commands.moveBlockDown() },
-        { labelKey: 'blockDelete', danger: true, run: () => void editor.commands.deleteBlock() },
+        {
+          labelKey: 'blockDuplicate',
+          run: () => void uiOp(editor, { op: 'duplicateBlocks', target: 'selection' }),
+        },
+        { labelKey: 'blockMoveUp', run: () => void moveSelectedBlocks(editor, -1) },
+        { labelKey: 'blockMoveDown', run: () => void moveSelectedBlocks(editor, 1) },
+        {
+          labelKey: 'blockDelete',
+          danger: true,
+          run: () => void uiOp(editor, { op: 'deleteBlocks', target: 'selection' }),
+        },
       ]
 
       const openMenu = () => {
@@ -234,10 +244,11 @@ function dragHandlePlugin(editor: Editor): Plugin {
         }, 250)
       }
 
+      const onHandleMouseMove = (event: MouseEvent) => event.stopPropagation()
       view.dom.addEventListener('mousemove', onMouseMove)
       view.dom.addEventListener('mouseenter', cancelHide)
       view.dom.addEventListener('mouseleave', scheduleHide)
-      handle.addEventListener('mousemove', (e) => e.stopPropagation())
+      handle.addEventListener('mousemove', onHandleMouseMove)
       handle.addEventListener('mouseenter', cancelHide)
       handle.addEventListener('mouseleave', scheduleHide)
       grip.addEventListener('dragstart', onDragStart)
@@ -256,9 +267,18 @@ function dragHandlePlugin(editor: Editor): Plugin {
           view.dom.removeEventListener('mousemove', onMouseMove)
           view.dom.removeEventListener('mouseenter', cancelHide)
           view.dom.removeEventListener('mouseleave', scheduleHide)
+          handle.removeEventListener('mousemove', onHandleMouseMove)
+          handle.removeEventListener('mouseenter', cancelHide)
+          handle.removeEventListener('mouseleave', scheduleHide)
+          grip.removeEventListener('dragstart', onDragStart)
+          grip.removeEventListener('click', onGripClick)
+          plus.removeEventListener('click', onPlusClick)
           document.removeEventListener('scroll', onScrollOrLeave, true)
           handle.remove()
           menu.remove()
+          if (container && setContainerPosition && container.style.position === 'relative') {
+            container.style.position = previousContainerPosition
+          }
         },
       }
     },

@@ -15,6 +15,7 @@ import {
   nativeImage,
   session as electronSession,
   shell,
+  webContents,
   WebContentsView,
 } from 'electron'
 import type { WebContents } from 'electron'
@@ -23,130 +24,77 @@ import { readFile, writeFile, rm, stat, mkdir, open } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync } from 'node:fs'
 import { userInfo } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
+import { cleanupExpiredGeneratedPages } from './generated-page-temp'
+import { exportSlidesPdf } from './pdf-export'
 import { gskApiKey, gskSlideGenerate, setGskProxyUrl } from '@genoffice/ai-search'
 import {
   appMenuLabels,
   configuredDefaultSaveDir,
   contextMenuLabels,
+  fetchRemoteImage,
   installContextMenu,
   installNavigationGuard,
   safeExternalUrl,
+  saveAsSuggestion,
   showOpenDialogWithMemory,
   showSaveDialogWithMemory,
   toggleDevToolsItem,
 } from '@genoffice/electron-utils'
+import {
+  resolveGroupChildId,
+  runTxn,
+  type Op,
+  type OpRecord,
+  type TxnRequest,
+  type TxnResult,
+} from './ops'
+import { mapScriptOps } from './ops/script-map'
+import { matchesElementRef } from '@genoffice/pptx-engine/identity'
+import { buildPagePptx, parsePageSpec } from './page-spec'
+import { sniffImageMime } from './media-mime'
 import { getUiLang, normalizeLang, setUiLang } from '@genoffice/i18n'
 import { ProjectStore } from '@genoffice/project-store'
 import {
-  addChart,
-  addElement,
-  addMedia,
-  addModel3d,
-  addPicture,
-  addSlideComment,
-  addSmartArt,
-  applyHeaderFooter,
-  applyThemeToArchive,
-  remapDeckColors,
-  addTable,
   copyElementData,
-  editPictureSrcRect,
-  groupElements,
-  ungroupElement,
   findGroupChild,
-  editGroupChildTransform,
-  patchGroupChildText,
-  setGroupChildFont,
-  editGroupChildFill,
-  editGroupChildStroke,
   patchBodyPrAutofit,
   getElementLink,
   getSlideLinks,
   getRunLinks,
-  ensureRunLinkRels,
   readHeaderFooter,
-  setElementLink,
   createBlankPptx,
-  deleteElement,
-  deleteSlide,
-  deleteSlideComment,
-  duplicateSlide,
   copySlide,
-  pasteSlide,
   type SlideBundle,
-  insertBlankSlide,
-  insertSlideWithLayout,
   listSlideLayouts,
-  editTableCellText,
-  editTableStructure,
-  editTableStyle,
-  ensureTableStylePart,
   editChartElement,
-  markChartEditable,
   getChartElementData,
   materializeSlide,
   listMasterParts,
   parseMasterPart,
-  patchSlideXml,
-  TABLE_STYLE_PRESETS,
-  setTableColWidth,
-  type TableStructureOp,
-  type TableStyleEdit,
   EMU_PER_PT,
+  slideDurableId,
   getSlideComments,
   getSlideNotes,
   getSlideTransition,
   elementSpid,
   getSlideAnimations,
-  setSlideAnimations,
-  type SlideAnimation,
+  listEmbeddedFonts,
   openPptx,
   mergeSlideFromPptx,
+  extractMergeSlideSource,
+  type MergeSlideSource,
   promoteSlideBackground,
   parseTheme,
-  pasteElements,
-  reorderElement,
   reparseDeck,
-  replacePictureBytes,
   savePptx,
   savePptxToFile,
   commitSaved,
-  setElementFont,
-  replaceAllInDeck,
-  mergeTableCells,
-  setSlideLayout,
-  resetSlideLayout,
   builtinLayoutInfos,
   ensureBuiltinLayout,
   shouldOfferBuiltinLayouts,
   BUILTIN_LAYOUT_PREFIX,
-  setSlideSize,
-  setPictureOpacity,
-  setElementConnection,
-  updateConnectorsForMoved,
-  setElementImageFill,
-  setElementTextAnchor,
-  setTableRowHeight,
-  resizeTable,
-  setTableCellAnchor,
-  setElementParagraphFormat,
-  setGroupChildParagraphFormat,
-  setSlideBackground,
-  setSlideBackgroundImage,
-  resetSlideBackground,
-  setSlideBgGraphicsHidden,
-  setSlideAdvanceTime,
-  setSlideHidden,
-  setSlideNotes,
-  setSlideTransition,
   getSections,
-  setSections,
-  addSection,
-  renameSection,
-  removeSection,
-  moveSection,
-  moveSlide,
   type SectionInfo,
   type ElementClipboardItem,
   type OpenedPptx,
@@ -154,9 +102,14 @@ import {
   type Slide,
   type TextElement,
 } from '@genoffice/pptx-engine'
-import { buildRenderSlide, EMU_PER_PX_96, type RenderSlide } from '@genoffice/pptx-render'
+import {
+  buildRenderSlide,
+  layoutText,
+  makeViewport,
+  EMU_PER_PX_96,
+  type RenderSlide,
+} from '@genoffice/pptx-render'
 import { refineComplexWidths, shapedMetricsReady } from './shaped-metrics'
-import { applyEditParagraphs, collectParagraphFormatPatches, levelsChanged } from './edit-text'
 import { cfbKind, isCfbHeader } from './cfb-sniff'
 import { unplayableAudioCodec } from './mp4-audio-sniff'
 import type {
@@ -182,6 +135,8 @@ import type {
   DeleteElementOp,
   EditBackgroundOp,
   EditFillOp,
+  GradientFillSpec,
+  EditFillImageOp,
   EditStrokeOp,
   FlipElementOp,
   EditPictureSrcRectOp,
@@ -230,20 +185,28 @@ import type {
   RemoveSectionOp,
   MoveSectionOp,
   MoveSlideOp,
+  ApplyEditScriptOp,
+  ApplyTxnOp,
+  ApplyTxnResult,
   AnimationItem,
   ShapeKey,
+  SetEffectsPatch,
 } from '../shared/ipc'
 import { buildPrintDocumentHtml } from '../shared/print-html'
 
 import { tm } from './i18n-main'
 import { tiffToPng } from './tiff-decode'
 import {
+  attachedIds,
+  editorAttachedIds,
   beginHistoryBatch,
   buildAllRenderSlides,
   carryHistoryForReplacement,
   dialogParent,
   endHistoryBatch,
   getFontMetrics,
+  resetFontMetrics,
+  journalOps,
   makeMediaResolver,
   pushHistory,
   rebuildSlide,
@@ -253,15 +216,26 @@ import {
   restoreSnapshot,
   settleStaleHistoryBatch,
   runtime,
+  scheduleDeckBroadcast,
   scheduleHistoryNotify,
+  setActiveSlidesWebContents,
   sessions,
   showChrome,
   takeSnapshot,
   windowRefs,
+  type OpLogEntry,
   type Session,
 } from './session-state'
 import { registerAiIpc, registerSlidesOnlyAiIpc } from './ai-ipc'
-import { listPrivateFontFaces, getPrivateFontData } from './fonts'
+import { listPrivateFontFaces, getPrivateFontData, registerEmbeddedFonts } from './fonts'
+import { listMetafileFonts } from './metafile-fonts'
+import {
+  downloadFontFamily,
+  initFontStore,
+  installLocalFontFiles,
+  listFontCatalog,
+  missingCatalogFonts,
+} from './font-store'
 
 /** One slide, copied from any deck open in this process, waiting to be pasted into another. */
 let slideClipboard: { bundle: SlideBundle; png?: string } | null = null
@@ -269,7 +243,7 @@ let slideClipboard: { bundle: SlideBundle; png?: string } | null = null
 /** The immediately preceding slide paste per webContents, so the paste-options floater can redo it with another mode. */
 const lastSlidePaste = new Map<number, { afterIndex: number; undoLen: number }>()
 
-// Cloud-generated single-page pptx: marker strings travel in pagesHtml slots; only paths issued
+// Cloud-generated single-page pptx: marker strings travel in pageMarkers slots; only paths issued
 // by slides:cloud-page-generate are readable (the renderer can't point the reader at arbitrary files)
 const CLOUD_PAGE_PREFIX = 'cloudpptx:'
 const issuedCloudPages = new Set<string>()
@@ -282,6 +256,26 @@ export {
   setSlidesShellWindow,
   setSlidesShowBleed,
 } from './session-state'
+
+/** IPC gradient → engine stop list (full stop list wins over the two-color from/to form). */
+const gradientStops = (g: GradientFillSpec['gradient']): Array<{ pos: number; color: string }> =>
+  g.stops?.length
+    ? g.stops
+    : [
+        { pos: 0, color: g.from },
+        { pos: 1, color: g.to },
+      ]
+
+/** IPC gradient → path kind (radial is a legacy alias for circle; undefined = linear). */
+const gradientPathKind = (
+  g: GradientFillSpec['gradient'],
+): 'circle' | 'rect' | 'shape' | undefined => g.path ?? (g.radial ? 'circle' : undefined)
+
+/** IPC gradient focus point → <a:fillToRect> insets (undefined when unspecified). */
+const gradientFillTo = (
+  g: GradientFillSpec['gradient'],
+): { l: number; t: number; r: number; b: number } | undefined =>
+  g.center ? { l: g.center.x, t: g.center.y, r: 1 - g.center.x, b: 1 - g.center.y } : undefined
 export { registerAiIpc } from './ai-ipc'
 
 /** standalone: path queued before window creation (argv/open-file) */
@@ -378,7 +372,6 @@ function trackSlidesWebContents(wc: WebContents): void {
     else untitledRecovery.delete(wc.id)
     sessions.delete(wc.id)
     pendingByWc.delete(wc.id)
-    clipboards.delete(wc.id)
     lastSlidePaste.delete(wc.id)
     closeSaveWaiters.get(wc.id)?.(false)
     closeSaveWaiters.delete(wc.id)
@@ -387,13 +380,36 @@ function trackSlidesWebContents(wc: WebContents): void {
   })
 }
 
-// ── In-app element clipboard (isolated per webContents; pasteCount drives cascading offset) ─
-const clipboards = new Map<number, { items: ElementClipboardItem[]; pasteCount: number }>()
+// ── In-app element clipboard (app-wide, so elements copied in one deck paste into any other open deck; pasteCount drives cascading offset) ─
+let elementClipboard: { items: ElementClipboardItem[]; pasteCount: number } | null = null
 
 /** Shell hook: a view opened a file (including ⌘O inside a tab) — used to update tab titles and de-duplicate paths */
 let slidesOpenedHook: ((wc: WebContents, path: string) => void) | null = null
 export function setSlidesOpenedHook(fn: ((wc: WebContents, path: string) => void) | null): void {
   slidesOpenedHook = fn
+}
+
+/** Detached editor windows (createSlidesWindow), keyed by webContents id — their titles are owned here */
+const standaloneWindows = new Map<number, BrowserWindow>()
+
+/**
+ * A shared session's path changed (Save As): sync every attached surface — the
+ * shell tab title/path of tab-hosted windows (via the opened hook; a no-op for
+ * non-tab webContents) and the window title of detached editors. Without this a
+ * Save As from a detached window left the shell tab on the old path, breaking
+ * open-by-path dedupe.
+ */
+function syncAttachedPaths(session: Session, path: string): void {
+  for (const id of attachedIds(session)) {
+    const wc = webContents.fromId(id)
+    if (!wc || wc.isDestroyed()) continue
+    slidesOpenedHook?.(wc, path)
+    // Peer renderers keep the path in React state (Save As defaults, path-keyed
+    // guides); the saver also gets it from its own IPC result — idempotent
+    wc.send('slides:renamed', path)
+    const win = standaloneWindows.get(id)
+    if (win && !win.isDestroyed()) win.setTitle(basename(path))
+  }
 }
 
 const RECENT_PATH = () => join(app.getPath('userData'), 'slides-recent.json')
@@ -492,7 +508,10 @@ setInterval(() => {
   if (autosaveRunning) return
   autosaveRunning = true
   void (async () => {
+    const seen = new Set<Session>() // aliased entries share the session; save it once
     for (const [wcId, session] of sessions.entries()) {
+      if (seen.has(session)) continue
+      seen.add(session)
       if (session.masterEdit || !sessionDirty(session)) continue
       let target: string
       if (session.path) {
@@ -572,6 +591,11 @@ export async function requestSlidesClose(
   parent?: BrowserWindow | null,
 ): Promise<boolean> {
   if (!slidesIsDirty(contents.id) || contents.isDestroyed()) return true
+  // A shared session stays alive in another EDITOR window; this window can leave
+  // without a save prompt — the changes are not being discarded. View-only
+  // attachments (presenter audience) don't count: they cannot save.
+  const shared = sessions.get(contents.id)
+  if (shared && editorAttachedIds(shared).length > 1) return true
   // Autosave on and a path exists: save silently and proceed without bothering the user; only a failed save falls through to the dialog
   if (autoSavePrefByWc.get(contents.id) && sessions.get(contents.id)?.path) {
     if (await requestRendererSave(contents)) return true
@@ -672,15 +696,58 @@ async function rejectLegacyPpt(path: string): Promise<boolean> {
   return true
 }
 
+/** Register the deck's usable embedded fonts before layout; new faces invalidate cached metrics. */
+function adoptEmbeddedFonts(opened: OpenedPptx): void {
+  try {
+    if (registerEmbeddedFonts(listEmbeddedFonts(opened.archive))) resetFontMetrics()
+  } catch {
+    // Embedded fonts are best-effort: a malformed fntdata must never block opening
+  }
+  // Metafile pictures draw text through canvas fonts: resolving their facenames here puts the
+  // Office-private faces (Yu Gothic UI, MS PGothic…) on the renderer's private-font list before
+  // the EMF/WMF previews rasterize.
+  try {
+    const metrics = getFontMetrics()
+    for (const f of listMetafileFonts(opened.archive))
+      metrics.displayFamily?.({
+        fontFamily: f.family,
+        fontSizePx: 100,
+        bold: f.bold,
+        italic: f.italic,
+      })
+  } catch {
+    // best-effort as well
+  }
+}
+
 async function openAndBuild(
   wc: WebContents,
   path: string,
   fitWidthPx: number,
 ): Promise<OpenResult> {
+  // Same file already open in another window: attach to that session instead of
+  // opening an independent copy (which would silently lose the loser's edits on
+  // save). Both windows then see the same live deck; edits propagate via
+  // scheduleDeckBroadcast. Untitled sessions have path '' and never alias.
+  const wanted = resolve(path)
+  for (const [id, existing] of sessions) {
+    if (id === wc.id || !existing.path || resolve(existing.path) !== wanted) continue
+    sessions.set(wc.id, existing)
+    scheduleHistoryNotify(existing)
+    await pushRecent(path)
+    slidesOpenedHook?.(wc, path)
+    return {
+      path: existing.path,
+      slides: buildAllRenderSlides(existing.opened, fitWidthPx),
+      size: { cx: existing.opened.deck.size.cx, cy: existing.opened.deck.size.cy },
+      defaultFont: deckDefaultFont(existing.opened),
+    }
+  }
   const raw = await readFile(path)
   const { bytes, recovered } = await maybeRecoverBytes(path, new Uint8Array(raw))
   await shapedMetricsReady() // Lay out only after complex-script shaped metrics are ready, avoiding an init race falling back to estimation
   const opened = await openPptx(bytes)
+  adoptEmbeddedFonts(opened)
   sessions.set(wc.id, {
     path,
     opened,
@@ -797,7 +864,7 @@ function deckDefaultFont(opened: OpenedPptx): string | undefined {
 }
 
 function findEl(slide: Slide, sourceId: string): TextElement | undefined {
-  const el = slide.elements.find((e) => e.id === sourceId)
+  const el = slide.elements.find((e) => matchesElementRef(e, sourceId))
   if (el && (el.type === 'text' || el.type === 'shape')) return el as TextElement
   return undefined
 }
@@ -818,7 +885,7 @@ function applyAutofitResize(
   const slide = session.opened.deck.slides[slideIndex]
   const el = slide ? findEl(slide, sourceId) : undefined
   if (!el?.text || el.text.autofit !== 'resize') return rendered
-  const node = rendered.nodes.find((n) => n.sourceId === sourceId)
+  const node = rendered.nodes.find((n) => n.sourceId === el.id)
   if (!node || (node.type !== 'shape' && node.type !== 'text') || !node.text) return rendered
   const needH = node.text.contentHeight + node.text.insets.t + node.text.insets.b
   if (Math.abs(needH - node.box.h) < 1) return rendered
@@ -852,10 +919,21 @@ function syncAutofitScale(
   const slide = session.opened.deck.slides[slideIndex]
   const el = slide ? findEl(slide, sourceId) : undefined
   if (!el?.text || el.text.autofit !== 'shrink') return rendered
-  const node = rendered.nodes.find((n) => n.sourceId === sourceId)
+  const node = rendered.nodes.find((n) => n.sourceId === el.id)
   if (!node || (node.type !== 'shape' && node.type !== 'text') || !node.text) return rendered
-  const effective = node.text.fontScale
-  const effectiveRed = node.text.lnSpcReduction ?? 0
+  // The plain render honors the stored fontScale as-is (PowerPoint-on-open semantics);
+  // after a text edit, re-run the layout with the autofit ladder enabled to find the
+  // ratio PowerPoint would now use (still capped at the stored value).
+  const refit = layoutText({
+    body: el.text,
+    boxWidthPx: node.box.w,
+    boxHeightPx: node.box.h,
+    metrics: getFontMetrics(),
+    vp: makeViewport(session.opened.deck.size, session.fitWidthPx),
+    refitAutofit: true,
+  })
+  const effective = refit.fontScale
+  const effectiveRed = refit.lnSpcReduction ?? 0
   if (
     Math.abs(effective - (el.text.fontScale ?? 1)) < 0.005 &&
     Math.abs(effectiveRed - (el.text.lnSpcReduction ?? 0)) < 0.005
@@ -866,7 +944,8 @@ function syncAutofitScale(
   else delete el.text.lnSpcReduction
   el.anchor.originalXml = patchBodyPrAutofit(el.anchor.originalXml, effective, effectiveRed)
   slide!.structureDirty = true
-  return rendered // The layout already rendered with the effective value; no rebuild needed
+  // The render above used the pre-edit stored scale; redo it at the written-back value
+  return rebuildSlide(session, slideIndex) ?? rendered
 }
 
 /** Legacy fixed color schemes (AI tools/old files still pass these keys; kept as fallback). */
@@ -935,11 +1014,28 @@ function chartColorSchemes(
   ]
 }
 
+/** After a successful Slides → PDF export: open the file in a PDF tab (shell)
+ * or reveal it in the folder (standalone). Tab-opening failure must not
+ * report the export itself as failed — the file is already persisted. */
+function openExportedPdf(path: string): void {
+  try {
+    if (runtime.openGeneratedPath?.(path)) return
+  } catch (err) {
+    console.warn('[slides] Failed to open exported PDF:', err)
+  }
+  shell.showItemInFolder(path)
+}
+
 let ipcRegistered = false
 
 export function registerSlidesIpc(): void {
   if (ipcRegistered) return
   ipcRegistered = true
+
+  // AI-generated slide pages land in app-owned temp directories; sweep
+  // expired ones at startup (never at land time — markers can be redeemed
+  // more than once), mirroring the sheets pasted-file cleanup.
+  void cleanupExpiredGeneratedPages(app.getPath('temp'))
 
   // shared with the other editor modules — last (identical) registration wins
   ipcMain.removeHandler('app:get-language')
@@ -969,6 +1065,89 @@ export function registerSlidesIpc(): void {
   ipcMain.handle('slides:private-font-faces', () => listPrivateFontFaces())
   ipcMain.handle('slides:private-font-data', (_e, id: string) => getPrivateFontData(id))
 
+  initFontStore()
+  // Fonts changed (download or local install): rebuild every open session with a fresh
+  // registry and push the relaid-out slides + a re-sync ping to all attached windows.
+  const afterFontsChanged = (): void => {
+    resetFontMetrics()
+    const seen = new Set<Session>()
+    for (const [wcId, session] of sessions) {
+      if (seen.has(session)) continue
+      seen.add(session)
+      const payload = {
+        slides: buildAllRenderSlides(session.opened, session.fitWidthPx),
+        size: { cx: session.opened.deck.size.cx, cy: session.opened.deck.size.cy },
+      }
+      for (const id of attachedIds(session))
+        webContents.fromId(id)?.send('slides:deck-changed', payload)
+      void wcId
+    }
+    for (const wc of webContents.getAllWebContents()) wc.send('slides:fonts-changed')
+  }
+  ipcMain.handle('slides:font-catalog', () => listFontCatalog())
+  ipcMain.handle('slides:font-download', async (_e, family: string) => {
+    try {
+      await downloadFontFamily(family)
+      afterFontsChanged()
+      return { ok: true }
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+  ipcMain.handle('slides:font-install-local', async () => {
+    const r = await showOpenDialogWithMemory(dialog, dialogParent(), {
+      properties: ['openFile', 'multiSelections'],
+      filters: [{ name: 'Fonts', extensions: ['ttf', 'otf', 'ttc', 'otc'] }],
+    })
+    if (r.canceled || !r.filePaths.length) return { families: [] }
+    const families = installLocalFontFiles(r.filePaths)
+    if (families.length) afterFontsChanged()
+    return { families }
+  })
+  ipcMain.handle('slides:font-missing', (e) => {
+    const session = sessions.get(e.sender.id)
+    return session ? missingCatalogFonts(session.opened) : []
+  })
+
+  // Shared shim core: one undo step wrapping a transaction; on failure the step is
+  // erased (the executor already restored the model, so history stays consistent).
+  // Handlers keep only surface translation and result shaping around this.
+  // Plan first: pushHistory clears the redo stack (and can evict the oldest undo
+  // entry at the cap), so an invalid request must not touch history at all —
+  // legacy handlers validated existence before their history push.
+  // The single funnel for non-dry transactions in this module: every applied
+  // batch lands in the session's op journal (collab groundwork).
+  const journaledTxn = (
+    session: Session,
+    source: Exclude<OpLogEntry['source'], 'reset'>,
+    req: TxnRequest,
+  ): TxnResult => {
+    const r = runTxn(session.opened, req)
+    if (r.applied) {
+      journalOps(session, source, r.records ?? [])
+      scheduleDeckBroadcast(session)
+    }
+    return r
+  }
+
+  const sessionTxn = (
+    session: Session,
+    req: TxnRequest,
+    source: Exclude<OpLogEntry['source'], 'reset'> = 'edit',
+  ): TxnResult | null => {
+    const plan = runTxn(session.opened, { ...req, dryRun: true })
+    const invalid = plan.failures?.length ?? 0
+    if ((req.isolation ?? 'atomic') === 'atomic' ? invalid > 0 : invalid >= req.ops.length)
+      return null
+    pushHistory(session)
+    const r = journaledTxn(session, source, req)
+    if (!r.applied) {
+      session.undoStack.pop()
+      return null
+    }
+    return r
+  }
+
   ipcMain.handle('slides:open', async (e, fitWidthPx: number) => {
     const parent = dialogParent()
     const options = {
@@ -993,10 +1172,19 @@ export function registerSlidesIpc(): void {
     vibFlip.get(e.sender.id)?.('#00000000')
     const queued = pendingByWc.get(e.sender.id) ?? pendingOpenPath
     if (queued && existsSync(queued)) {
+      const dropQueued = () => {
+        if (pendingByWc.get(e.sender.id) === queued) pendingByWc.delete(e.sender.id)
+        if (pendingOpenPath === queued) pendingOpenPath = null
+      }
+      // A CFB file (legacy .ppt / encrypted, possibly misnamed .pptx) can never
+      // parse: tell the user and drop it, or every relaunch restores a blank tab
+      if (await rejectLegacyPpt(queued)) {
+        dropQueued()
+        return null
+      }
       // Clear the queue only after a successful open: keep it on parse failure or a mid-flight renderer reload, so a remount can retry
       const result = await openAndBuild(e.sender, queued, fitWidthPx)
-      if (pendingByWc.get(e.sender.id) === queued) pendingByWc.delete(e.sender.id)
-      if (pendingOpenPath === queued) pendingOpenPath = null
+      dropQueued()
       return result
     }
     // No queued path but the main process already has a session (remount after an HMR full
@@ -1016,48 +1204,28 @@ export function registerSlidesIpc(): void {
     return null
   })
 
+  // Shim over the canonical setText op (rich-text rebuild, link rels, resource cleanup,
+  // level rematerialization live in the op); autofit is a render concern and stays here.
   ipcMain.handle('slides:edit-text', (e, op: EditTextOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    const slide = session.opened.deck.slides[op.slideIndex]
-    if (!slide) return null
-    // In-group editing: after updating a child's paragraphs, patch the text of the child slice inside the group's originalXml
-    if (op.groupId) {
-      const found = findGroupChild(slide, op.groupId, op.sourceId)
-      const child = found?.child
-      if (!child || (child.type !== 'text' && child.type !== 'shape')) return null
-      const textChild = child as TextElement
-      if (!textChild.text) return null
-      pushHistory(session)
-      textChild.text.paragraphs = applyEditParagraphs(textChild.text.paragraphs, op.paragraphs)
-      ensureRunLinkRels(session.opened, op.slideIndex, textChild.text.paragraphs)
-      if (!patchGroupChildText(slide, op.groupId, textChild)) {
-        restoreSnapshot(session, session.undoStack.pop()!) // Slice not located: roll back the already-modified model
-        return null
-      }
-      for (const { index, patch } of collectParagraphFormatPatches(op.paragraphs)) {
-        setGroupChildParagraphFormat(slide, op.groupId, op.sourceId, patch, [index])
-      }
-      return rebuildSlide(session, op.slideIndex)
-    }
-    const el = findEl(slide, op.sourceId)
-    if (!el || !el.text) return null
     pushHistory(session)
-    // Run-level rich-text rebuild: srcPara/srcRun back-tracing + preserving unedited fields, see applyEditParagraphs
-    const levelDirty = levelsChanged(el.text.paragraphs, op.paragraphs)
-    el.text.paragraphs = applyEditParagraphs(el.text.paragraphs, op.paragraphs)
-    ensureRunLinkRels(session.opened, op.slideIndex, el.text.paragraphs)
-    el.dirty = true
-    // Per-paragraph bullets/spacing marked on the editor selection
-    for (const { index, patch } of collectParagraphFormatPatches(op.paragraphs)) {
-      setElementParagraphFormat(slide, op.sourceId, patch, [index])
+    const r = journaledTxn(session, 'edit', {
+      ops: [
+        {
+          op: 'setText',
+          target: { slide: op.slideIndex, el: op.sourceId },
+          paragraphs: op.paragraphs,
+          ...(op.groupId ? { group: op.groupId } : {}),
+        },
+      ],
+    })
+    if (!r.applied) {
+      session.undoStack.pop()
+      return null
     }
-    if (levelDirty) {
-      // Level changes affect inheritance (font size/bullet/indent take master defaults by lvl); bake into bytes then reparse
-      el.dirtyPPr = { ...el.dirtyPPr, level: true, indents: true }
-      materializeSlide(session.opened, op.slideIndex)
-      return rebuildSlide(session, op.slideIndex)
-    }
+    const levelDirty = (r.records?.[0]?.after as { levelDirty?: boolean } | undefined)?.levelDirty
+    if (op.groupId || levelDirty) return rebuildSlide(session, op.slideIndex)
     const rendered = applyAutofitResize(
       session,
       op.slideIndex,
@@ -1067,36 +1235,32 @@ export function registerSlidesIpc(): void {
     return syncAutofitScale(session, op.slideIndex, op.sourceId, rendered)
   })
 
+  // Shim over the canonical setFont op: one per_op transaction covers the whole
+  // selection (non-text elements fail their own op and are skipped, matching the
+  // legacy "changed if any succeeded" semantics).
   ipcMain.handle('slides:set-element-font', (e, op: SetElementFontOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    const slide = session.opened.deck.slides[op.slideIndex]
-    if (!slide) return null
-    pushHistory(session)
-    let changed = false
-    for (const id of op.sourceIds) {
-      const ok = op.groupId
-        ? setGroupChildFont(slide, op.groupId, id, {
-            fontFamily: op.fontFamily,
-            fontSizePt: op.fontSizePt,
-            strike: op.strike,
-            bold: op.bold,
-            italic: op.italic,
-            underline: op.underline,
-            color: op.color,
-          })
-        : setElementFont(slide, id, {
-            fontFamily: op.fontFamily,
-            fontSizePt: op.fontSizePt,
-            strike: op.strike,
-            bold: op.bold,
-            italic: op.italic,
-            underline: op.underline,
-            color: op.color,
-          })
-      if (ok) changed = true
+    const font = {
+      fontFamily: op.fontFamily,
+      fontSizePt: op.fontSizePt,
+      strike: op.strike,
+      bold: op.bold,
+      italic: op.italic,
+      underline: op.underline,
+      color: op.color,
     }
-    if (!changed) {
+    pushHistory(session)
+    const r = journaledTxn(session, 'edit', {
+      isolation: 'per_op',
+      ops: op.sourceIds.map((id) => ({
+        op: 'setFont',
+        target: { slide: op.slideIndex, el: id },
+        font,
+        ...(op.groupId ? { group: op.groupId } : {}),
+      })),
+    })
+    if (!r.applied) {
       session.undoStack.pop() // All non-text elements (images etc.): nothing happened, pop the just-pushed history
       return null
     }
@@ -1108,13 +1272,11 @@ export function registerSlidesIpc(): void {
     return rendered
   })
 
+  // Shim over the canonical setParagraphFormat op (same per_op selection semantics as setFont).
   ipcMain.handle('slides:set-element-paragraph-format', (e, op: SetElementParagraphFormatOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    const slide = session.opened.deck.slides[op.slideIndex]
-    if (!slide) return null
-    pushHistory(session)
-    const patch = {
+    const format = {
       bullet: op.bullet,
       bulletChar: op.bulletChar,
       bulletHangEmu: op.bulletHangEmu,
@@ -1124,16 +1286,20 @@ export function registerSlidesIpc(): void {
       spaceBeforePt: op.spaceBeforePt,
       spaceAfterPt: op.spaceAfterPt,
       align: op.align,
+      rtl: op.rtl,
       indentDelta: op.indentDelta,
     }
-    let changed = false
-    for (const id of op.sourceIds) {
-      const ok = op.groupId
-        ? setGroupChildParagraphFormat(slide, op.groupId, id, patch)
-        : setElementParagraphFormat(slide, id, patch)
-      if (ok) changed = true
-    }
-    if (!changed) {
+    pushHistory(session)
+    const r = journaledTxn(session, 'edit', {
+      isolation: 'per_op',
+      ops: op.sourceIds.map((id) => ({
+        op: 'setParagraphFormat',
+        target: { slide: op.slideIndex, el: id },
+        format,
+        ...(op.groupId ? { group: op.groupId } : {}),
+      })),
+    })
+    if (!r.applied) {
       session.undoStack.pop()
       return null
     }
@@ -1150,31 +1316,22 @@ export function registerSlidesIpc(): void {
     return rendered
   })
 
+  // Shim over the canonical setTransform op. Preview-gesture undo bookkeeping and the
+  // px→EMU (and group-local scale) translation are surface concerns and stay here.
   ipcMain.handle('slides:edit-transform', (e, op: EditTransformOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
     const slide = session.opened.deck.slides[op.slideIndex]
     if (!slide) return null
-    const el = op.groupId ? null : slide.elements.find((x) => x.id === op.sourceId)
-    const grpChild = op.groupId ? findGroupChild(slide, op.groupId, op.sourceId) : null
-    if (!el && !grpChild) return null
-    // Undo semantics for preview gestures: one whole drag = one undo step.
-    // The first preview pushes a pre-gesture snapshot; later previews and the final commit do not.
-    if (op.preview) {
-      if (!session.transformPreview) {
-        pushHistory(session)
-        session.transformPreview = true
-      }
-    } else if (session.transformPreview) {
-      session.transformPreview = false
-    } else {
-      pushHistory(session)
-    }
+    const childId = op.groupId ? resolveGroupChildId(slide, op.groupId, op.sourceId) : op.sourceId
+    const grpChild = op.groupId ? findGroupChild(slide, op.groupId, childId) : null
+    if (op.groupId && !grpChild) return null
     // px -> EMU (inverting the viewport scale)
     const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
     const scale = op.fitWidthPx / baseWidthPx
     const toEmu = (px: number) => Math.round((px / scale) * EMU_PER_PX_96)
     // In-group editing: the pixel box is in group-local coords (with ext/chExt scaling baked in); divide out the group scale first, then convert back to the child EMU coordinate system
+    let box: { x: number; y: number; cx: number; cy: number }
     if (grpChild) {
       const ch = grpChild.grp.childOffset
       const chX = ch?.x ?? grpChild.grp.transform.offset.x
@@ -1182,41 +1339,57 @@ export function registerSlidesIpc(): void {
       const gExt = grpChild.grp.transform.offset
       const gsx = ch?.cx ? gExt.cx / ch.cx : 1
       const gsy = ch?.cy ? gExt.cy / ch.cy : 1
-      const ok = editGroupChildTransform(
-        slide,
-        op.groupId!,
-        op.sourceId,
-        {
-          x: toEmu(op.xPx / gsx) + chX,
-          y: toEmu(op.yPx / gsy) + chY,
-          cx: toEmu(op.wPx / gsx),
-          cy: toEmu(op.hPx / gsy),
-        },
-        op.rotationDeg,
-      )
-      if (!ok) {
-        session.undoStack.pop() // Slice not located: model untouched, pop the just-pushed history
-        return null
+      box = {
+        x: toEmu(op.xPx / gsx) + chX,
+        y: toEmu(op.yPx / gsy) + chY,
+        cx: toEmu(op.wPx / gsx),
+        cy: toEmu(op.hPx / gsy),
       }
-      return rebuildSlide(session, op.slideIndex)
+    } else {
+      box = { x: toEmu(op.xPx), y: toEmu(op.yPx), cx: toEmu(op.wPx), cy: toEmu(op.hPx) }
     }
-    // Tables: redistribute gridCol widths / tr heights so the file matches the
-    // frame instead of keeping the old grid under a new a:ext
-    const isTable = el!.type === 'table'
-    if (isTable) resizeTable(slide, op.sourceId, toEmu(op.wPx), toEmu(op.hPx))
-    el!.transform = {
-      ...el!.transform,
-      offset: {
-        x: toEmu(op.xPx),
-        y: toEmu(op.yPx),
-        // resizeTable synced cx/cy to the redistributed sums
-        cx: isTable ? el!.transform.offset.cx : toEmu(op.wPx),
-        cy: isTable ? el!.transform.offset.cy : toEmu(op.hPx),
-      },
-      rot: Math.round(op.rotationDeg * 60000),
+    const payload = {
+      op: 'setTransform',
+      target: { slide: op.slideIndex, el: op.sourceId },
+      box,
+      rotDeg: op.rotationDeg,
+      // Tables redistribute gridCol widths / tr heights so the file matches the frame
+      ...(op.groupId ? { group: op.groupId } : { resizeTableGrid: true }),
     }
-    el!.dirtyTransform = true
-    updateConnectorsForMoved(slide, [op.sourceId])
+    // Validate BEFORE the preview bookkeeping: a failed first preview must not set
+    // transformPreview (later frames would skip pushHistory and the eventual commit
+    // would lose its undo step) and must not clear the redo stack.
+    if (runTxn(session.opened, { dryRun: true, ops: [payload] }).failures?.length) return null
+    // Undo semantics for preview gestures: one whole drag = one undo step.
+    // The first preview pushes a pre-gesture snapshot; later previews and the final commit do not.
+    let pushed = false
+    if (op.preview) {
+      if (!session.transformPreview) {
+        pushHistory(session)
+        pushed = true
+        session.transformPreview = true
+      }
+    } else if (session.transformPreview) {
+      session.transformPreview = false
+    } else {
+      pushHistory(session)
+      pushed = true
+    }
+    // Journal only the settled commit: preview frames would flood the ring with
+    // intermediate boxes (undo coalesces the gesture the same way via transformPreview).
+    const r = op.preview
+      ? runTxn(session.opened, { ops: [payload] })
+      : journaledTxn(session, 'edit', { ops: [payload] })
+    if (!r.applied) {
+      // Apply-time failure (e.g. a group-child slice that validation cannot see):
+      // unwind everything this call did, including the preview flag it set — a stuck
+      // flag would make later frames skip pushHistory and cost the commit its undo step.
+      if (pushed) {
+        session.undoStack.pop()
+        if (op.preview) session.transformPreview = false
+      }
+      return null
+    }
     return rebuildSlide(session, op.slideIndex)
   })
 
@@ -1225,40 +1398,22 @@ export function registerSlidesIpc(): void {
   ipcMain.handle('slides:edit-connector-endpoints', (e, op: EditConnectorEndpointsOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    const slide = session.opened.deck.slides[op.slideIndex]
-    if (!slide) return null
-    const el = slide.elements.find((x) => x.id === op.sourceId)
-    if (!el) return null
-    pushHistory(session)
     const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
     const scale = op.fitWidthPx / baseWidthPx
     const toEmu = (px: number) => Math.round((px / scale) * EMU_PER_PX_96)
-    const p1 = { x: toEmu(op.x1Px), y: toEmu(op.y1Px) }
-    const p2 = { x: toEmu(op.x2Px), y: toEmu(op.y2Px) }
-    el.transform = {
-      ...el.transform,
-      offset: {
-        x: Math.min(p1.x, p2.x),
-        y: Math.min(p1.y, p2.y),
-        cx: Math.abs(p2.x - p1.x),
-        cy: Math.abs(p2.y - p1.y),
-      },
-      rot: 0,
-      flipH: p1.x > p2.x,
-      flipV: p1.y > p2.y,
-    }
-    el.dirtyTransform = true
-    const toRef = (
-      v: { targetId: string; idx: number } | null | undefined,
-    ): { id: number; idx: number } | null | undefined => {
-      if (v === undefined) return undefined
-      if (v === null) return null
-      const target = slide.elements.find((x) => x.id === v.targetId)
-      const spid = target ? elementSpid(target) : null
-      return spid != null ? { id: spid, idx: v.idx } : null
-    }
-    setElementConnection(slide, op.sourceId, { start: toRef(op.start), end: toRef(op.end) })
-    return rebuildSlide(session, op.slideIndex)
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'setConnectorEndpoints',
+          target: { slide: op.slideIndex, el: op.sourceId },
+          p1: { x: toEmu(op.x1Px), y: toEmu(op.y1Px) },
+          p2: { x: toEmu(op.x2Px), y: toEmu(op.y2Px) },
+          start: op.start,
+          end: op.end,
+        },
+      ],
+    })
+    return r ? rebuildSlide(session, op.slideIndex) : null
   })
 
   // Read-only: RenderSlide for every page of the current session (E2E driver/debug use, no state change)
@@ -1268,46 +1423,154 @@ export function registerSlidesIpc(): void {
     return session.opened.deck.slides.map((_, i) => rebuildSlide(session, i))
   })
 
+  // Shim: the whole selection is one atomic transaction of setTransform ops — the
+  // executor's plan step reproduces the legacy "every element must exist" gate.
   ipcMain.handle('slides:batch-edit-transform', (e, op: BatchEditTransformOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    const slide = session.opened.deck.slides[op.slideIndex]
-    if (!slide) return null
     const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
     const scale = op.fitWidthPx / baseWidthPx
     const toEmu = (px: number) => Math.round((px / scale) * EMU_PER_PX_96)
-    // Validate: every element must exist
-    const pairs: Array<{ el: (typeof slide.elements)[0]; item: BatchEditTransformOp['items'][0] }> =
-      []
-    for (const item of op.items) {
-      const el = slide.elements.find((x) => x.id === item.sourceId)
-      if (!el) return null
-      pairs.push({ el, item })
+    const r = sessionTxn(session, {
+      ops: op.items.map((item) => ({
+        op: 'setTransform',
+        target: { slide: op.slideIndex, el: item.sourceId },
+        box: { x: toEmu(item.xPx), y: toEmu(item.yPx), cx: toEmu(item.wPx), cy: toEmu(item.hPx) },
+        rotDeg: item.rotationDeg,
+        // Legacy parity: the batch path never redistributed table grids
+      })),
+    })
+    return r ? rebuildSlide(session, op.slideIndex) : null
+  })
+
+  // AI batch surface: raw ops arrive as one transaction. The registry validates
+  // (guided errors), the executor owns atomicity/rollback/journal; dry-run
+  // rehearses the plan without touching the deck or its history.
+  ipcMain.handle('slides:apply-txn', (e, req: ApplyTxnOp): ApplyTxnResult | null => {
+    const session = sessions.get(e.sender.id)
+    if (!session) return null
+    const ops = Array.isArray(req?.ops) ? (req.ops as Parameters<typeof runTxn>[1]['ops']) : []
+    if (ops.length === 0 || ops.length > 50) {
+      return {
+        applied: false,
+        failures: [
+          { index: 0, error: 'ops must be a non-empty array (at most 50 per transaction).' },
+        ],
+      }
+    }
+    const isolation = req.isolation === 'per_op' ? ('per_op' as const) : ('atomic' as const)
+    const compact = (fails?: Array<{ index: number; error: string }>) =>
+      fails?.map((f) => ({ index: f.index, error: f.error }))
+    if (req.dryRun) {
+      const r = runTxn(session.opened, { ops, isolation, dryRun: true })
+      return {
+        applied: false,
+        dryRun: true,
+        plan: r.plan ?? [],
+        ...(r.failures?.length ? { failures: compact(r.failures) } : {}),
+      }
+    }
+    // Plan before pushing history (a no-op request must not clear the redo stack)
+    const plan = runTxn(session.opened, { ops, isolation, dryRun: true })
+    const invalid = plan.failures?.length ?? 0
+    if (isolation === 'atomic' ? invalid > 0 : invalid >= ops.length) {
+      return { applied: false, failures: compact(plan.failures) }
     }
     pushHistory(session)
-    for (const { el, item } of pairs) {
-      el.transform = {
-        ...el.transform,
-        offset: {
-          x: toEmu(item.xPx),
-          y: toEmu(item.yPx),
-          cx: toEmu(item.wPx),
-          cy: toEmu(item.hPx),
-        },
-        rot: Math.round(item.rotationDeg * 60000),
-      }
-      el.dirtyTransform = true
+    const r = journaledTxn(session, 'batch', { ops, isolation })
+    if (!r.applied) {
+      session.undoStack.pop()
+      return { applied: false, failures: compact(r.failures) }
     }
-    updateConnectorsForMoved(
-      slide,
-      op.items.map((i) => i.sourceId),
-    )
-    return rebuildSlide(session, op.slideIndex)
+    // Post-pass mirroring the dedicated shims (autofit/reparse are render concerns and live
+    // outside the executor): text ops get autofit resize + fontScale write-back, level changes
+    // materialize, and XML-patching ops reparse the page so the final render reflects them.
+    // Slides are re-found by the executor-stamped durable id: a numeric target.slide drifts
+    // when a later structural op (deleteSlide/moveSlide/duplicateSlide) shifts pages.
+    const slideIdxOf = (rec: OpRecord): number => {
+      if (rec.slideId)
+        return session.opened.deck.slides.findIndex((s) => slideDurableId(s) === rec.slideId)
+      return -1
+    }
+    const renderedByIdx = new Map<number, ReturnType<typeof rebuildSlide>>()
+    for (const rec of r.records ?? []) {
+      const o = rec.op
+      const idx = slideIdxOf(rec)
+      if (idx < 0) continue
+      if (o.op === 'setTableStyle' || o.op === 'setChart') {
+        rebuildSlideWithReparse(session, idx)
+        renderedByIdx.delete(idx)
+        continue
+      }
+      const id = o.target?.el
+      if (!id || o.group) continue
+      if (o.op !== 'setText' && o.op !== 'setFont' && o.op !== 'setParagraphFormat') continue
+      if (o.op === 'setText' && (rec.after as { levelDirty?: boolean } | undefined)?.levelDirty)
+        continue
+      if (
+        o.op === 'setParagraphFormat' &&
+        (o.format as { indentDelta?: number } | undefined)?.indentDelta
+      ) {
+        materializeSlide(session.opened, idx)
+        renderedByIdx.delete(idx)
+        continue
+      }
+      let rendered = renderedByIdx.has(idx) ? renderedByIdx.get(idx)! : rebuildSlide(session, idx)
+      rendered = applyAutofitResize(session, idx, id, rendered)
+      rendered = syncAutofitScale(session, idx, id, rendered)
+      renderedByIdx.set(idx, rendered)
+    }
+    return {
+      applied: true,
+      records: (r.records ?? []).map((rec) => ({
+        op: rec.op.op,
+        ...(rec.op.target
+          ? { target: `${rec.op.target.slide}${rec.op.target.el ? `/${rec.op.target.el}` : ''}` }
+          : {}),
+        ...(rec.created ? { created: rec.created } : {}),
+      })),
+      ...(r.failures?.length ? { failures: compact(r.failures) } : {}),
+      slides: buildAllRenderSlides(session.opened, session.fitWidthPx),
+    }
+  })
+
+  // The whole edit script as ONE transaction: the collected primitives arrive in a
+  // single IPC, compile to ops (script-map), and apply atomically — the executor
+  // owns validation, rollback and the journal. Autofit is a render concern and
+  // stays here, mirroring the per-op shims the script used to fan out to.
+  ipcMain.handle('slides:apply-edit-script', (e, op: ApplyEditScriptOp) => {
+    const session = sessions.get(e.sender.id)
+    if (!session) return null
+    const ops = mapScriptOps(session.opened, op)
+    if (ops.length === 0) return null
+    const plan = runTxn(session.opened, { ops, dryRun: true })
+    if (plan.failures?.length) return { error: plan.failures[0]!.error }
+    pushHistory(session)
+    const r = journaledTxn(session, 'script', { ops })
+    if (!r.applied) {
+      session.undoStack.pop()
+      return { error: r.failures?.[0]?.error ?? 'the transaction could not be applied' }
+    }
+    let rendered = rebuildSlide(session, op.slideIndex)
+    for (const rec of r.records ?? []) {
+      const o = rec.op
+      const id = o.target?.el
+      if (!id || o.group || !rendered) continue
+      if (o.op === 'setText') {
+        // Level changes rematerialized inside the op; autofit would fight the reparse
+        if ((rec.after as { levelDirty?: boolean } | undefined)?.levelDirty) continue
+        rendered = applyAutofitResize(session, op.slideIndex, id, rendered)
+        rendered = syncAutofitScale(session, op.slideIndex, id, rendered)
+      } else if (o.op === 'setFont' || o.op === 'setParagraphFormat') {
+        rendered = applyAutofitResize(session, op.slideIndex, id, rendered)
+        rendered = syncAutofitScale(session, op.slideIndex, id, rendered)
+      }
+    }
+    return rendered ? { slide: rendered } : null
   })
   // ── Cloud single-page generation (gsk slide_generate): brief → cloud HTML+conversion → one-slide
-  // pptx saved to a temp file. Returns a marker string that flows through the same pagesHtml slots
-  // as locally generated HTML; slides:html-to-pptx recognizes it and reads the bytes instead of
-  // converting. Enabled when gsk is logged in; GENOFFICE_CLOUD_SLIDE=0 is the kill switch.
+  // pptx saved to a temp file. Returns a marker string that slides:land-generated-pages redeems for
+  // the bytes. Enabled when gsk is logged in; GENOFFICE_CLOUD_SLIDE=0 is the kill switch.
   const cloudSlideEnabled = () => process.env.GENOFFICE_CLOUD_SLIDE !== '0' && !!gskApiKey()
 
   ipcMain.handle('slides:cloud-gen-status', () => ({ enabled: cloudSlideEnabled() }))
@@ -1328,7 +1591,9 @@ export function registerSlidesIpc(): void {
     ): Promise<{ ok: boolean; marker?: string; error?: string }> => {
       if (!cloudSlideEnabled()) return { ok: false, error: 'cloud slide generation is disabled' }
       try {
-        // ultra = opus-class model, matching the local path's quality tier; GENOFFICE_CLOUD_SLIDE_TIER=standard opts down
+        // Ultra resolves to the opus-class slide model server-side; standard is the
+        // lighter MiniMax M3 model. Keep an explicit escape hatch for quality
+        // comparisons and emergency rollback.
         const tier = process.env.GENOFFICE_CLOUD_SLIDE_TIER === 'standard' ? 'standard' : 'ultra'
         const started = Date.now()
         const { bytes, model } = await gskSlideGenerate({
@@ -1356,11 +1621,71 @@ export function registerSlidesIpc(): void {
     },
   )
 
+  // ── Local single-page generation (no gsk needed, e.g. BYOK): a JSON slide spec written by
+  // the renderer's LLM call is built directly into a one-slide pptx with pptx-engine
+  // primitives — no HTML intermediate. Returns the same marker kind as the cloud path, so
+  // landing (slides:land-generated-pages) is shared.
   ipcMain.handle(
-    'slides:html-to-pptx',
+    'slides:local-page-generate',
+    async (
+      _e,
+      op: { specJson: string },
+    ): Promise<{ ok: boolean; marker?: string; error?: string; imageFailures?: string[] }> => {
+      const parsed = parsePageSpec(String(op?.specJson ?? ''))
+      if (!parsed.ok) return { ok: false, error: parsed.error }
+      try {
+        const started = Date.now()
+        const { bytes, imageFailures } = await buildPagePptx(parsed.spec, {
+          fontMetrics: getFontMetrics(),
+          fetchImage: async (url) => {
+            const resp = await fetchRemoteImage(url)
+            if (!resp || !resp.ok) return null
+            const buf = new Uint8Array(await resp.arrayBuffer())
+            const mime = sniffImageMime(buf) ?? resp.headers.get('content-type') ?? ''
+            const ext = /png/.test(mime)
+              ? 'png'
+              : /gif/.test(mime)
+                ? 'gif'
+                : /webp/.test(mime)
+                  ? 'webp'
+                  : /bmp/.test(mime)
+                    ? 'bmp'
+                    : 'jpg'
+            return { bytes: buf, ext }
+          },
+          imageDims: (bytes) => {
+            try {
+              const s = nativeImage.createFromBuffer(Buffer.from(bytes)).getSize()
+              return s.width > 0 && s.height > 0 ? s : null
+            } catch {
+              return null
+            }
+          },
+        })
+        console.log(
+          `[local-slide] page generated: bytes=${bytes.length} imageFails=${imageFailures.length} ms=${Date.now() - started}`,
+        )
+        const dir = join(app.getPath('temp'), 'genoffice-local-pages')
+        mkdirSync(dir, { recursive: true })
+        const path = join(dir, `${randomUUID()}.pptx`)
+        await writeFile(path, bytes)
+        issuedCloudPages.add(path)
+        return {
+          ok: true,
+          marker: CLOUD_PAGE_PREFIX + path,
+          ...(imageFailures.length ? { imageFailures } : {}),
+        }
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) }
+      }
+    },
+  )
+
+  ipcMain.handle(
+    'slides:land-generated-pages',
     async (
       e,
-      pagesHtml: string[],
+      pageMarkers: string[],
       fitWidthPx: number,
       mode?: 'replace' | 'append' | 'replace_at' | 'insert_at',
       atIndex?: number,
@@ -1379,8 +1704,8 @@ export function registerSlidesIpc(): void {
       // slides:cloud-page-generate, pointing at a one-slide pptx temp file); this handler only
       // reads and lands the bytes.
       // replace: assemble the whole batch into one multi-page pptx as the new deck base.
-      // append: merge the "new pages" one by one into the existing deck via mergeSlideFromPptx
-      // (earlier pages are untouched).
+      // append/replace_at/insert_at: land the extracted pages as insertSlidePptx ops
+      // (earlier pages are untouched; landing shows up in the op journal like any edit).
       const readCloudPage = async (marker: string): Promise<{ bytes: Uint8Array }> => {
         if (!marker.startsWith(CLOUD_PAGE_PREFIX)) throw new Error('expected a cloud page marker')
         const path = marker.slice(CLOUD_PAGE_PREFIX.length)
@@ -1388,7 +1713,7 @@ export function registerSlidesIpc(): void {
         return { bytes: new Uint8Array(await readFile(path)) }
       }
       const assembleDeck = async (): Promise<{ bytes: Uint8Array }> => {
-        const perPage = await Promise.all(pagesHtml.map(readCloudPage))
+        const perPage = await Promise.all(pageMarkers.map(readCloudPage))
         const base = await openPptx(perPage[0]!.bytes)
         for (const one of perPage.slice(1)) await mergeSlideFromPptx(base, one.bytes)
         for (const s of base.deck.slides) promoteSlideBackground(s, base.deck.size)
@@ -1396,8 +1721,8 @@ export function registerSlidesIpc(): void {
       }
 
       try {
-        // Append: convert only the "new pages" and merge them one by one into the existing
-        // in-memory deck via mergeSlideFromPptx. Already-landed pages stay untouched
+        // Append: extract only the "new pages" and land them into the existing in-memory
+        // deck as one per_op transaction. Already-landed pages stay untouched
         // (O(N) rather than O(N²)); no dependency on stored PageVisualData.
         if (mode === 'append') {
           const existing = sessions.get(e.sender.id)
@@ -1409,23 +1734,32 @@ export function registerSlidesIpc(): void {
           // Push an undo snapshot: appending is an ordinary edit, ⌘Z should return to the
           // pre-append state (previously the undoStack was simply cleared, making all of the
           // user's prior manual edits non-undoable — inconsistent with replace_at behavior)
-          pushHistory(existing)
-          let merged = 0
+          // Extract every page first (pure reads), then land them as insertSlidePptx ops so
+          // the journal and undo see generation like any other edit.
+          const sources: MergeSlideSource[] = []
           let lastErr: string | undefined
-          for (const html of pagesHtml) {
+          for (const marker of pageMarkers) {
             try {
-              const one = await readCloudPage(html)
-              const slide = await mergeSlideFromPptx(opened, one.bytes)
-              if (slide) {
-                promoteSlideBackground(slide, opened.deck.size)
-                merged += 1
-              } else lastErr = tm('errMergeFailed')
+              const one = await readCloudPage(marker)
+              const source = await extractMergeSlideSource(one.bytes)
+              if (source) sources.push(source)
+              else lastErr = tm('errMergeFailed')
             } catch (pageErr) {
               lastErr = pageErr instanceof Error ? pageErr.message : String(pageErr)
             }
           }
+          let merged = 0
+          if (sources.length > 0) {
+            pushHistory(existing)
+            const r = journaledTxn(existing, 'generate', {
+              isolation: 'per_op',
+              ops: sources.map((source) => ({ op: 'insertSlidePptx', source })),
+            })
+            merged = r.records?.length ?? 0
+            if (merged === 0) existing.undoStack.pop() // Nothing happened, pop the just-pushed snapshot
+            if (!lastErr) lastErr = r.failures?.[0]?.error
+          }
           if (merged === 0) {
-            existing.undoStack.pop() // Nothing happened, pop the just-pushed snapshot
             return { error: tm('errAppendFailed', { reason: lastErr ?? tm('errUnknown') }) }
           }
           existing.fitWidthPx = fitWidthPx
@@ -1445,16 +1779,15 @@ export function registerSlidesIpc(): void {
             size: { cx: existing.opened.deck.size.cx, cy: existing.opened.deck.size.cy },
             defaultFont: deckDefaultFont(existing.opened),
             appendedFrom: beforeCount,
-            ...(lastErr && merged < pagesHtml.length
+            ...(lastErr && merged < pageMarkers.length
               ? { fallbackReason: tm('errPartialAppend', { reason: lastErr }) }
               : {}),
           }
         }
 
-        // Redo one page in place: single-page HTML -> single-page pptx -> merge at the end ->
-        // moveSlide into position -> delete the old page. Conversion happens first (deck
-        // untouched); the mutation phase takes one undo snapshot overall, so ⌘Z rolls back to the
-        // old page.
+        // Redo one page in place: the insertSlidePptx op merges the extracted page at the
+        // end, moves it to atIndex and drops the displaced old page — one atomic txn, one
+        // undo snapshot, so ⌘Z rolls back to the old page.
         if (mode === 'replace_at') {
           const existing = sessions.get(e.sender.id)
           if (!existing) {
@@ -1465,26 +1798,22 @@ export function registerSlidesIpc(): void {
           if (atIndex == null || !Number.isInteger(atIndex) || atIndex < 0 || atIndex >= total) {
             return { error: tm('errIndexRange', { max: total - 1 }) }
           }
-          const html = pagesHtml[0]
-          if (!html || pagesHtml.length !== 1) {
+          const marker = pageMarkers[0]
+          if (!marker || pageMarkers.length !== 1) {
             return { error: tm('errReplaceNeedsOne') }
           }
-          const one = await readCloudPage(html)
-          pushHistory(existing)
-          const rollback = () => {
-            const snap = existing.undoStack.pop()
-            if (snap) restoreSnapshot(existing, snap)
-          }
-          const merged = await mergeSlideFromPptx(opened, one.bytes)
-          if (!merged) {
-            rollback()
+          const one = await readCloudPage(marker)
+          const source = await extractMergeSlideSource(one.bytes)
+          if (!source) {
             return { error: tm('errMergeFailed') }
           }
-          promoteSlideBackground(merged, opened.deck.size)
-          // The new page is at the end (index=total); after moving to atIndex the old page gets pushed to atIndex+1, delete it
-          if (!moveSlide(opened, total, atIndex) || !deleteSlide(opened, atIndex + 1)) {
-            rollback()
-            return { error: tm('errReplaceFailed') }
+          pushHistory(existing)
+          const r = journaledTxn(existing, 'generate', {
+            ops: [{ op: 'insertSlidePptx', source, at: atIndex, replace: true }],
+          })
+          if (!r.applied) {
+            existing.undoStack.pop() // The executor already restored the deck
+            return { error: r.failures?.[0]?.error ?? tm('errReplaceFailed') }
           }
           existing.fitWidthPx = fitWidthPx
           const bytes = await savePptx(opened)
@@ -1503,8 +1832,8 @@ export function registerSlidesIpc(): void {
         }
 
         // Insert one page at atIndex (later pages shift back): used to regenerate a failed middle
-        // page from generate_deck and put it back in place. Same mechanism as replace_at (merge at
-        // the end -> moveSlide into position) but without deleting an old page.
+        // page from generate_deck and put it back in place. Same op as replace_at but without
+        // dropping an old page; atIndex=total lands at the end without a move.
         if (mode === 'insert_at') {
           const existing = sessions.get(e.sender.id)
           if (!existing) {
@@ -1515,26 +1844,22 @@ export function registerSlidesIpc(): void {
           if (atIndex == null || !Number.isInteger(atIndex) || atIndex < 0 || atIndex > total) {
             return { error: tm('errIndexRange', { max: total }) }
           }
-          const html = pagesHtml[0]
-          if (!html || pagesHtml.length !== 1) {
+          const marker = pageMarkers[0]
+          if (!marker || pageMarkers.length !== 1) {
             return { error: tm('errInsertNeedsOne') }
           }
-          const one = await readCloudPage(html)
-          pushHistory(existing)
-          const rollback = () => {
-            const snap = existing.undoStack.pop()
-            if (snap) restoreSnapshot(existing, snap)
-          }
-          const merged = await mergeSlideFromPptx(opened, one.bytes)
-          if (!merged) {
-            rollback()
+          const one = await readCloudPage(marker)
+          const source = await extractMergeSlideSource(one.bytes)
+          if (!source) {
             return { error: tm('errMergeFailed') }
           }
-          promoteSlideBackground(merged, opened.deck.size)
-          // The new page is at the end (index=total); with atIndex=total it belongs at the end anyway, no move needed
-          if (atIndex < total && !moveSlide(opened, total, atIndex)) {
-            rollback()
-            return { error: tm('errInsertFailed') }
+          pushHistory(existing)
+          const r = journaledTxn(existing, 'generate', {
+            ops: [{ op: 'insertSlidePptx', source, at: atIndex }],
+          })
+          if (!r.applied) {
+            existing.undoStack.pop() // The executor already restored the deck
+            return { error: r.failures?.[0]?.error ?? tm('errInsertFailed') }
           }
           existing.fitWidthPx = fitWidthPx
           const bytes = await savePptx(opened)
@@ -1555,19 +1880,21 @@ export function registerSlidesIpc(): void {
         // replace mode: assemble the whole batch into one multi-page pptx as the new deck base.
         const { bytes } = await assembleDeck()
         const opened = await openPptx(bytes)
-        // With per-page conversion + merging, stored PageVisualData is no longer needed; append reads the opened deck directly.
         const replaceSession: Session = {
           path: '',
           opened,
           fitWidthPx,
           undoStack: [],
           redoStack: [],
-          htmlPages: null,
         }
-        carryHistoryForReplacement(sessions.get(e.sender.id), replaceSession)
+        const old = sessions.get(e.sender.id)
+        carryHistoryForReplacement(old, replaceSession)
         sessions.set(e.sender.id, replaceSession)
+        // Re-point windows that shared the old session, or they diverge onto a dead deck
+        if (old) for (const id of attachedIds(old)) sessions.set(id, replaceSession)
         // Save the draft: await completion so the real path is returned; on failure degrade silently (session.path stays '')
         await saveDraftAfterGenerate(e.sender, replaceSession, bytes, 'replace', deckName)
+        scheduleDeckBroadcast(replaceSession)
         return {
           path: replaceSession.path,
           slides: buildAllRenderSlides(opened, fitWidthPx),
@@ -1595,9 +1922,6 @@ export function registerSlidesIpc(): void {
   ipcMain.handle('slides:add-element', (e, op: AddElementOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    const slide = session.opened.deck.slides[op.slideIndex]
-    if (!slide) return null
-    pushHistory(session)
     const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
     const scale = op.fitWidthPx / baseWidthPx
     const toEmu = (px: number) => Math.round((px / scale) * EMU_PER_PX_96)
@@ -1606,70 +1930,85 @@ export function registerSlidesIpc(): void {
       : op.text
         ? op.text.split('\n').map((line) => ({ runs: [{ text: line }] }))
         : undefined
-    const el = addElement(slide, {
-      kind: op.kind,
-      offset: { x: toEmu(op.xPx), y: toEmu(op.yPx), cx: toEmu(op.wPx), cy: toEmu(op.hPx) },
-      ...(paragraphs ? { paragraphs } : {}),
-      ...(op.fillColor ? { fillColor: op.fillColor } : {}),
-      ...(op.stroke
-        ? {
-            stroke: {
-              color: op.stroke.color,
-              widthEmu: Math.round(op.stroke.widthPt * EMU_PER_PT),
-            },
-          }
-        : {}),
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'addElement',
+          target: { slide: op.slideIndex },
+          kind: op.kind,
+          offset: { x: toEmu(op.xPx), y: toEmu(op.yPx), cx: toEmu(op.wPx), cy: toEmu(op.hPx) },
+          ...(paragraphs ? { paragraphs } : {}),
+          ...(op.fillColor ? { fill: op.fillColor } : {}),
+          ...(op.stroke
+            ? {
+                stroke: {
+                  color: op.stroke.color,
+                  widthEmu: Math.round(op.stroke.widthPt * EMU_PER_PT),
+                },
+              }
+            : {}),
+        },
+      ],
     })
+    if (!r) return null
     const rebuilt = rebuildSlide(session, op.slideIndex)
-    return rebuilt ? { slide: rebuilt, sourceId: el.id } : null
+    return rebuilt ? { slide: rebuilt, sourceId: r.records![0]!.created![0]! } : null
   })
 
+  // Shim over the canonical op (see main/ops): the op owns validation/mutation/journal;
+  // the shim keeps session lookup, undo bookkeeping, and RenderSlide rebuilding.
   ipcMain.handle('slides:delete-element', (e, op: DeleteElementOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    const slide = session.opened.deck.slides[op.slideIndex]
-    if (!slide) return null
-    if (!slide.elements.some((x) => x.id === op.sourceId)) return null
     pushHistory(session)
-    if (!deleteElement(slide, op.sourceId)) return null
+    const r = journaledTxn(session, 'edit', {
+      ops: [{ op: 'deleteElement', target: { slide: op.slideIndex, el: op.sourceId } }],
+    })
+    if (!r.applied) {
+      session.undoStack.pop()
+      return null
+    }
     return rebuildSlide(session, op.slideIndex)
   })
 
+  // Shim over the canonical setStroke op: pt→EMU/angle conversion is surface translation
+  // and stays here; validation/mutation/journal live in the op.
   ipcMain.handle('slides:edit-stroke', (e, op: EditStrokeOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    const slide = session.opened.deck.slides[op.slideIndex]
-    if (!slide) return null
-    if (op.groupId) {
-      pushHistory(session)
-      const stroke = op.stroke
-        ? {
-            color: op.stroke.color,
-            widthEmu: Math.round(op.stroke.widthPt * EMU_PER_PT),
-            ...(op.stroke.dash ? { dash: op.stroke.dash } : {}),
-          }
-        : null
-      if (!editGroupChildStroke(slide, op.groupId, op.sourceId, stroke)) {
-        session.undoStack.pop()
-        return null
-      }
-      return rebuildSlide(session, op.slideIndex)
-    }
-    // Unlike findEl, pictures are strokable too (picture border)
-    const el = slide.elements.find(
-      (x) =>
-        x.id === op.sourceId && (x.type === 'text' || x.type === 'shape' || x.type === 'picture'),
-    ) as TextElement | undefined
-    if (!el) return null
-    pushHistory(session)
-    el.stroke = op.stroke
+    const patch = op.stroke
       ? {
-          fill: { type: 'solid', color: op.stroke.color },
-          width: Math.round(op.stroke.widthPt * EMU_PER_PT),
+          color: op.stroke.color,
+          widthEmu: Math.round(op.stroke.widthPt * EMU_PER_PT),
           ...(op.stroke.dash ? { dash: op.stroke.dash } : {}),
+          ...(op.stroke.cap ? { cap: op.stroke.cap } : {}),
+          ...(op.stroke.join ? { join: op.stroke.join } : {}),
+          ...(op.stroke.compound ? { compound: op.stroke.compound } : {}),
+          ...(op.stroke.gradient
+            ? {
+                gradient: {
+                  stops: op.stroke.gradient.stops,
+                  angle: Math.round(op.stroke.gradient.angleDeg * 60000),
+                },
+              }
+            : {}),
         }
-      : undefined
-    el.dirtyStroke = true
+      : null
+    pushHistory(session)
+    const r = journaledTxn(session, 'edit', {
+      ops: [
+        {
+          op: 'setStroke',
+          target: { slide: op.slideIndex, el: op.sourceId },
+          stroke: patch,
+          ...(op.groupId ? { group: op.groupId } : {}),
+        },
+      ],
+    })
+    if (!r.applied) {
+      session.undoStack.pop()
+      return null
+    }
     return rebuildSlide(session, op.slideIndex)
   })
 
@@ -1678,143 +2017,70 @@ export function registerSlidesIpc(): void {
   ipcMain.handle('slides:flip-elements', (e, op: FlipElementOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    const slide = session.opened.deck.slides[op.slideIndex]
-    if (!slide) return null
-    // Any element with an a:xfrm can flip (picture/shape/text/group) — findEl's
-    // text/shape filter would silently drop pictures
-    const targets = op.sourceIds
-      .map((id) =>
-        op.groupId
-          ? findGroupChild(slide, op.groupId, id)?.child
-          : slide.elements.find((x) => x.id === id),
-      )
-      .filter((el): el is NonNullable<typeof el> => !!el && !!el.transform)
-    if (targets.length === 0) return null
-    pushHistory(session)
-    for (const el of targets) {
-      const t = el.transform
-      // Rotation pivots on the flip-adjusted box origin, so toggling a flip on a
-      // rotated element would move its visual center: origin + R(rot)·(flip-signed
-      // half-extent) must stay put — shift the offset by the orbit difference.
-      const orbit = () => {
-        const rad = (((t.rot ?? 0) / 60000) * Math.PI) / 180
-        const bx = t.flipH ? t.offset.cx : 0
-        const by = t.flipV ? t.offset.cy : 0
-        const vx = ((t.flipH ? -1 : 1) * t.offset.cx) / 2
-        const vy = ((t.flipV ? -1 : 1) * t.offset.cy) / 2
-        return {
-          x: bx + vx * Math.cos(rad) - vy * Math.sin(rad),
-          y: by + vx * Math.sin(rad) + vy * Math.cos(rad),
-        }
-      }
-      const before = orbit()
-      if (op.axis === 'h') t.flipH = !t.flipH
-      else t.flipV = !t.flipV
-      const after = orbit()
-      t.offset.x += Math.round(before.x - after.x)
-      t.offset.y += Math.round(before.y - after.y)
-      el.dirtyTransform = true
-    }
-    updateConnectorsForMoved(
-      slide,
-      targets.map((el) => el.id),
-    )
-    return rebuildSlide(session, op.slideIndex)
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'flipElements',
+          target: { slide: op.slideIndex },
+          els: op.sourceIds,
+          axis: op.axis,
+          ...(op.groupId ? { group: op.groupId } : {}),
+        },
+      ],
+    })
+    return r ? rebuildSlide(session, op.slideIndex) : null
   })
 
   ipcMain.handle('slides:edit-picture-src-rect', (e, op: EditPictureSrcRectOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    const slide = session.opened.deck.slides[op.slideIndex]
-    if (!slide) return null
-    pushHistory(session)
-    if (!editPictureSrcRect(slide, op.sourceId, op.srcRect)) {
-      session.undoStack.pop()
-      return null
-    }
-    // Crop confirm also shrinks the element frame to the crop frame — same history
-    // push, so a single undo restores frame and crop together (no distorted middle state)
+    let box: { x: number; y: number; cx: number; cy: number } | undefined
     if (op.boxPx && op.fitWidthPx) {
-      const el = slide.elements.find((x) => x.id === op.sourceId)
-      if (el) {
-        const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
-        const scale = op.fitWidthPx / baseWidthPx
-        const toEmu = (px: number) => Math.round((px / scale) * EMU_PER_PX_96)
-        el.transform = {
-          ...el.transform,
-          offset: {
-            x: toEmu(op.boxPx.x),
-            y: toEmu(op.boxPx.y),
-            cx: toEmu(op.boxPx.w),
-            cy: toEmu(op.boxPx.h),
-          },
-        }
-        el.dirtyTransform = true
-        updateConnectorsForMoved(slide, [op.sourceId])
+      const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
+      const scale = op.fitWidthPx / baseWidthPx
+      const toEmu = (px: number) => Math.round((px / scale) * EMU_PER_PX_96)
+      box = {
+        x: toEmu(op.boxPx.x),
+        y: toEmu(op.boxPx.y),
+        cx: toEmu(op.boxPx.w),
+        cy: toEmu(op.boxPx.h),
       }
     }
-    return rebuildSlide(session, op.slideIndex)
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'setPictureSrcRect',
+          target: { slide: op.slideIndex, el: op.sourceId },
+          srcRect: op.srcRect,
+          ...(box ? { box } : {}),
+        },
+      ],
+    })
+    return r ? rebuildSlide(session, op.slideIndex) : null
   })
 
   ipcMain.handle('slides:group-elements', (e, op: GroupElementsOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    pushHistory(session)
-    const result = groupElements(session.opened, op.slideIndex, op.sourceIds)
-    if (!result) {
-      session.undoStack.pop()
-      return null
-    }
-    // groupElements already updated deck.slides[slideIndex] internally via materializeSlide
+    const r = sessionTxn(session, {
+      ops: [{ op: 'groupElements', target: { slide: op.slideIndex }, els: op.sourceIds }],
+    })
+    if (!r) return null
     const renderSlide = rebuildSlide(session, op.slideIndex)
-    return renderSlide ? { slide: renderSlide, groupId: result.groupId } : null
+    return renderSlide ? { slide: renderSlide, groupId: r.records![0]!.created![0]! } : null
   })
 
   ipcMain.handle('slides:ungroup-element', (e, op: UngroupElementOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    pushHistory(session)
-    const fresh = ungroupElement(session.opened, op.slideIndex, op.sourceId)
-    if (!fresh) {
-      session.undoStack.pop()
-      return null
-    }
-    // ungroupElement already updated deck.slides[slideIndex] internally
-    return rebuildSlide(session, op.slideIndex)
+    const r = sessionTxn(session, {
+      ops: [{ op: 'ungroupElement', target: { slide: op.slideIndex, el: op.sourceId } }],
+    })
+    return r ? rebuildSlide(session, op.slideIndex) : null
   })
 
-  // Full-page "backdrop" rectangles: design templates often use a text-free solid rectangle
-  // covering the whole page as background; changing only the page background would be hidden
-  // behind them — so repaint such rectangles along with the background (solid/gradient), or
-  // make them transparent when the new background is a picture.
-  const repaintFullBleedBackdrops = (
-    slide: Slide,
-    size: { cx: number; cy: number },
-    fill:
-      | { type: 'solid'; color: string }
-      | {
-          type: 'gradient'
-          stops: Array<{ pos: number; color: string }>
-          angle?: number
-          path?: 'circle'
-        }
-      | { type: 'none' },
-  ) => {
-    for (const el of slide.elements) {
-      if (el.type !== 'shape' && el.type !== 'text') continue
-      const shaped = el as TextElement
-      const fillType = shaped.fill?.type
-      if (fillType !== 'solid' && fillType !== 'gradient') continue
-      if (shaped.text?.paragraphs.some((p) => p.runs.some((r) => r.text.trim()))) continue
-      const { x, y, cx, cy } = el.transform.offset
-      const coversX = x <= size.cx * 0.05 && x + cx >= size.cx * 0.95
-      const coversY = y <= size.cy * 0.05 && y + cy >= size.cy * 0.95
-      if (!coversX || !coversY) continue
-      shaped.fill = fill
-      shaped.dirtyFill = true
-    }
-  }
-
+  // Shim over the canonical setBackground op (one slide per op; apply-to-all fans out;
+  // the full-bleed backdrop repaint lives in the op). File dialogs stay here.
   ipcMain.handle('slides:edit-background', async (e, op: EditBackgroundOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
@@ -1849,68 +2115,74 @@ export function registerSlidesIpc(): void {
       }
       pushHistory(session)
       // The picked bytes land as one media part; further slides only add a rel to it
+      // (each op reports the landed media path, threaded into the next op's source)
       let landed: string | null = null
-      for (const s of targets) {
-        const used = setSlideBackgroundImage(
-          session.opened,
-          s!,
-          landed ? { mediaPath: landed } : source,
-          op.mode === 'tile',
-        )
-        if (used) {
-          landed = used
-          repaintFullBleedBackdrops(s!, session.opened.deck.size, { type: 'none' })
+      for (const [i, s] of slides.entries()) {
+        if (!targets.includes(s)) continue
+        const r = journaledTxn(session, 'edit', {
+          ops: [
+            {
+              op: 'setBackground',
+              target: { slide: i },
+              kind: 'image',
+              source: landed ? { mediaPath: landed } : source,
+              tile: op.mode === 'tile',
+            },
+          ],
+        })
+        if (r.applied) {
+          const used = (r.records![0]!.after as { mediaPath?: string } | undefined)?.mediaPath
+          if (used) landed = used
         }
       }
       if (!landed) {
         session.undoStack.pop()
         return null
       }
-    } else if (op.kind === 'solid') {
-      pushHistory(session)
-      for (const s of targets) {
-        setSlideBackground(s!, op.color)
-        repaintFullBleedBackdrops(s!, session.opened.deck.size, {
-          type: 'solid',
-          color: op.color,
-        })
-      }
-    } else if (op.kind === 'gradient') {
-      pushHistory(session)
-      const stops = [
-        { pos: 0, color: op.from },
-        { pos: 1, color: op.to },
-      ]
-      const angle = Math.round((op.angleDeg ?? 0) * 60000)
-      const patch = { stops, ...(op.radial ? { radial: true } : { angle }) }
-      for (const s of targets) {
-        setSlideBackground(s!, patch)
-        repaintFullBleedBackdrops(s!, session.opened.deck.size, {
-          type: 'gradient',
-          stops,
-          ...(op.radial ? { path: 'circle' as const } : { angle }),
-        })
-      }
-    } else if (op.kind === 'reset') {
-      pushHistory(session)
-      for (const s of targets) resetSlideBackground(session.opened, s!)
     } else {
+      const common: Record<string, unknown> =
+        op.kind === 'solid'
+          ? { kind: 'solid', color: op.color }
+          : op.kind === 'gradient'
+            ? {
+                kind: 'gradient',
+                from: op.from,
+                to: op.to,
+                ...(op.angleDeg !== undefined ? { angleDeg: op.angleDeg } : {}),
+                ...(op.radial ? { radial: true } : {}),
+              }
+            : op.kind === 'reset'
+              ? { kind: 'reset' }
+              : { kind: 'graphics', hidden: op.hidden }
       pushHistory(session)
-      for (const s of targets) setSlideBgGraphicsHidden(session.opened, s!, op.hidden)
+      const r = journaledTxn(session, 'edit', {
+        ops: slides
+          .map((s, i) => ({ s, i }))
+          .filter(({ s }) => targets.includes(s))
+          .map(({ i }) => ({ op: 'setBackground', target: { slide: i }, ...common })),
+      })
+      if (!r.applied) {
+        session.undoStack.pop()
+        return null
+      }
     }
     session.fitWidthPx = op.fitWidthPx
     return buildAllRenderSlides(session.opened, op.fitWidthPx)
   })
 
-  ipcMain.handle(
-    'slides:edit-image-fill',
-    async (e, op: { slideIndex: number; sourceId: string }) => {
-      const session = sessions.get(e.sender.id)
-      if (!session) return null
-      const slide = session.opened.deck.slides[op.slideIndex]
-      if (!slide) return null
-      const parent = dialogParent()
-      const options = {
+  ipcMain.handle('slides:edit-image-fill', async (e, op: EditFillImageOp) => {
+    const session = sessions.get(e.sender.id)
+    if (!session) return null
+    const slide = session.opened.deck.slides[op.slideIndex]
+    if (!slide || op.targets.length === 0) return null
+    let bytes: Uint8Array
+    let ext: string
+    if (op.source) {
+      // bundled texture preset: bytes shipped inline, no picker
+      bytes = new Uint8Array(Buffer.from(op.source.base64, 'base64'))
+      ext = op.source.ext.toLowerCase()
+    } else {
+      const r = await showOpenDialogWithMemory(dialog, dialogParent(), {
         title: tm('dlgInsertImage'),
         properties: ['openFile' as const],
         filters: [
@@ -1919,20 +2191,60 @@ export function registerSlidesIpc(): void {
             extensions: ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'tif', 'tiff'],
           },
         ],
-      }
-      const r = await showOpenDialogWithMemory(dialog, parent, options)
+      })
       if (r.canceled || !r.filePaths[0]) return null
-      const bytes = await readFile(r.filePaths[0])
-      const ext = r.filePaths[0].split('.').pop()!.toLowerCase()
-      pushHistory(session)
-      if (!setElementImageFill(session.opened, slide, op.sourceId, bytes, ext)) {
-        session.undoStack.pop()
-        return null
+      bytes = new Uint8Array(await readFile(r.filePaths[0]))
+      ext = r.filePaths[0].split('.').pop()!.toLowerCase()
+    }
+    pushHistory(session)
+    // The picked bytes land as one media part; further targets only add rels to it
+    // (each op reports the landed media path, threaded into the next op's source)
+    let landed: string | null = null
+    let applied = 0
+    for (const target of op.targets) {
+      const r = journaledTxn(session, 'edit', {
+        ops: [
+          {
+            op: 'setImageFill',
+            target: { slide: op.slideIndex, el: target.sourceId },
+            source: landed ? { mediaPath: landed } : { bytes, ext },
+            tile: op.mode === 'tile',
+            ...(target.groupId ? { group: target.groupId } : {}),
+          },
+        ],
+      })
+      if (r.applied) {
+        applied += 1
+        const used = (r.records![0]!.after as { mediaPath?: string } | undefined)?.mediaPath
+        if (used) landed = used
       }
-      return rebuildSlide(session, op.slideIndex)
-    },
-  )
+    }
+    if (!applied) {
+      session.undoStack.pop()
+      return null
+    }
+    return rebuildSlide(session, op.slideIndex)
+  })
 
+  // Replace picture: the renderer swaps the bytes in place through replacePictureBytes
+  ipcMain.handle('slides:pick-picture-file', async () => {
+    const r = await showOpenDialogWithMemory(dialog, dialogParent(), {
+      title: tm('dlgReplacePicture'),
+      properties: ['openFile' as const],
+      filters: [
+        {
+          name: tm('filterImages'),
+          extensions: ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'tif', 'tiff'],
+        },
+      ],
+    })
+    if (r.canceled || !r.filePaths[0]) return null
+    const filePath = r.filePaths[0]
+    return {
+      base64: (await readFile(filePath)).toString('base64'),
+      ext: filePath.split('.').pop()!.toLowerCase(),
+    }
+  })
   ipcMain.handle('slides:insert-image', async (e, slideIndex: number, fitWidthPx: number) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
@@ -1977,73 +2289,74 @@ export function registerSlidesIpc(): void {
       cy,
     }
 
-    pushHistory(session)
-    const el = addPicture(session.opened, slide, { bytes: new Uint8Array(bytes), ext, offset })
-    if (!el) {
-      session.undoStack.pop()
-      return { error: 'unsupported' as const, ext }
-    }
+    const txn = sessionTxn(session, {
+      ops: [
+        {
+          op: 'addPicture',
+          target: { slide: slideIndex },
+          bytes: new Uint8Array(bytes),
+          ext,
+          offset,
+        },
+      ],
+    })
+    if (!txn) return { error: 'unsupported' as const, ext }
     session.fitWidthPx = fitWidthPx
     const rebuilt = rebuildSlide(session, slideIndex)
-    return rebuilt ? { slide: rebuilt, sourceId: el.id } : null
+    return rebuilt ? { slide: rebuilt, sourceId: txn.records![0]!.created![0]! } : null
   })
 
+  // Shim over the canonical setFill op: gradient normalization is surface translation
+  // and stays here; validation/mutation/journal live in the op.
   ipcMain.handle('slides:edit-fill', (e, op: EditFillOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    const slide = session.opened.deck.slides[op.slideIndex]
-    if (!slide) return null
-    if (op.groupId) {
-      pushHistory(session)
-      const fill =
-        typeof op.fill === 'string'
-          ? op.fill
-          : {
-              stops: [
-                { pos: 0, color: op.fill.gradient.from },
-                { pos: 1, color: op.fill.gradient.to },
-              ],
-              ...(op.fill.gradient.radial
-                ? { radial: true }
-                : { angle: Math.round((op.fill.gradient.angleDeg ?? 0) * 60000) }),
-            }
-      if (!editGroupChildFill(slide, op.groupId, op.sourceId, fill)) {
-        session.undoStack.pop()
-        return null
-      }
-      return rebuildSlide(session, op.slideIndex)
-    }
-    const el = findEl(slide, op.sourceId)
-    if (!el) return null
+    const fill =
+      typeof op.fill === 'string'
+        ? op.fill
+        : {
+            stops: gradientStops(op.fill.gradient),
+            ...((pk) =>
+              pk
+                ? {
+                    path: pk,
+                    ...((ft) => (ft ? { fillTo: ft } : {}))(gradientFillTo(op.fill.gradient)),
+                  }
+                : { angle: Math.round((op.fill.gradient.angleDeg ?? 0) * 60000) })(
+              gradientPathKind(op.fill.gradient),
+            ),
+          }
     pushHistory(session)
-    if (typeof op.fill === 'string') {
-      el.fill = op.fill === 'none' ? { type: 'none' } : { type: 'solid', color: op.fill }
-    } else {
-      const g = op.fill.gradient
-      el.fill = {
-        type: 'gradient',
-        stops: [
-          { pos: 0, color: g.from },
-          { pos: 1, color: g.to },
-        ],
-        ...(g.radial
-          ? { path: 'circle' as const }
-          : { angle: Math.round((g.angleDeg ?? 0) * 60000) }),
-      }
+    const r = journaledTxn(session, 'edit', {
+      ops: [
+        {
+          op: 'setFill',
+          target: { slide: op.slideIndex, el: op.sourceId },
+          fill,
+          ...(op.groupId ? { group: op.groupId } : {}),
+        },
+      ],
+    })
+    if (!r.applied) {
+      session.undoStack.pop()
+      return null
     }
-    el.dirtyFill = true
     return rebuildSlide(session, op.slideIndex)
   })
 
   ipcMain.handle('slides:add-slide', (e, op: AddSlideOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    pushHistory(session)
-    const slide = duplicateSlide(session.opened, op.sourceIndex, { clearText: !!op.clearText })
-    if (!slide) {
-      session.undoStack.pop()
-      return null
-    }
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'duplicateSlide',
+          target: { slide: op.sourceIndex },
+          ...(op.clearText ? { clearText: true } : {}),
+        },
+      ],
+    })
+    if (!r) return null
     session.fitWidthPx = op.fitWidthPx
     return {
       slides: buildAllRenderSlides(session.opened, op.fitWidthPx),
@@ -2070,32 +2383,26 @@ export function registerSlidesIpc(): void {
     op: PasteSlideOp,
   ): { slides: RenderSlide[]; index: number; sourceId?: string } | null => {
     if (!slideClipboard) return null
-    if (op.mode === 'picture') {
-      const { deck } = session.opened
-      const anchorIndex = Math.min(Math.max(op.afterIndex, 0), deck.slides.length - 1)
-      const slide = deck.slides[anchorIndex]
-      if (!slide || !slideClipboard.png) return null
-      const el = addPicture(session.opened, slide, {
-        bytes: new Uint8Array(Buffer.from(slideClipboard.png, 'base64')),
-        ext: 'png',
-        offset: { x: 0, y: 0, cx: deck.size.cx, cy: deck.size.cy },
-      })
-      if (!el) return null
-      session.fitWidthPx = op.fitWidthPx
-      return {
-        slides: buildAllRenderSlides(session.opened, op.fitWidthPx),
-        index: anchorIndex,
-        sourceId: el.id,
-      }
-    }
-    const slide = pasteSlide(session.opened, op.afterIndex, slideClipboard.bundle, {
-      keepSourceFormatting: op.mode === 'source',
+    if (op.mode === 'picture' && !slideClipboard.png) return null
+    const r = journaledTxn(session, 'edit', {
+      ops: [
+        {
+          op: 'pasteSlide',
+          afterIndex: op.afterIndex,
+          mode: op.mode,
+          ...(op.mode === 'picture'
+            ? { png: slideClipboard.png }
+            : { bundle: slideClipboard.bundle }),
+        },
+      ],
     })
-    if (!slide) return null
+    if (!r.applied) return null
+    const rec = r.records![0]!
     session.fitWidthPx = op.fitWidthPx
     return {
       slides: buildAllRenderSlides(session.opened, op.fitWidthPx),
-      index: session.opened.deck.slides.indexOf(slide),
+      index: (rec.after as { index: number }).index,
+      ...(rec.created?.[0] ? { sourceId: rec.created[0] } : {}),
     }
   }
 
@@ -2142,12 +2449,10 @@ export function registerSlidesIpc(): void {
   ipcMain.handle('slides:add-blank-slide', (e, op: AddBlankSlideOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    pushHistory(session)
-    const slide = insertBlankSlide(session.opened, op.sourceIndex)
-    if (!slide) {
-      session.undoStack.pop()
-      return null
-    }
+    const r = sessionTxn(session, {
+      ops: [{ op: 'addBlankSlide', target: { slide: op.sourceIndex } }],
+    })
+    if (!r) return null
     session.fitWidthPx = op.fitWidthPx
     return {
       slides: buildAllRenderSlides(session.opened, op.fitWidthPx),
@@ -2170,12 +2475,16 @@ export function registerSlidesIpc(): void {
   ipcMain.handle('slides:add-slide-with-layout', (e, op: AddSlideWithLayoutOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
+    // 'builtin:' resolution may inject a layout part — do it before the undo snapshot
+    // is taken so a failed insert still rolls back to a consistent package
     pushHistory(session)
     const layoutPath = resolveLayoutPath(session, op.layoutPath)
-    const slide = layoutPath
-      ? insertSlideWithLayout(session.opened, op.sourceIndex, layoutPath)
+    const r = layoutPath
+      ? journaledTxn(session, 'edit', {
+          ops: [{ op: 'addSlideWithLayout', target: { slide: op.sourceIndex }, layoutPath }],
+        })
       : null
-    if (!slide) {
+    if (!r?.applied) {
       session.undoStack.pop()
       return null
     }
@@ -2216,11 +2525,16 @@ export function registerSlidesIpc(): void {
     })
   }
 
-  const commitMasterEdit = (session: Session): void => {
-    const me = session.masterEdit!
-    session.opened.archive.entries.set(me.partPath, Buffer.from(patchSlideXml(me.slide), 'utf8'))
-    for (let i = 0; i < session.opened.deck.slides.length; i++) materializeSlide(session.opened, i)
+  // Master edits run as part-addressed op transactions seeded with the live
+  // master slide: ops mutate me.slide itself (parse-time ids stay stable for
+  // the renderer's selection/editing state — a fresh parse would re-mint them)
+  // and the executor's flush serializes that same object to the entry.
+  const masterTxn = (session: Session, me: { partPath: string; slide: Slide }, op: Op) =>
+    sessionTxn(session, { ops: [op], parts: new Map([[me.partPath, me.slide]]) })
+
+  const masterEditDone = (session: Session): RenderSlide | null => {
     session.metaDirty = true
+    return buildMasterRenderSlide(session)
   }
 
   ipcMain.handle('slides:master-enter', (e, fitWidthPx: number): MasterEnterResult | null => {
@@ -2263,13 +2577,13 @@ export function registerSlidesIpc(): void {
     const session = sessions.get(e.sender.id)
     const me = session?.masterEdit
     if (!session || !me) return null
-    const el = findEl(me.slide, op.sourceId)
-    if (!el?.text) return null
-    pushHistory(session)
-    el.text.paragraphs = applyEditParagraphs(el.text.paragraphs, op.paragraphs)
-    el.dirty = true
-    commitMasterEdit(session)
-    return buildMasterRenderSlide(session)
+    const r = masterTxn(session, me, {
+      op: 'setText',
+      target: { part: me.partPath, el: op.sourceId },
+      paragraphs: op.paragraphs,
+    })
+    if (!r) return null
+    return masterEditDone(session)
   })
 
   ipcMain.handle('slides:master-edit-transform', (e, op: MasterEditTransformOp) => {
@@ -2278,110 +2592,118 @@ export function registerSlidesIpc(): void {
     if (!session || !me) return null
     const el = me.slide.elements.find((x) => x.id === op.sourceId)
     if (!el) return null
+    const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
+    const scale = op.fitWidthPx / baseWidthPx
+    const toEmu = (px: number) => Math.round((px / scale) * EMU_PER_PX_96)
     if (op.preview) {
+      // Previews are not persisted: mutate the live master slide only (the final
+      // commit at drag end goes through the op executor against the entry bytes)
       if (!session.transformPreview) {
         pushHistory(session)
         session.transformPreview = true
       }
-    } else if (session.transformPreview) {
+      el.transform = {
+        ...el.transform,
+        offset: { x: toEmu(op.xPx), y: toEmu(op.yPx), cx: toEmu(op.wPx), cy: toEmu(op.hPx) },
+        rot: Math.round(op.rotationDeg * 60000),
+      }
+      return buildMasterRenderSlide(session)
+    }
+    const payload = {
+      op: 'setTransform',
+      target: { part: me.partPath, el: op.sourceId },
+      box: { x: toEmu(op.xPx), y: toEmu(op.yPx), cx: toEmu(op.wPx), cy: toEmu(op.hPx) },
+      rotDeg: op.rotationDeg,
+    }
+    const seed = new Map([[me.partPath, me.slide]])
+    let r: TxnResult | null
+    if (session.transformPreview) {
+      // The gesture's first preview frame already pushed the undo step
       session.transformPreview = false
+      const applied = journaledTxn(session, 'edit', { ops: [payload], parts: seed })
+      r = applied.applied ? applied : null
     } else {
-      pushHistory(session)
+      r = sessionTxn(session, { ops: [payload], parts: seed })
     }
-    const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
-    const scale = op.fitWidthPx / baseWidthPx
-    const toEmu = (px: number) => Math.round((px / scale) * EMU_PER_PX_96)
-    el.transform = {
-      ...el.transform,
-      offset: { x: toEmu(op.xPx), y: toEmu(op.yPx), cx: toEmu(op.wPx), cy: toEmu(op.hPx) },
-      rot: Math.round(op.rotationDeg * 60000),
-    }
-    el.dirtyTransform = true
-    // Previews are not persisted (only the final commit at drag end writes the entry + full reparse)
-    if (!op.preview) commitMasterEdit(session)
-    return buildMasterRenderSlide(session)
+    if (!r) return null
+    return masterEditDone(session)
   })
 
   ipcMain.handle('slides:master-edit-fill', (e, op: MasterEditFillOp) => {
     const session = sessions.get(e.sender.id)
     const me = session?.masterEdit
     if (!session || !me) return null
-    const el = findEl(me.slide, op.sourceId)
-    if (!el) return null
-    pushHistory(session)
-    if (typeof op.fill === 'string') {
-      el.fill = op.fill === 'none' ? { type: 'none' } : { type: 'solid', color: op.fill }
-    } else {
-      const g = op.fill.gradient
-      el.fill = {
-        type: 'gradient',
-        stops: [
-          { pos: 0, color: g.from },
-          { pos: 1, color: g.to },
-        ],
-        ...(g.radial
-          ? { path: 'circle' as const }
-          : { angle: Math.round((g.angleDeg ?? 0) * 60000) }),
-      }
-    }
-    el.dirtyFill = true
-    commitMasterEdit(session)
-    return buildMasterRenderSlide(session)
+    const fill =
+      typeof op.fill === 'string'
+        ? op.fill
+        : {
+            stops: gradientStops(op.fill.gradient),
+            ...((pk) =>
+              pk
+                ? {
+                    path: pk,
+                    ...((ft) => (ft ? { fillTo: ft } : {}))(gradientFillTo(op.fill.gradient)),
+                  }
+                : { angle: Math.round((op.fill.gradient.angleDeg ?? 0) * 60000) })(
+              gradientPathKind(op.fill.gradient),
+            ),
+          }
+    const r = masterTxn(session, me, {
+      op: 'setFill',
+      target: { part: me.partPath, el: op.sourceId },
+      fill,
+    })
+    if (!r) return null
+    return masterEditDone(session)
   })
 
   ipcMain.handle('slides:master-edit-stroke', (e, op: MasterEditStrokeOp) => {
     const session = sessions.get(e.sender.id)
     const me = session?.masterEdit
     if (!session || !me) return null
-    const el = findEl(me.slide, op.sourceId)
-    if (!el) return null
-    pushHistory(session)
-    el.stroke = op.stroke
-      ? {
-          fill: { type: 'solid', color: op.stroke.color },
-          width: Math.round(op.stroke.widthPt * EMU_PER_PT),
-        }
-      : undefined
-    el.dirtyStroke = true
-    commitMasterEdit(session)
-    return buildMasterRenderSlide(session)
+    const r = masterTxn(session, me, {
+      op: 'setStroke',
+      target: { part: me.partPath, el: op.sourceId },
+      stroke: op.stroke
+        ? { color: op.stroke.color, widthEmu: Math.round(op.stroke.widthPt * EMU_PER_PT) }
+        : null,
+    })
+    if (!r) return null
+    return masterEditDone(session)
   })
 
   ipcMain.handle('slides:master-delete-element', (e, op: MasterDeleteElementOp) => {
     const session = sessions.get(e.sender.id)
     const me = session?.masterEdit
     if (!session || !me) return null
-    if (!me.slide.elements.some((x) => x.id === op.sourceId)) return null
-    pushHistory(session)
-    if (!deleteElement(me.slide, op.sourceId)) {
-      session.undoStack.pop()
-      return null
-    }
-    commitMasterEdit(session)
-    return buildMasterRenderSlide(session)
+    const r = masterTxn(session, me, {
+      op: 'deleteElement',
+      target: { part: me.partPath, el: op.sourceId },
+    })
+    if (!r) return null
+    return masterEditDone(session)
   })
 
   ipcMain.handle('slides:edit-picture-opacity', (e, op: EditPictureOpacityOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    const slide = session.opened.deck.slides[op.slideIndex]
-    if (!slide) return null
-    pushHistory(session)
-    if (!setPictureOpacity(slide, op.sourceId, op.opacity)) {
-      session.undoStack.pop()
-      return null
-    }
-    return rebuildSlide(session, op.slideIndex)
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'setPictureOpacity',
+          target: { slide: op.slideIndex, el: op.sourceId },
+          opacity: op.opacity,
+        },
+      ],
+    })
+    return r ? rebuildSlide(session, op.slideIndex) : null
   })
 
   ipcMain.handle('slides:set-slide-size', (e, op: SetSlideSizeOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    pushHistory(session)
-    if (!setSlideSize(session.opened, op.cx, op.cy)) {
-      session.undoStack.pop()
-      return null
-    }
+    const r = sessionTxn(session, { ops: [{ op: 'setSlideSize', cx: op.cx, cy: op.cy }] })
+    if (!r) return null
     session.metaDirty = true
     return buildAllRenderSlides(session.opened, session.fitWidthPx)
   })
@@ -2396,12 +2718,20 @@ export function registerSlidesIpc(): void {
     if (!session) return null
     pushHistory(session)
     const layoutPath = resolveLayoutPath(session, op.layoutPath)
-    const r = layoutPath
-      ? setSlideLayout(session.opened, op.slideIndex, layoutPath)
-      : op.layoutPath
+    // A named layout that fails to resolve is an error; an absent layoutPath means reset
+    const r =
+      op.layoutPath && !layoutPath
         ? null
-        : resetSlideLayout(session.opened, op.slideIndex)
-    if (!r) {
+        : journaledTxn(session, 'edit', {
+            ops: [
+              {
+                op: 'setSlideLayout',
+                target: { slide: op.slideIndex },
+                ...(layoutPath ? { layoutPath } : {}),
+              },
+            ],
+          })
+    if (!r?.applied) {
       session.undoStack.pop()
       return null
     }
@@ -2411,119 +2741,141 @@ export function registerSlidesIpc(): void {
   ipcMain.handle('slides:find-replace', (e, op: FindReplaceOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    pushHistory(session)
-    const { count } = replaceAllInDeck(session.opened.deck, op.find, op.replace, {
-      matchCase: op.matchCase,
-      firstOnly: op.firstOnly,
-      slideIndex: op.slideIndex,
-      elementId: op.elementId,
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'findReplace',
+          find: op.find,
+          replace: op.replace,
+          matchCase: op.matchCase,
+          firstOnly: op.firstOnly,
+          slideIndex: op.slideIndex,
+          elementId: op.elementId,
+        },
+      ],
     })
-    if (!count) {
-      session.undoStack.pop()
-      return { count: 0, slides: null }
-    }
+    if (!r) return { count: 0, slides: null }
+    const count = (r.records![0]!.after as { count: number }).count
     return { count, slides: buildAllRenderSlides(session.opened, session.fitWidthPx) }
   })
 
   ipcMain.handle('slides:delete-slide', (e, slideIndex: number) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    pushHistory(session)
-    if (!deleteSlide(session.opened, slideIndex)) {
-      session.undoStack.pop()
-      return null
-    }
-    return buildAllRenderSlides(session.opened, session.fitWidthPx)
+    const r = sessionTxn(session, { ops: [{ op: 'deleteSlide', target: { slide: slideIndex } }] })
+    return r ? buildAllRenderSlides(session.opened, session.fitWidthPx) : null
   })
 
   ipcMain.handle('slides:edit-table-cell', (e, op: EditTableCellOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    const slide = session.opened.deck.slides[op.slideIndex]
-    if (!slide) return null
-    pushHistory(session)
-    if (!editTableCellText(slide, op.sourceId, op.row, op.col, op.paragraphs as Paragraph[])) {
-      session.undoStack.pop()
-      return null
-    }
-    return rebuildSlide(session, op.slideIndex)
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'setTableCell',
+          target: { slide: op.slideIndex, el: op.sourceId },
+          row: op.row,
+          col: op.col,
+          paragraphs: op.paragraphs,
+        },
+      ],
+    })
+    return r ? rebuildSlide(session, op.slideIndex) : null
   })
 
   ipcMain.handle('slides:table-merge', (e, op: TableMergeIpcOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    pushHistory(session)
-    const r = mergeTableCells(session.opened, op.slideIndex, op.sourceId, {
-      kind: op.kind,
-      row: op.row,
-      col: op.col,
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'tableMerge',
+          target: { slide: op.slideIndex, el: op.sourceId },
+          kind: op.kind,
+          row: op.row,
+          col: op.col,
+        },
+      ],
     })
-    if (!r) {
-      session.undoStack.pop()
-      return null
-    }
+    if (!r) return null
     const rebuilt = rebuildSlide(session, op.slideIndex)
-    return rebuilt ? { slide: rebuilt, sourceId: r.elementId } : null
+    return rebuilt
+      ? { slide: rebuilt, sourceId: (r.records![0]!.after as { elementId: string }).elementId }
+      : null
   })
 
   ipcMain.handle('slides:table-structure', (e, op: TableStructureIpcOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    pushHistory(session)
-    const r = editTableStructure(session.opened, op.slideIndex, op.sourceId, {
-      kind: op.kind,
-      index: op.index,
-      ...(op.before ? { before: true } : {}),
-    } as TableStructureOp)
-    if (!r) {
-      session.undoStack.pop()
-      return null
-    }
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'tableStructure',
+          target: { slide: op.slideIndex, el: op.sourceId },
+          kind: op.kind,
+          index: op.index,
+          ...(op.before ? { before: true } : {}),
+        },
+      ],
+    })
+    if (!r) return null
     const rebuilt = rebuildSlide(session, op.slideIndex)
-    return rebuilt ? { slide: rebuilt, sourceId: r.elementId } : null
+    return rebuilt
+      ? { slide: rebuilt, sourceId: (r.records![0]!.after as { elementId: string }).elementId }
+      : null
   })
 
   ipcMain.handle('slides:set-table-row-height', (e, op: SetTableRowHeightOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    const slide = session.opened.deck.slides[op.slideIndex]
-    if (!slide) return null
     const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
     const scale = op.fitWidthPx / baseWidthPx
-    pushHistory(session)
-    if (!setTableRowHeight(slide, op.sourceId, op.row, (op.hPx / scale) * EMU_PER_PX_96)) {
-      session.undoStack.pop()
-      return null
-    }
-    return rebuildSlide(session, op.slideIndex)
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'setTableRowHeight',
+          target: { slide: op.slideIndex, el: op.sourceId },
+          row: op.row,
+          hEmu: (op.hPx / scale) * EMU_PER_PX_96,
+        },
+      ],
+    })
+    return r ? rebuildSlide(session, op.slideIndex) : null
   })
 
   ipcMain.handle('slides:set-table-cell-anchor', (e, op: SetTableCellAnchorOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    const slide = session.opened.deck.slides[op.slideIndex]
-    if (!slide) return null
-    pushHistory(session)
-    if (!setTableCellAnchor(slide, op.sourceId, op.row, op.col, op.anchor)) {
-      session.undoStack.pop()
-      return null
-    }
-    return rebuildSlide(session, op.slideIndex)
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'setTableCellAnchor',
+          target: { slide: op.slideIndex, el: op.sourceId },
+          row: op.row,
+          col: op.col,
+          anchor: op.anchor,
+        },
+      ],
+    })
+    return r ? rebuildSlide(session, op.slideIndex) : null
   })
 
   ipcMain.handle('slides:set-table-col-width', (e, op: SetTableColWidthOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    const slide = session.opened.deck.slides[op.slideIndex]
-    if (!slide) return null
     const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
     const scale = op.fitWidthPx / baseWidthPx
-    pushHistory(session)
-    if (!setTableColWidth(slide, op.sourceId, op.col, (op.wPx / scale) * EMU_PER_PX_96)) {
-      session.undoStack.pop()
-      return null
-    }
-    return rebuildSlide(session, op.slideIndex)
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'setTableColWidth',
+          target: { slide: op.slideIndex, el: op.sourceId },
+          col: op.col,
+          wEmu: (op.wPx / scale) * EMU_PER_PX_96,
+        },
+      ],
+    })
+    return r ? rebuildSlide(session, op.slideIndex) : null
   })
 
   ipcMain.handle('slides:edit-table-style', (e, op: EditTableStyleOp) => {
@@ -2532,44 +2884,13 @@ export function registerSlidesIpc(): void {
     const slide = session.opened.deck.slides[op.slideIndex]
     if (!slide) return null
     // A reparse regenerates element ids: look up the new id by element index; the renderer uses it to keep the selection
-    const elIdx = slide.elements.findIndex((el) => el.id === op.sourceId)
+    const elIdx = slide.elements.findIndex((el) => matchesElementRef(el, op.sourceId))
     pushHistory(session)
-    // Parse op -> TableStyleEdit
-    let edit: TableStyleEdit
-    if (op.styleName && TABLE_STYLE_PRESETS[op.styleName]) {
-      const preset = TABLE_STYLE_PRESETS[op.styleName]!
-      // Inject fixed-color presets' style definitions into tableStyles.xml (built-in GUIDs track theme colors, so colors would drift)
-      if (preset.styleId && preset.styleDefXml) {
-        ensureTableStylePart(session.opened, preset.styleId, preset.styleDefXml)
-      }
-      // Applying a style-gallery preset in PowerPoint clears cells' direct fills/borders; otherwise direct formatting hides the style
-      edit = {
-        tblPrXml: preset.tblPrXml,
-        clearDirectFormatting: true,
-        // Grid-style presets use direct borders (the style mechanism only has inner lines and cannot draw the outer frame)
-        ...(preset.border
-          ? {
-              borderPreset: 'all' as const,
-              borderColor: preset.border.color,
-              borderWidthEmu: preset.border.widthEmu,
-            }
-          : {}),
-      }
-    } else {
-      const borderColor = op.borderColor ?? undefined
-      const borderWidthEmu =
-        op.borderWidthPt != null ? Math.round(op.borderWidthPt * EMU_PER_PT) : undefined
-      edit = {
-        ...(op.firstRow !== undefined ? { firstRow: op.firstRow } : {}),
-        ...(op.bandRow !== undefined ? { bandRow: op.bandRow } : {}),
-        ...(op.shadingColor !== undefined ? { shadingColor: op.shadingColor } : {}),
-        ...(op.borderPreset !== undefined ? { borderPreset: op.borderPreset } : {}),
-        ...(borderColor !== undefined ? { borderColor } : {}),
-        ...(borderWidthEmu !== undefined ? { borderWidthEmu } : {}),
-        ...(op.cells ? { cells: op.cells } : {}),
-      }
-    }
-    if (!editTableStyle(slide, op.sourceId, edit)) {
+    const { slideIndex, sourceId, ...style } = op
+    const r = journaledTxn(session, 'edit', {
+      ops: [{ op: 'setTableStyle', target: { slide: slideIndex, el: sourceId }, ...style }],
+    })
+    if (!r.applied) {
       session.undoStack.pop()
       return null
     }
@@ -2586,7 +2907,7 @@ export function registerSlidesIpc(): void {
     const slide = session.opened.deck.slides[op.slideIndex]
     if (!slide) return null
     // A reparse regenerates element ids: look up the new id by element index; the renderer uses it to keep the selection
-    const elIdx = slide.elements.findIndex((el) => el.id === op.sourceId)
+    const elIdx = slide.elements.findIndex((el) => matchesElementRef(el, op.sourceId))
     // Confirm before the first edit of a chart from an imported file: editing rebuilds it from the template,
     // and unmodeled fine-grained formatting (number formats/trendlines/error bars/per-point styles) is lost
     const chartEl = slide.elements[elIdx] as { type?: string; descr?: string } | undefined
@@ -2605,9 +2926,6 @@ export function registerSlidesIpc(): void {
         : await dialog.showMessageBox(options)
       if (r.response !== 0) return null
     }
-    pushHistory(session)
-    // Mark aislides-chart on first edit (the conversion itself is lossless; no re-prompt after one confirmation)
-    markChartEditable(slide, op.sourceId)
     const patch: Parameters<typeof editChartElement>[3] = {
       ...(op.kind ? { kind: op.kind === 'barH' ? 'bar' : op.kind } : {}),
       ...(op.kind === 'barH' ? { barDir: 'bar' as const } : {}),
@@ -2630,10 +2948,10 @@ export function registerSlidesIpc(): void {
       ...(op.switchRowCol ? { switchRowCol: true } : {}),
       ...(op.pointColors ? { pointColors: op.pointColors } : {}),
     }
-    if (!editChartElement(session.opened, op.slideIndex, op.sourceId, patch)) {
-      session.undoStack.pop()
-      return null
-    }
+    const r = sessionTxn(session, {
+      ops: [{ op: 'setChart', target: { slide: op.slideIndex, el: op.sourceId }, patch }],
+    })
+    if (!r) return null
     // The chart part XML is updated; reparse the whole page to refresh the model
     const rebuilt = rebuildSlideWithReparse(session, op.slideIndex)
     if (!rebuilt) return null
@@ -2657,49 +2975,187 @@ export function registerSlidesIpc(): void {
   ipcMain.handle('slides:reorder-element', (e, op: ReorderElementOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    const slide = session.opened.deck.slides[op.slideIndex]
-    if (!slide) return null
-    pushHistory(session)
-    if (!reorderElement(slide, op.sourceId, op.dir)) {
-      session.undoStack.pop()
-      return null
-    }
-    return rebuildSlide(session, op.slideIndex)
+    const r = sessionTxn(session, {
+      ops: [
+        { op: 'reorderElement', target: { slide: op.slideIndex, el: op.sourceId }, dir: op.dir },
+      ],
+    })
+    return r ? rebuildSlide(session, op.slideIndex) : null
   })
 
   ipcMain.handle(
-    'slides:set-text-anchor',
-    (e, op: { slideIndex: number; sourceId: string; anchor: 'top' | 'middle' | 'bottom' }) => {
+    'slides:change-shape',
+    (e, op: { slideIndex: number; sourceId: string; prst: string; groupId?: string }) => {
       const session = sessions.get(e.sender.id)
       if (!session) return null
-      const slide = session.opened.deck.slides[op.slideIndex]
-      if (!slide) return null
-      pushHistory(session)
-      if (!setElementTextAnchor(slide, op.sourceId, op.anchor)) {
-        session.undoStack.pop()
+      const r = sessionTxn(session, {
+        ops: [
+          {
+            op: 'setShapeGeometry',
+            target: { slide: op.slideIndex, el: op.sourceId },
+            prst: op.prst,
+            ...(op.groupId ? { group: op.groupId } : {}),
+          },
+        ],
+      })
+      return r ? rebuildSlide(session, op.slideIndex) : null
+    },
+  )
+
+  ipcMain.handle(
+    'slides:set-shape-adjust',
+    (
+      e,
+      op: {
+        slideIndex: number
+        sourceId: string
+        adjust: Record<string, number>
+        groupId?: string
+        preview?: boolean
+      },
+    ) => {
+      const session = sessions.get(e.sender.id)
+      if (!session) return null
+      const payload = {
+        op: 'setShapeAdjust',
+        target: { slide: op.slideIndex, el: op.sourceId },
+        adjust: op.adjust,
+        ...(op.groupId ? { group: op.groupId } : {}),
+      }
+      // Validate before the preview bookkeeping (same contract as edit-transform):
+      // a failed first preview must not set transformPreview or clear the redo stack.
+      if (runTxn(session.opened, { dryRun: true, ops: [payload] }).failures?.length) return null
+      // Gesture undo semantics: one whole drag = one undo step. The first preview
+      // pushes a pre-gesture snapshot; later previews and the final commit do not.
+      let pushed = false
+      if (op.preview) {
+        if (!session.transformPreview) {
+          pushHistory(session)
+          session.transformPreview = true
+          pushed = true
+        }
+      } else if (session.transformPreview) {
+        session.transformPreview = false
+      } else {
+        pushHistory(session)
+        pushed = true
+      }
+      const r = journaledTxn(session, 'edit', { ops: [payload] })
+      if (!r.applied) {
+        if (pushed) {
+          session.undoStack.pop()
+          if (op.preview) session.transformPreview = false
+        }
         return null
       }
       return rebuildSlide(session, op.slideIndex)
     },
   )
 
-  ipcMain.handle('slides:clipboard-external', () => {
-    // Our marker still present = the last copy came from this app -> use internal element paste
-    // (on macOS custom formats don't appear in availableFormats, so check via readBuffer)
-    const marker = (format: string) => {
-      try {
-        return clipboard.readBuffer(format).length > 0
-      } catch {
-        return false
-      }
+  ipcMain.handle(
+    'slides:set-text-anchor',
+    (e, op: { slideIndex: number; sourceId: string; anchor: 'top' | 'middle' | 'bottom' }) => {
+      const session = sessions.get(e.sender.id)
+      if (!session) return null
+      const r = sessionTxn(session, {
+        ops: [
+          {
+            op: 'setTextAnchor',
+            target: { slide: op.slideIndex, el: op.sourceId },
+            anchor: op.anchor,
+          },
+        ],
+      })
+      return r ? rebuildSlide(session, op.slideIndex) : null
+    },
+  )
+
+  ipcMain.handle(
+    'slides:set-text-body-props',
+    (
+      e,
+      op: {
+        slideIndex: number
+        sourceId: string
+        props: {
+          vert?: 'horz' | 'eaVert' | 'vert' | 'vert270' | 'wordArtVert'
+          autofit?: 'none' | 'shrink' | 'resize'
+          insets?: Partial<{ l: number; t: number; r: number; b: number }>
+          wrap?: boolean
+        }
+      },
+    ) => {
+      const session = sessions.get(e.sender.id)
+      if (!session) return null
+      const r = sessionTxn(session, {
+        ops: [
+          {
+            op: 'setTextBodyProps',
+            target: { slide: op.slideIndex, el: op.sourceId },
+            props: op.props,
+          },
+        ],
+      })
+      if (!r) return null
+      // Autofit must take effect immediately on toggle, not only on the next text edit:
+      // 'resize' fits the shape height to the content now, 'shrink' runs the ladder and
+      // writes the used fontScale back into bodyPr (a bare <a:normAutofit/> opens at
+      // 100% in PowerPoint). Insets/wrap/vert changes re-fit under the same rules.
+      const rendered = applyAutofitResize(
+        session,
+        op.slideIndex,
+        op.sourceId,
+        rebuildSlide(session, op.slideIndex),
+      )
+      return syncAutofitScale(session, op.slideIndex, op.sourceId, rendered)
+    },
+  )
+
+  ipcMain.handle(
+    'slides:set-effects',
+    (e, op: { slideIndex: number; sourceId: string; effects: SetEffectsPatch }) => {
+      const session = sessions.get(e.sender.id)
+      if (!session) return null
+      const r = sessionTxn(session, {
+        ops: [
+          {
+            op: 'setEffects',
+            target: { slide: op.slideIndex, el: op.sourceId },
+            effects: op.effects,
+          },
+        ],
+      })
+      return r ? rebuildSlide(session, op.slideIndex) : null
+    },
+  )
+
+  // Our marker still present = the last copy came from this app -> use internal element paste
+  // (on macOS custom formats don't appear in availableFormats, so check via readBuffer)
+  const clipboardMarker = (format: string) => {
+    try {
+      return clipboard.readBuffer(format).length > 0
+    } catch {
+      return false
     }
-    if (slideClipboard && marker('io.genoffice.slides.slide')) return { kind: 'slide' }
-    if (marker('io.genoffice.slides.elements')) return { kind: 'internal' }
+  }
+
+  ipcMain.handle('slides:clipboard-external', () => {
+    if (slideClipboard && clipboardMarker('io.genoffice.slides.slide')) return { kind: 'slide' }
+    if (elementClipboard && clipboardMarker('io.genoffice.slides.elements'))
+      return { kind: 'internal' }
     const img = clipboard.readImage()
     if (!img.isEmpty()) return { kind: 'image', base64: img.toPNG().toString('base64'), ext: 'png' }
     const text = clipboard.readText()
     if (text.trim()) return { kind: 'text', text }
     return { kind: 'none' }
+  })
+
+  // Menu-enable probe: is there anything a paste would act on? (no image decode)
+  ipcMain.handle('slides:clipboard-probe', () => {
+    if (slideClipboard && clipboardMarker('io.genoffice.slides.slide')) return true
+    if (elementClipboard && clipboardMarker('io.genoffice.slides.elements')) return true
+    if (clipboard.availableFormats().some((f) => f.startsWith('image/'))) return true
+    return clipboard.readText().trim().length > 0
   })
 
   ipcMain.handle('slides:copy-elements', (e, op: CopyElementsOp) => {
@@ -2712,7 +3168,7 @@ export function registerSlidesIpc(): void {
       .filter((el): el is NonNullable<typeof el> => !!el)
       .map((el) => copyElementData(session.opened, slide, el))
     if (items.length) {
-      clipboards.set(e.sender.id, { items, pasteCount: 0 })
+      elementClipboard = { items, pasteCount: 0 }
       // Write our marker to the OS clipboard: an external copy overwrites it, so at paste time it tells whether internal or external is newer
       clipboard.writeBuffer('io.genoffice.slides.elements', Buffer.from('1'))
     }
@@ -2721,23 +3177,29 @@ export function registerSlidesIpc(): void {
 
   ipcMain.handle('slides:paste-elements', (e, op: PasteElementsOp) => {
     const session = sessions.get(e.sender.id)
-    const clip = clipboards.get(e.sender.id)
+    const clip = elementClipboard
     if (!session || !clip?.items.length) return null
     if (!session.opened.deck.slides[op.slideIndex]) return null
     const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
     const scale = op.fitWidthPx / baseWidthPx
     // Cascading offset: each paste shifts another 16px relative to the original
     const shift = Math.round(((16 * (clip.pasteCount + 1)) / scale) * EMU_PER_PX_96)
-    pushHistory(session)
-    const r = pasteElements(session.opened, op.slideIndex, clip.items, { dx: shift, dy: shift })
-    if (!r) {
-      session.undoStack.pop()
-      return null
-    }
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'pasteElements',
+          target: { slide: op.slideIndex },
+          items: clip.items,
+          dx: shift,
+          dy: shift,
+        },
+      ],
+    })
+    if (!r) return null
     clip.pasteCount++
     session.fitWidthPx = op.fitWidthPx
     const rebuilt = rebuildSlide(session, op.slideIndex)
-    return rebuilt ? { slide: rebuilt, sourceIds: r.elementIds } : null
+    return rebuilt ? { slide: rebuilt, sourceIds: r.records![0]!.created! } : null
   })
 
   // Duplicate in place (⌘D / Option+drag copy): does not touch the app clipboard; the caller supplies the offset
@@ -2754,18 +3216,21 @@ export function registerSlidesIpc(): void {
     const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
     const scale = op.fitWidthPx / baseWidthPx
     const toEmu = (px: number) => Math.round((px / scale) * EMU_PER_PX_96)
-    pushHistory(session)
-    const r = pasteElements(session.opened, op.slideIndex, items, {
-      dx: toEmu(op.dxPx),
-      dy: toEmu(op.dyPx),
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'pasteElements',
+          target: { slide: op.slideIndex },
+          items,
+          dx: toEmu(op.dxPx),
+          dy: toEmu(op.dyPx),
+        },
+      ],
     })
-    if (!r) {
-      session.undoStack.pop()
-      return null
-    }
+    if (!r) return null
     session.fitWidthPx = op.fitWidthPx
     const rebuilt = rebuildSlide(session, op.slideIndex)
-    return rebuilt ? { slide: rebuilt, sourceIds: r.elementIds } : null
+    return rebuilt ? { slide: rebuilt, sourceIds: r.records![0]!.created! } : null
   })
 
   ipcMain.handle('slides:add-table', (e, op: AddTableOp) => {
@@ -2775,19 +3240,21 @@ export function registerSlidesIpc(): void {
     const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
     const scale = op.fitWidthPx / baseWidthPx
     const toEmu = (px: number) => Math.round((px / scale) * EMU_PER_PX_96)
-    pushHistory(session)
-    const r = addTable(session.opened, op.slideIndex, {
-      rows: op.rows,
-      cols: op.cols,
-      offset: { x: toEmu(op.xPx), y: toEmu(op.yPx), cx: toEmu(op.wPx), cy: toEmu(op.hPx) },
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'addTable',
+          target: { slide: op.slideIndex },
+          rows: op.rows,
+          cols: op.cols,
+          offset: { x: toEmu(op.xPx), y: toEmu(op.yPx), cx: toEmu(op.wPx), cy: toEmu(op.hPx) },
+        },
+      ],
     })
-    if (!r) {
-      session.undoStack.pop()
-      return null
-    }
+    if (!r) return null
     session.fitWidthPx = op.fitWidthPx
     const rebuilt = rebuildSlide(session, op.slideIndex)
-    return rebuilt ? { slide: rebuilt, sourceId: r.elementId } : null
+    return rebuilt ? { slide: rebuilt, sourceId: r.records![0]!.created![0]! } : null
   })
 
   // Freehand ink stroke commit: one transparent PNG picture element per stroke (cNvPr name has
@@ -2801,26 +3268,28 @@ export function registerSlidesIpc(): void {
     const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
     const scale = op.fitWidthPx / baseWidthPx
     const toEmu = (px: number) => Math.round((px / scale) * EMU_PER_PX_96)
-    pushHistory(session)
-    const el = addPicture(session.opened, slide, {
-      bytes: new Uint8Array(Buffer.from(op.base64, 'base64')),
-      ext: 'png',
-      offset: {
-        x: toEmu(op.xPx),
-        y: toEmu(op.yPx),
-        cx: Math.max(1, toEmu(op.wPx)),
-        cy: Math.max(1, toEmu(op.hPx)),
-      },
-      name: `aislides-ink ${Date.now().toString(36)}`,
-      descr: op.payload,
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'addPicture',
+          target: { slide: op.slideIndex },
+          bytes: new Uint8Array(Buffer.from(op.base64, 'base64')),
+          ext: 'png',
+          offset: {
+            x: toEmu(op.xPx),
+            y: toEmu(op.yPx),
+            cx: Math.max(1, toEmu(op.wPx)),
+            cy: Math.max(1, toEmu(op.hPx)),
+          },
+          name: `aislides-ink ${Date.now().toString(36)}`,
+          descr: op.payload,
+        },
+      ],
     })
-    if (!el) {
-      session.undoStack.pop()
-      return null
-    }
+    if (!r) return null
     session.fitWidthPx = op.fitWidthPx
     const rebuilt = rebuildSlide(session, op.slideIndex)
-    return rebuilt ? { slide: rebuilt, sourceId: el.id } : null
+    return rebuilt ? { slide: rebuilt, sourceId: r.records![0]!.created![0]! } : null
   })
 
   // ── New insert capabilities: charts / SmartArt / icon bitmaps / audio-video / 3D / links / header-footer ──
@@ -2831,22 +3300,24 @@ export function registerSlidesIpc(): void {
     const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
     const scale = op.fitWidthPx / baseWidthPx
     const toEmu = (px: number) => Math.round((px / scale) * EMU_PER_PX_96)
-    pushHistory(session)
-    const r = addChart(session.opened, op.slideIndex, {
-      kind: op.kind === 'barH' ? 'bar' : op.kind,
-      ...(op.kind === 'barH' ? { barDir: 'bar' as const } : {}),
-      ...(op.title ? { title: op.title } : {}),
-      categories: op.categories,
-      series: op.series,
-      offset: { x: toEmu(op.xPx), y: toEmu(op.yPx), cx: toEmu(op.wPx), cy: toEmu(op.hPx) },
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'addChart',
+          target: { slide: op.slideIndex },
+          kind: op.kind === 'barH' ? 'bar' : op.kind,
+          ...(op.kind === 'barH' ? { barDir: 'bar' as const } : {}),
+          ...(op.title ? { title: op.title } : {}),
+          categories: op.categories,
+          series: op.series,
+          offset: { x: toEmu(op.xPx), y: toEmu(op.yPx), cx: toEmu(op.wPx), cy: toEmu(op.hPx) },
+        },
+      ],
     })
-    if (!r) {
-      session.undoStack.pop()
-      return null
-    }
+    if (!r) return null
     session.fitWidthPx = op.fitWidthPx
     const rebuilt = rebuildSlide(session, op.slideIndex)
-    return rebuilt ? { slide: rebuilt, sourceId: r.elementId } : null
+    return rebuilt ? { slide: rebuilt, sourceId: r.records![0]!.created![0]! } : null
   })
 
   ipcMain.handle('slides:add-smartart', (e, op: AddSmartArtOp) => {
@@ -2855,19 +3326,21 @@ export function registerSlidesIpc(): void {
     const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
     const scale = op.fitWidthPx / baseWidthPx
     const toEmu = (px: number) => Math.round((px / scale) * EMU_PER_PX_96)
-    pushHistory(session)
-    const r = addSmartArt(session.opened, op.slideIndex, {
-      layout: op.layout,
-      items: op.items,
-      offset: { x: toEmu(op.xPx), y: toEmu(op.yPx), cx: toEmu(op.wPx), cy: toEmu(op.hPx) },
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'addSmartArt',
+          target: { slide: op.slideIndex },
+          layout: op.layout,
+          items: op.items,
+          offset: { x: toEmu(op.xPx), y: toEmu(op.yPx), cx: toEmu(op.wPx), cy: toEmu(op.hPx) },
+        },
+      ],
     })
-    if (!r) {
-      session.undoStack.pop()
-      return null
-    }
+    if (!r) return null
     session.fitWidthPx = op.fitWidthPx
     const rebuilt = rebuildSlide(session, op.slideIndex)
-    return rebuilt ? { slide: rebuilt, sourceId: r.elementId } : null
+    return rebuilt ? { slide: rebuilt, sourceId: r.records![0]!.created![0]! } : null
   })
 
   ipcMain.handle('slides:add-image-bytes', (e, op: AddImageBytesOp) => {
@@ -2878,25 +3351,27 @@ export function registerSlidesIpc(): void {
     const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
     const scale = op.fitWidthPx / baseWidthPx
     const toEmu = (px: number) => Math.round((px / scale) * EMU_PER_PX_96)
-    pushHistory(session)
-    const el = addPicture(session.opened, slide, {
-      bytes: new Uint8Array(Buffer.from(op.base64, 'base64')),
-      ext: op.ext,
-      offset: {
-        x: toEmu(op.xPx),
-        y: toEmu(op.yPx),
-        cx: Math.max(1, toEmu(op.wPx)),
-        cy: Math.max(1, toEmu(op.hPx)),
-      },
-      ...(op.name ? { name: op.name } : {}),
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'addPicture',
+          target: { slide: op.slideIndex },
+          bytes: new Uint8Array(Buffer.from(op.base64, 'base64')),
+          ext: op.ext,
+          offset: {
+            x: toEmu(op.xPx),
+            y: toEmu(op.yPx),
+            cx: Math.max(1, toEmu(op.wPx)),
+            cy: Math.max(1, toEmu(op.hPx)),
+          },
+          ...(op.name ? { name: op.name } : {}),
+        },
+      ],
     })
-    if (!el) {
-      session.undoStack.pop()
-      return { error: 'unsupported' as const, ext: op.ext }
-    }
+    if (!r) return { error: 'unsupported' as const, ext: op.ext }
     session.fitWidthPx = op.fitWidthPx
     const rebuilt = rebuildSlide(session, op.slideIndex)
-    return rebuilt ? { slide: rebuilt, sourceId: el.id } : null
+    return rebuilt ? { slide: rebuilt, sourceId: r.records![0]!.created![0]! } : null
   })
 
   ipcMain.handle('slides:replace-picture-bytes', (e, op: ReplacePictureBytesOp) => {
@@ -2904,19 +3379,18 @@ export function registerSlidesIpc(): void {
     if (!session) return null
     const slide = session.opened.deck.slides[op.slideIndex]
     if (!slide) return null
-    pushHistory(session)
-    const ok = replacePictureBytes(
-      session.opened,
-      slide,
-      op.sourceId,
-      new Uint8Array(Buffer.from(op.base64, 'base64')),
-      op.ext,
-      op.keepSrcRect ? { keepSrcRect: true } : undefined,
-    )
-    if (!ok) {
-      session.undoStack.pop()
-      return { error: 'unsupported' as const, ext: op.ext }
-    }
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'replacePicture',
+          target: { slide: op.slideIndex, el: op.sourceId },
+          bytes: new Uint8Array(Buffer.from(op.base64, 'base64')),
+          ext: op.ext,
+          ...(op.keepSrcRect ? { keepSrcRect: true } : {}),
+        },
+      ],
+    })
+    if (!r) return { error: 'unsupported' as const, ext: op.ext }
     return rebuildSlide(session, op.slideIndex)
   })
 
@@ -3001,22 +3475,24 @@ export function registerSlidesIpc(): void {
               }
             })()
 
-      pushHistory(session)
-      const added = addMedia(session.opened, slideIndex, {
-        kind,
-        bytes: new Uint8Array(bytes),
-        ext,
-        ...(poster ? { poster } : {}),
-        offset,
-        name: fileName,
+      const txn = sessionTxn(session, {
+        ops: [
+          {
+            op: 'addMedia',
+            target: { slide: slideIndex },
+            kind,
+            bytes: new Uint8Array(bytes),
+            ext,
+            ...(poster ? { poster } : {}),
+            offset,
+            name: fileName,
+          },
+        ],
       })
-      if (!added) {
-        session.undoStack.pop()
-        return null
-      }
+      if (!txn) return null
       session.fitWidthPx = fitWidthPx
       const rebuilt = rebuildSlide(session, slideIndex)
-      return rebuilt ? { slide: rebuilt, sourceId: added.elementId } : null
+      return rebuilt ? { slide: rebuilt, sourceId: txn.records![0]!.created![0]! } : null
     },
   )
 
@@ -3063,26 +3539,28 @@ export function registerSlidesIpc(): void {
     const deckSize = session.opened.deck.size
     const cx = Math.round(deckSize.cx * 0.6)
     const cy = Math.round((cx * 9) / 16)
-    pushHistory(session)
-    const added = addMedia(session.opened, op.slideIndex, {
-      kind: op.kind,
-      bytes: new Uint8Array(Buffer.from(op.base64, 'base64')),
-      ext: op.ext,
-      offset: {
-        x: Math.round((deckSize.cx - cx) / 2),
-        y: Math.round((deckSize.cy - cy) / 2),
-        cx,
-        cy,
-      },
-      ...(op.name ? { name: op.name } : {}),
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'addMedia',
+          target: { slide: op.slideIndex },
+          kind: op.kind,
+          bytes: new Uint8Array(Buffer.from(op.base64, 'base64')),
+          ext: op.ext,
+          offset: {
+            x: Math.round((deckSize.cx - cx) / 2),
+            y: Math.round((deckSize.cy - cy) / 2),
+            cx,
+            cy,
+          },
+          ...(op.name ? { name: op.name } : {}),
+        },
+      ],
     })
-    if (!added) {
-      session.undoStack.pop()
-      return null
-    }
+    if (!r) return null
     session.fitWidthPx = op.fitWidthPx
     const rebuilt = rebuildSlide(session, op.slideIndex)
-    return rebuilt ? { slide: rebuilt, sourceId: added.elementId } : null
+    return rebuilt ? { slide: rebuilt, sourceId: r.records![0]!.created![0]! } : null
   })
 
   // 3D model (simplified): glb embed + poster placeholder image
@@ -3112,38 +3590,37 @@ export function registerSlidesIpc(): void {
     const deckSize = session.opened.deck.size
     const cy = Math.round(deckSize.cy * 0.5)
     const cx = cy
-    pushHistory(session)
-    const added = addModel3d(session.opened, slideIndex, {
-      bytes: new Uint8Array(bytes),
-      ext,
-      ...(poster ? { poster } : {}),
-      offset: {
-        x: Math.round((deckSize.cx - cx) / 2),
-        y: Math.round((deckSize.cy - cy) / 2),
-        cx,
-        cy,
-      },
-      name: filePath.split('/').pop()!,
+    const txn = sessionTxn(session, {
+      ops: [
+        {
+          op: 'addModel3d',
+          target: { slide: slideIndex },
+          bytes: new Uint8Array(bytes),
+          ext,
+          ...(poster ? { poster } : {}),
+          offset: {
+            x: Math.round((deckSize.cx - cx) / 2),
+            y: Math.round((deckSize.cy - cy) / 2),
+            cx,
+            cy,
+          },
+          name: filePath.split('/').pop()!,
+        },
+      ],
     })
-    if (!added) {
-      session.undoStack.pop()
-      return null
-    }
+    if (!txn) return null
     session.fitWidthPx = fitWidthPx
     const rebuilt = rebuildSlide(session, slideIndex)
-    return rebuilt ? { slide: rebuilt, sourceId: added.elementId } : null
+    return rebuilt ? { slide: rebuilt, sourceId: txn.records![0]!.created![0]! } : null
   })
 
   ipcMain.handle('slides:set-link', (e, op: SetLinkOp) => {
     const session = sessions.get(e.sender.id)
-    if (!session || !session.opened.deck.slides[op.slideIndex]) return null
-    pushHistory(session)
-    const fresh = setElementLink(session.opened, op.slideIndex, op.sourceId, op.target)
-    if (!fresh) {
-      session.undoStack.pop()
-      return null
-    }
-    return rebuildSlide(session, op.slideIndex)
+    if (!session) return null
+    const r = sessionTxn(session, {
+      ops: [{ op: 'setLink', target: { slide: op.slideIndex, el: op.sourceId }, link: op.target }],
+    })
+    return r ? rebuildSlide(session, op.slideIndex) : null
   })
 
   ipcMain.handle('slides:get-link', (e, slideIndex: number, sourceId: string) => {
@@ -3173,17 +3650,20 @@ export function registerSlidesIpc(): void {
   ipcMain.handle('slides:apply-header-footer', (e, op: HeaderFooterOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    pushHistory(session)
-    const changed = applyHeaderFooter(session.opened, {
-      footer: op.footer ?? null,
-      slideNum: !!op.slideNum,
-      date: op.date ?? null,
-      ...(op.dateAuto ? { dateAuto: true } : {}),
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'applyHeaderFooter',
+          settings: {
+            footer: op.footer ?? null,
+            slideNum: !!op.slideNum,
+            date: op.date ?? null,
+            ...(op.dateAuto ? { dateAuto: true } : {}),
+          },
+        },
+      ],
     })
-    if (!changed) {
-      session.undoStack.pop()
-      return null
-    }
+    if (!r) return null
     session.fitWidthPx = op.fitWidthPx
     return buildAllRenderSlides(session.opened, op.fitWidthPx)
   })
@@ -3199,42 +3679,35 @@ export function registerSlidesIpc(): void {
   // (real-world decks have almost entirely explicit colors, so swapping only the theme changes
   // nothing visually). Element resolved colors come from the parse-time inheritance chain, so
   // after the surgery the deck reparses in memory; undo snapshots roll back as usual.
-  ipcMain.handle('slides:apply-theme', async (e, op: ApplyThemeOp) => {
+  ipcMain.handle('slides:apply-theme', (e, op: ApplyThemeOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    pushHistory(session)
-    const spec = {
+    const payload = {
+      op: 'applyTheme',
       name: op.name,
       colors: op.colors,
       ...(op.majorFont ? { majorFont: op.majorFont } : {}),
       ...(op.minorFont ? { minorFont: op.minorFont } : {}),
     }
-    try {
-      // 1) Bake unsaved edits into the entries first: the color surgery edits entries
-      //    directly, and dirty elements left for a later save would overwrite the surgery
-      //    result with stale slices. In-memory (commitSaved/reparseDeck) instead of
-      //    savePptx -> openPptx: the zip roundtrip's contiguous buffer fails on large decks
-      commitSaved(session.opened)
-      // 2) Pure entry surgery: theme parts + explicit color remapping
-      const patched = applyThemeToArchive(session.opened, spec)
-      const remapped = remapDeckColors(session.opened, spec)
-      if (patched === 0 && remapped === 0) {
-        session.undoStack.pop()
-        return null
-      }
-      // 3) Reparse so every element's resolved colors/fonts refresh
-      session.opened = reparseDeck(session.opened)
-    } catch (err) {
-      restoreSnapshot(session, session.undoStack.pop()!)
-      return { error: err instanceof Error ? err.message : String(err) }
+    // Plan first so an invalid request doesn't clear the redo stack
+    const plan = runTxn(session.opened, { ops: [payload], dryRun: true })
+    if (plan.failures?.length) return { error: plan.failures[0]!.error }
+    pushHistory(session)
+    const r = journaledTxn(session, 'edit', { ops: [payload] })
+    if (!r.applied) {
+      session.undoStack.pop()
+      return { error: r.failures?.[0]?.error ?? 'applyTheme failed' }
     }
-    // Pages without any background definition fall back to the theme base color (so dark themes don't leave a white background)
-    const lt1 = op.colors.lt1
-    if (lt1) {
-      for (const s of session.opened.deck.slides) {
-        if (!s.background) setSlideBackground(s, `#${lt1.replace(/^#/, '')}`)
-      }
+    const after = r.records![0]!.after as { patched: number; remapped: number }
+    if (after.patched === 0 && after.remapped === 0) {
+      // Nothing matched the spec; the op only baked pending edits — not an undo step
+      session.undoStack.pop()
+      return null
     }
+    // Reparse so every element's resolved colors/fonts refresh. In-memory
+    // (reparseDeck) instead of savePptx -> openPptx: the zip roundtrip's
+    // contiguous buffer fails on large decks
+    session.opened = reparseDeck(session.opened)
     // Reopening cleared element-level dirty; the session-level flag preserves the "unsaved" state (reset on save)
     session.metaDirty = true
     session.fitWidthPx = op.fitWidthPx
@@ -3245,11 +3718,13 @@ export function registerSlidesIpc(): void {
     const session = sessions.get(e.sender.id)
     if (!session) return false
     const slides = session.opened.deck.slides
-    const targets = op.slideIndex === -1 ? slides : [slides[op.slideIndex]].filter(Boolean)
-    if (targets.length === 0) return false
-    pushHistory(session)
-    for (const s of targets) setSlideTransition(s!, op.kind)
-    return true
+    const idxs =
+      op.slideIndex === -1 ? slides.map((_, i) => i) : slides[op.slideIndex] ? [op.slideIndex] : []
+    if (idxs.length === 0) return false
+    const r = sessionTxn(session, {
+      ops: idxs.map((i) => ({ op: 'setTransition', target: { slide: i }, kind: op.kind })),
+    })
+    return r !== null
   })
 
   ipcMain.handle('slides:get-transition', (e, slideIndex: number) => {
@@ -3265,9 +3740,14 @@ export function registerSlidesIpc(): void {
     const slides = session.opened.deck.slides
     const targets = op.times.filter((t) => slides[t.slideIndex])
     if (targets.length === 0) return false
-    pushHistory(session)
-    for (const t of targets) setSlideAdvanceTime(slides[t.slideIndex]!, t.ms)
-    return true
+    const r = sessionTxn(session, {
+      ops: targets.map((t) => ({
+        op: 'setAdvanceTime',
+        target: { slide: t.slideIndex },
+        ms: t.ms,
+      })),
+    })
+    return r !== null
   })
 
   // ── Shape animations (<p:timing>; the spid <-> temporary element id mapping happens here) ──
@@ -3321,36 +3801,20 @@ export function registerSlidesIpc(): void {
 
   ipcMain.handle('slides:set-animations', (e, op: SetAnimationsOp) => {
     const session = sessions.get(e.sender.id)
-    const slide = session?.opened.deck.slides[op.slideIndex]
-    if (!session || !slide) return false
-    const anims: SlideAnimation[] = []
-    for (const it of op.items) {
-      const el = slide.elements.find((x) => x.id === it.sourceId)
-      const spid = el ? elementSpid(el) : null
-      if (spid == null) continue
-      anims.push({
-        spid,
-        effect: it.effect,
-        trigger: it.trigger,
-        durationMs: Math.max(0, Math.round(it.durationMs)),
-        delayMs: Math.max(0, Math.round(it.delayMs)),
-        ...(it.motionPath != null ? { motionPath: it.motionPath } : {}),
-        ...(it.paragraph != null ? { paragraph: it.paragraph } : {}),
-      })
-    }
-    pushHistory(session)
-    setSlideAnimations(slide, anims)
-    return true
+    if (!session) return false
+    const r = sessionTxn(session, {
+      ops: [{ op: 'setAnimations', target: { slide: op.slideIndex }, items: op.items }],
+    })
+    return r !== null
   })
 
   ipcMain.handle('slides:set-hidden', (e, op: SetSlideHiddenOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    const slide = session.opened.deck.slides[op.slideIndex]
-    if (!slide) return null
-    pushHistory(session)
-    setSlideHidden(slide, op.hidden)
-    return rebuildSlide(session, op.slideIndex)
+    const r = sessionTxn(session, {
+      ops: [{ op: 'setHidden', target: { slide: op.slideIndex }, hidden: op.hidden }],
+    })
+    return r ? rebuildSlide(session, op.slideIndex) : null
   })
 
   // ── Section management: presentation.xml surgery, riding on snapshot undo and savePptx ──
@@ -3359,63 +3823,43 @@ export function registerSlidesIpc(): void {
     return session ? getSections(session.opened) : []
   })
 
+  // Section shims share one shape: single op, metaDirty, echo the op's section payload back.
+  const sectionShim = (e: Electron.IpcMainInvokeEvent, op: Record<string, unknown>) => {
+    const session = sessions.get(e.sender.id)
+    if (!session) return null
+    const r = sessionTxn(session, { ops: [op as Parameters<typeof runTxn>[1]['ops'][0]] })
+    if (!r) return null
+    session.metaDirty = true
+    return r.records![0]!.after
+  }
+
   ipcMain.handle('slides:set-sections', (e, sections: SectionInfo[]) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    pushHistory(session)
-    setSections(session.opened, sections)
-    session.metaDirty = true
+    if (!sectionShim(e, { op: 'setSections', sections })) return null
     return getSections(session.opened)
   })
 
-  ipcMain.handle('slides:add-section', (e, op: AddSectionOp) => {
-    const session = sessions.get(e.sender.id)
-    if (!session) return null
-    pushHistory(session)
-    const r = addSection(session.opened, op.atSlideIndex, op.name)
-    if (!r) {
-      session.undoStack.pop()
-      return null
-    }
-    session.metaDirty = true
-    return r
-  })
+  ipcMain.handle('slides:add-section', (e, op: AddSectionOp) =>
+    sectionShim(e, { op: 'addSection', atSlideIndex: op.atSlideIndex, name: op.name }),
+  )
 
-  ipcMain.handle('slides:rename-section', (e, op: RenameSectionOp) => {
-    const session = sessions.get(e.sender.id)
-    if (!session) return null
-    pushHistory(session)
-    const r = renameSection(session.opened, op.id, op.name)
-    if (!r) {
-      session.undoStack.pop()
-      return null
-    }
-    session.metaDirty = true
-    return r
-  })
+  ipcMain.handle('slides:rename-section', (e, op: RenameSectionOp) =>
+    sectionShim(e, { op: 'renameSection', id: op.id, name: op.name }),
+  )
 
-  ipcMain.handle('slides:remove-section', (e, op: RemoveSectionOp) => {
-    const session = sessions.get(e.sender.id)
-    if (!session) return null
-    pushHistory(session)
-    const r = removeSection(session.opened, op.id, { keepSlides: true })
-    if (!r) {
-      session.undoStack.pop()
-      return null
-    }
-    session.metaDirty = true
-    return r
-  })
+  ipcMain.handle('slides:remove-section', (e, op: RemoveSectionOp) =>
+    sectionShim(e, { op: 'removeSection', id: op.id }),
+  )
 
   // Drag to reorder slides (sldIdLst + deck.slides + section membership); must send back the full RenderSlide set
   ipcMain.handle('slides:move-slide', (e, op: MoveSlideOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    pushHistory(session)
-    if (!moveSlide(session.opened, op.fromIndex, op.toIndex)) {
-      session.undoStack.pop()
-      return null
-    }
+    const r = sessionTxn(session, {
+      ops: [{ op: 'moveSlide', target: { slide: op.fromIndex }, to: op.toIndex }],
+    })
+    if (!r) return null
     session.metaDirty = true
     return {
       slides: buildAllRenderSlides(session.opened, session.fitWidthPx),
@@ -3427,13 +3871,8 @@ export function registerSlidesIpc(): void {
   ipcMain.handle('slides:move-section', (e, op: MoveSectionOp) => {
     const session = sessions.get(e.sender.id)
     if (!session) return null
-    pushHistory(session)
-    const sections = moveSection(session.opened, op.id, op.dir)
-    if (!sections) {
-      session.undoStack.pop()
-      return null
-    }
-    session.metaDirty = true
+    const sections = sectionShim(e, { op: 'moveSection', id: op.id, dir: op.dir })
+    if (!sections) return null
     return {
       slides: buildAllRenderSlides(session.opened, session.fitWidthPx),
       sections,
@@ -3449,12 +3888,12 @@ export function registerSlidesIpc(): void {
 
   ipcMain.handle('slides:set-notes', (e, op: SetNotesOp) => {
     const session = sessions.get(e.sender.id)
-    if (!session || !session.opened.deck.slides[op.slideIndex]) return false
-    pushHistory(session)
-    const ok = setSlideNotes(session.opened, op.slideIndex, op.text)
-    if (!ok) session.undoStack.pop()
-    else session.metaDirty = true
-    return ok
+    if (!session) return false
+    const r = sessionTxn(session, {
+      ops: [{ op: 'setNotes', target: { slide: op.slideIndex }, text: op.text }],
+    })
+    if (r) session.metaDirty = true
+    return r !== null
   })
 
   ipcMain.handle('slides:get-comments', (e, slideIndex: number) => {
@@ -3467,13 +3906,17 @@ export function registerSlidesIpc(): void {
     const session = sessions.get(e.sender.id)
     const slide = session?.opened.deck.slides[op.slideIndex]
     if (!session || !slide) return null
-    pushHistory(session)
-    const author = commentAuthorName()
-    const added = addSlideComment(session.opened, op.slideIndex, { author, text: op.text })
-    if (!added) {
-      session.undoStack.pop()
-      return null
-    }
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'addComment',
+          target: { slide: op.slideIndex },
+          author: commentAuthorName(),
+          text: op.text,
+        },
+      ],
+    })
+    if (!r) return null
     session.metaDirty = true
     return getSlideComments(session.opened.archive, slide.path)
   })
@@ -3482,13 +3925,17 @@ export function registerSlidesIpc(): void {
     const session = sessions.get(e.sender.id)
     const slide = session?.opened.deck.slides[op.slideIndex]
     if (!session || !slide) return null
-    pushHistory(session)
-    if (
-      !deleteSlideComment(session.opened, op.slideIndex, { authorId: op.authorId, idx: op.idx })
-    ) {
-      session.undoStack.pop()
-      return null
-    }
+    const r = sessionTxn(session, {
+      ops: [
+        {
+          op: 'deleteComment',
+          target: { slide: op.slideIndex },
+          authorId: op.authorId,
+          idx: op.idx,
+        },
+      ],
+    })
+    if (!r) return null
     session.metaDirty = true
     return getSlideComments(session.opened.archive, slide.path)
   })
@@ -3518,6 +3965,7 @@ export function registerSlidesIpc(): void {
     const session = sessions.get(e.sender.id)
     if (!session || session.masterEdit || session.historyBatch) return null
     if (!restoreAiSnapshot(session, id)) return null
+    scheduleDeckBroadcast(session)
     return buildAllRenderSlides(session.opened, session.fitWidthPx)
   })
 
@@ -3530,6 +3978,7 @@ export function registerSlidesIpc(): void {
     session.redoStack.push(takeSnapshot(session))
     restoreSnapshot(session, session.undoStack.pop()!)
     scheduleHistoryNotify(session)
+    scheduleDeckBroadcast(session)
     return buildAllRenderSlides(session.opened, session.fitWidthPx)
   })
 
@@ -3541,6 +3990,7 @@ export function registerSlidesIpc(): void {
     session.undoStack.push(takeSnapshot(session))
     restoreSnapshot(session, session.redoStack.pop()!)
     scheduleHistoryNotify(session)
+    scheduleDeckBroadcast(session)
     return buildAllRenderSlides(session.opened, session.fitWidthPx)
   })
 
@@ -3592,7 +4042,7 @@ export function registerSlidesIpc(): void {
     if (!session) return { ok: false, error: 'no file open' }
     const parent = dialogParent()
     const options = {
-      defaultPath: defaultName,
+      defaultPath: saveAsSuggestion(session.path, defaultName),
       filters: [{ name: 'PowerPoint', extensions: ['pptx'] }],
     }
     const r = await showSaveDialogWithMemory(dialog, parent, options, getDraftsDir())
@@ -3603,7 +4053,7 @@ export function registerSlidesIpc(): void {
       autosaveBackoff.delete(r.filePath)
       dropUntitledRecovery(e.sender.id)
       await pushRecent(r.filePath)
-      slidesOpenedHook?.(e.sender, r.filePath)
+      syncAttachedPaths(session, r.filePath)
       commitSaved(session.opened)
       session.metaDirty = false
       return {
@@ -3660,40 +4110,11 @@ export function registerSlidesIpc(): void {
   })
 
   ipcMain.handle('slides:export-pdf', async (_e, op: ExportPdfOp): Promise<ExportPdfResult> => {
-    // PDF page size: fixed 7.5in height, width by slide ratio (16:9 -> 13.333in, 4:3 -> 10in)
-    const heightIn = 7.5
-    const widthIn = Math.round((op.widthPx / op.heightPx) * heightIn * 1000) / 1000
-    const html = `<!doctype html><html><head><meta charset="utf-8"><style>
-@page { size: ${widthIn}in ${heightIn}in; margin: 0; }
-html, body { margin: 0; padding: 0; }
-.page { width: ${widthIn}in; height: ${heightIn}in; overflow: hidden; page-break-after: always; }
-.page:last-child { page-break-after: auto; }
-.page img { display: block; width: 100%; height: 100%; }
-</style></head><body>${op.pngsBase64
-      .map((b64) => `<div class="page"><img src="data:image/png;base64,${b64}"></div>`)
-      .join('')}</body></html>`
-    const win = new BrowserWindow({ show: false, webPreferences: { sandbox: true } })
-    try {
-      await win.loadURL('data:text/html;base64,' + Buffer.from(html, 'utf8').toString('base64'))
-      // Wait for fonts and all images to decode before printing, avoiding blank pages
-      await win.webContents.executeJavaScript(
-        'Promise.all([document.fonts.ready, ...Array.from(document.images).map((i) => i.decode().catch(() => {}))])',
-        true,
-      )
-      const pdf = await win.webContents.printToPDF({
-        landscape: false, // The page size is already landscape (width > height); passing landscape would rotate a second time
-        printBackground: true,
-        pageSize: { width: widthIn, height: heightIn },
-        margins: { top: 0, bottom: 0, left: 0, right: 0 },
-        preferCSSPageSize: false,
-      })
-      await writeFile(op.filePath, pdf)
-      return { ok: true, path: op.filePath }
-    } catch (err) {
-      return { ok: false, error: String(err) }
-    } finally {
-      win.destroy()
-    }
+    return exportSlidesPdf({
+      ...op,
+      createWindow: () => new BrowserWindow({ show: false, webPreferences: { sandbox: true } }),
+      openExportedPdf,
+    })
   })
 
   ipcMain.handle(
@@ -3860,6 +4281,7 @@ export function registerProjectIpc(): void {
           output?: string
         }>
         attachments?: Array<{ name: string; path?: string; ext?: string; sizeBytes?: number }>
+        scope?: { label: string; text?: string }
       },
     ) => {
       const msg: Parameters<ProjectStore['appendChatMessage']>[2] = {
@@ -3868,6 +4290,8 @@ export function registerProjectIpc(): void {
       }
       if (args.tools) msg.tools = args.tools
       if (args.attachments) msg.attachments = args.attachments
+      if (args.scope) msg.scope = args.scope
+
       getSlidesProjectStore().appendChatMessage(args.projectId, args.chatId, msg)
     },
   )
@@ -3914,6 +4338,18 @@ export function createSlidesWindow(openPath?: string | null): BrowserWindow {
     },
   })
   trackSlidesWebContents(win.webContents)
+  standaloneWindows.set(win.webContents.id, win)
+  const standaloneWcId = win.webContents.id
+  win.on('closed', () => standaloneWindows.delete(standaloneWcId))
+  // The focused window owns the process-global menu-command target and the app
+  // menu (the shell's tab manager re-claims both on its own window's focus)
+  win.on('focus', () => {
+    setActiveSlidesWebContents(win.webContents)
+    installSlidesMenu()
+  })
+  // Titles are owned by the main process (initial file name, Save As updates);
+  // the renderer's static <title> must not overwrite them
+  win.on('page-title-updated', (event) => event.preventDefault())
   // Close guard for standalone-window mode (tab mode runs the same flow via the shell's tab-manager/window-close path)
   win.on('close', (event) => {
     if (!slidesIsDirty(win.webContents.id)) return
@@ -3928,6 +4364,7 @@ export function createSlidesWindow(openPath?: string | null): BrowserWindow {
   else if (runtime.rendererFilePath) win.loadFile(runtime.rendererFilePath)
 
   if (openPath) {
+    win.setTitle(basename(openPath))
     win.webContents.once('did-finish-load', async () => {
       try {
         const result = await openAndBuild(win.webContents, openPath, 1280)
@@ -4009,6 +4446,16 @@ export function buildSlidesMenu(): Menu {
       label: tm('menuFile'),
       submenu: [
         { label: tm('menuOpen'), accelerator: 'CmdOrCtrl+O', click: () => send('open') },
+        {
+          // Detached second editor window on the same saved file: it attaches to
+          // the shared session (openAndBuild), so both windows co-edit live
+          label: tm('menuOpenNewWindow'),
+          click: () => {
+            const wc = windowRefs.activeWebContents ?? BrowserWindow.getFocusedWindow()?.webContents
+            const path = wc ? sessions.get(wc.id)?.path : undefined
+            if (path) createSlidesWindow(path)
+          },
+        },
         ...(extraFileMenuItems.length > 0
           ? [{ type: 'separator' as const }, ...extraFileMenuItems]
           : []),

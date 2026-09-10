@@ -1,5 +1,11 @@
+import type { AiPanelPrefs } from '@genoffice/ui'
 import type { Lang } from '@genoffice/i18n'
-import type { AiSettings, AiStreamChunk, AiStreamRequest } from '@genoffice/ai-provider'
+import type {
+  AiSettings,
+  AiStreamChunk,
+  AiStreamRequest,
+  GenSparkAccountStatus,
+} from '@genoffice/ai-provider'
 
 export const MARKDOWN_CHANNELS = {
   consumePending: 'markdown:consume-pending',
@@ -18,19 +24,32 @@ export const MARKDOWN_CHANNELS = {
   exportDocx: 'markdown:export-docx',
   exportPdf: 'markdown:export-pdf',
   printRequest: 'markdown:print-request',
+  aiGenerateImage: 'markdown:ai-generate-image',
   getLanguage: 'app:get-language',
   languageChanged: 'app:language-changed',
   getTheme: 'app:get-theme',
   themeChanged: 'app:theme-changed',
+  getAutoSaveDefault: 'app:get-auto-save-default',
+  autoSaveDefaultChanged: 'app:auto-save-default-changed',
+  getAiPanelPrefs: 'app:get-ai-panel-prefs',
+  aiPanelPrefsChanged: 'app:ai-panel-prefs-changed',
 } as const
 
 export type UiTheme = 'light' | 'dark' | 'system'
+
+/** shell-wide AutoSave default; updatedAt is 0 until the user has ever set it */
+export interface AutoSaveDefault {
+  on: boolean
+  updatedAt: number
+}
 
 export type SaveMode = 'save' | 'saveAs'
 
 export interface SaveMarkdownRequest {
   /** full document text (frontmatter included) */
   text: string
+  /** Authored image paths in document order; the main process validates every path. */
+  imageSources: string[]
   mode: SaveMode
   /**
    * Silent first save for an untitled document (AI auto-naming): saves to a
@@ -41,20 +60,40 @@ export interface SaveMarkdownRequest {
 }
 
 export type SaveMarkdownResult =
-  { ok: true; path: string } | { ok: true; canceled: true } | { ok: false; error: string }
+  | {
+      ok: true
+      path: string
+      /** Save As may relocate local images into the new document's assets directory. */
+      imageRewrites?: Array<{ from: string; to: string }>
+    }
+  | { ok: true; canceled: true }
+  | { ok: false; error: string }
 
 /** AI channels are app-wide shared ipcMain handlers (shell registers via docs-main registerAiIpc); pass-through only */
 export const AI_CHANNELS = {
   getSettings: 'ai:get-settings',
+  gskStatus: 'ai:gsk-status',
   stream: 'ai:stream',
   streamChunk: 'ai:stream-chunk',
   streamCancel: 'ai:stream-cancel',
   webSearch: 'ai:web-search',
+  imageSearch: 'ai:image-search',
+  fetchImage: 'ai:fetch-image',
 } as const
 
 export interface WebSearchResult {
   answer?: string
   results: Array<{ title: string; url: string; snippet: string }>
+  method: string
+  /** failure reason when method === 'error' */
+  error?: string
+}
+
+export interface ImageSearchResult {
+  images: Array<{ title?: string; imageUrl: string; width?: number; height?: number }>
+  method: string
+  /** failure reason when method === 'error' */
+  error?: string
 }
 
 export type ExportFormat = 'pdf' | 'docx' | 'docs'
@@ -64,7 +103,7 @@ export interface ExportDocxRequest {
   base64: string
   /** file name (no extension) suggested in the dialog / used for the silent convert */
   suggestedName: string
-  /** 'dialog' = save dialog; 'openInDocs' = silent save next to the .md, then open in AI Docs */
+  /** 'dialog' = save dialog; 'openInDocs' = app-managed temporary copy opened in AI Docs */
   mode: 'dialog' | 'openInDocs'
 }
 
@@ -131,13 +170,29 @@ export interface MarkdownApi {
   onLanguageChanged(handler: (lang: Lang) => void): () => void
   getTheme(): Promise<UiTheme>
   onThemeChanged(handler: (theme: UiTheme) => void): () => void
+  getAutoSaveDefault(): Promise<AutoSaveDefault>
+  onAutoSaveDefaultChanged(handler: (value: AutoSaveDefault) => void): () => void
+  /** AI panel text size + chat-input spellcheck (Settings → General in the shell) */
+  getAiPanelPrefs(): Promise<AiPanelPrefs>
+  onAiPanelPrefsChanged(handler: (prefs: AiPanelPrefs) => void): () => void
   /** press on the shell chrome (tab strip is a sibling WebContentsView whose
    *  clicks produce no DOM event here) — dismiss open popovers */
   onChromePressed(handler: () => void): () => void
   getAiSettings(): Promise<AiSettings>
+  /** Genspark login state (shell-registered ai:gsk-status) — gates generate_image with the cloud-tools toggle */
+  aiGskStatus(): Promise<GenSparkAccountStatus>
   aiStream(request: AiStreamRequest): Promise<void>
   aiStreamCancel(requestId: string): Promise<void>
   onAiStream(handler: (chunk: AiStreamChunk) => void): () => void
   /** Main-process web search (Serper/DuckDuckGo via the shared ai:web-search handler) */
   webSearch(query: string, maxResults?: number): Promise<WebSearchResult>
+  /** Main-process image search (shared ai:image-search handler) */
+  imageSearch(query: string, maxResults?: number): Promise<ImageSearchResult>
+  /** Download an image URL in the main process (CORS-free, scheme/target validated) */
+  fetchImage(url: string): Promise<{ base64: string; mime: string } | null>
+  /** Genspark cloud image generation (markdown-owned channel, gsk login required) */
+  aiGenerateImage(op: { prompt: string; aspectRatio?: string }): Promise<{
+    url?: string
+    error?: string
+  }>
 }

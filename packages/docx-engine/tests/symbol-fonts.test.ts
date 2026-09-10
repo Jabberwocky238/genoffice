@@ -40,6 +40,36 @@ describe('symbol font decoding helpers', () => {
     expect(decodeSymbolChar('Wingdings 2', 0xf0a4)).toBe('□')
   })
 
+  it('maps the common Wingdings bullet, arrow and check-box glyphs', () => {
+    expect(decodeSymbolChar('Wingdings', 0xf09f)).toBe('•')
+    expect(decodeSymbolChar('Wingdings', 0xf09e)).toBe('·')
+    expect(decodeSymbolChar('Wingdings', 0xf0a8)).toBe('□')
+    expect(decodeSymbolChar('Wingdings', 0xf0d8)).toBe('➢')
+    expect(decodeSymbolChar('Wingdings', 0xf0e0)).toBe('⇨')
+    expect(decodeSymbolChar('Wingdings', 0xf0f0)).toBe('→')
+    expect(decodeSymbolChar('Wingdings', 0xf0fb)).toBe('✗')
+    expect(decodeSymbolChar('Wingdings', 0xf0fc)).toBe('✓')
+    expect(decodeSymbolChar('Wingdings', 0xf0fd)).toBe('☒')
+    expect(decodeSymbolChar('Wingdings', 0xf0fe)).toBe('☑')
+    // the one-o'clock glyph has no plain-text stand-in
+    expect(decodeSymbolChar('Wingdings', 0xf0b7)).toBeNull()
+  })
+
+  it('maps the Wingdings 2 check marks and their boxed forms', () => {
+    expect(decodeSymbolChar('Wingdings 2', 0xf04f)).toBe('✕')
+    expect(decodeSymbolChar('Wingdings 2', 0xf050)).toBe('✓')
+    expect(decodeSymbolChar('Wingdings 2', 0xf051)).toBe('☒')
+    expect(decodeSymbolChar('Wingdings 2', 0xf052)).toBe('☑')
+    expect(decodeSymbolChar('Wingdings 2', 0xf054)).toBe('☒')
+  })
+
+  it('maps Wingdings 3 triangles and Webdings solid shapes', () => {
+    expect(decodeSymbolChar('Wingdings 3', 0xf075)).toBe('▶')
+    expect(decodeSymbolChar('Wingdings 3', 0xf070)).toBe('▲')
+    expect(decodeSymbolChar('Webdings', 0xf06e)).toBe('●')
+    expect(decodeSymbolChar('Webdings', 0xf067)).toBe('■')
+  })
+
   it('normalizes raw glyph bytes to their U+F0xx form', () => {
     expect(toSymbolPua('l')).toBe('\uF06C')
     expect(toSymbolPua('·')).toBe('\uF0B7')
@@ -59,6 +89,15 @@ describe('symbol runs in document.xml', () => {
     expect(doc.blocks[0].runs!.map((r) => r.text).join('')).toBe('勾:✓●')
   })
 
+  it('renders a Wingdings 2 boxed X check box from w:sym', async () => {
+    const bytes = await buildDocx({
+      bodyXml:
+        '<w:p><w:r><w:t>New</w:t></w:r><w:r><w:sym w:font="Wingdings 2" w:char="F054"/></w:r></w:p>',
+    })
+    const doc = await parseDocx(bytes)
+    expect(doc.blocks[0].runs!.map((r) => r.text).join('')).toBe('New☒')
+  })
+
   it('keeps unknown w:sym glyphs as private-use characters', async () => {
     const bytes = await buildDocx({
       bodyXml: '<w:p><w:r><w:sym w:font="Wingdings 2" w:char="F045"/></w:r></w:p>',
@@ -71,7 +110,7 @@ describe('symbol runs in document.xml', () => {
     const bytes = await buildDocx({
       bodyXml:
         '<w:p><w:r><w:rPr><w:rFonts w:ascii="Symbol" w:hAnsi="Symbol"/></w:rPr><w:t>&#xF0B7;</w:t></w:r>' +
-        '<w:r><w:t> 后文</w:t></w:r></w:p>',
+        '<w:r><w:t xml:space="preserve"> 后文</w:t></w:r></w:p>',
     })
     const doc = await parseDocx(bytes)
     const run = doc.blocks[0].runs![0]

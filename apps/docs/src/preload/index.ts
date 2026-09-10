@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type { IpcRendererEvent } from 'electron'
+import type { AiPanelPrefs } from '@genoffice/ui'
 import type {
   AiChatRequest,
   AiSettings,
@@ -7,9 +8,11 @@ import type {
   AiStreamRequest,
   DesktopApi,
   MenuCommand,
+  AutoSaveDefault,
   UiTheme,
 } from '../shared/ipc'
 import type { ProjectApi } from '@genoffice/project-store'
+import { installDropOpenBridge } from '@genoffice/electron-utils/drop-open'
 
 const api: DesktopApi = {
   getLanguage: () => ipcRenderer.invoke('app:get-language'),
@@ -27,6 +30,18 @@ const api: DesktopApi = {
     ipcRenderer.on('app:theme-changed', listener)
     return () => ipcRenderer.removeListener('app:theme-changed', listener)
   },
+  getAutoSaveDefault: () => ipcRenderer.invoke('app:get-auto-save-default'),
+  onAutoSaveDefaultChanged: (handler) => {
+    const listener = (_event: IpcRendererEvent, value: AutoSaveDefault) => handler(value)
+    ipcRenderer.on('app:auto-save-default-changed', listener)
+    return () => ipcRenderer.removeListener('app:auto-save-default-changed', listener)
+  },
+  getAiPanelPrefs: () => ipcRenderer.invoke('app:get-ai-panel-prefs'),
+  onAiPanelPrefsChanged: (handler) => {
+    const listener = (_event: IpcRendererEvent, prefs: AiPanelPrefs) => handler(prefs)
+    ipcRenderer.on('app:ai-panel-prefs-changed', listener)
+    return () => ipcRenderer.removeListener('app:ai-panel-prefs-changed', listener)
+  },
   onChromePressed: (handler) => {
     const listener = () => handler()
     ipcRenderer.on('app:chrome-pressed', listener)
@@ -34,8 +49,22 @@ const api: DesktopApi = {
   },
   openDocx: () => ipcRenderer.invoke('docs:open'),
   openDocxPath: (path: string) => ipcRenderer.invoke('docs:open-path', path),
+  openDocxDecrypt: (path: string, password: string) =>
+    ipcRenderer.invoke('docs:open-decrypt', path, password),
+  setDocPassword: (filePath: string | null, password: string | null) =>
+    ipcRenderer.invoke('docs:set-password', filePath, password),
+  docPasswordIntentRevision: async () => {
+    const revision: unknown = await ipcRenderer.invoke('docs:password-intent-revision')
+    return typeof revision === 'number' && Number.isSafeInteger(revision) && revision >= 0
+      ? revision
+      : 0
+  },
+  discardDocPasswordIntents: (throughRevision: number) =>
+    ipcRenderer.invoke('docs:discard-password-intents', throughRevision),
   consumePendingOpenDocx: () => ipcRenderer.invoke('docs:consume-pending-open'),
   consumeNewBlankDoc: () => ipcRenderer.invoke('docs:consume-new-blank'),
+  consumeAiDocContent: () => ipcRenderer.invoke('docs:consume-ai-doc-content'),
+  createDocument: (request) => ipcRenderer.invoke('docs:create-document', request),
   onOpenDocx: (handler) => {
     const listener = (_event: IpcRendererEvent, result: Parameters<typeof handler>[0]) =>
       handler(result)
@@ -57,22 +86,34 @@ const api: DesktopApi = {
     ipcRenderer.on('docs:teardown', listener)
     return () => ipcRenderer.removeListener('docs:teardown', listener)
   },
-  saveDocxAs: (defaultName: string, data: ArrayBuffer) =>
-    ipcRenderer.invoke('docs:save-as', defaultName, data),
+  respellKick: () => ipcRenderer.invoke('docs:respell-kick'),
+  saveDocxAs: (defaultName: string, data: ArrayBuffer, sourcePath?: string | null) =>
+    ipcRenderer.invoke('docs:save-as', defaultName, data, sourcePath ?? null),
   saveDocxNew: (defaultName: string, data: ArrayBuffer) =>
     ipcRenderer.invoke('docs:save-new', defaultName, data),
   getRecentFiles: () => ipcRenderer.invoke('docs:recent'),
   pickImage: () => ipcRenderer.invoke('docs:pick-image'),
   fontMetrics: (family: string) => ipcRenderer.invoke('docs:font-metrics', family),
-  print: () => ipcRenderer.invoke('docs:print'),
+  print: (scale?: number) => ipcRenderer.invoke('docs:print', scale),
   exportPdf: (
     defaultName: string,
     pageWidthTwips: number,
     pageHeightTwips: number,
     outPath?: string,
-  ) => ipcRenderer.invoke('docs:export-pdf', defaultName, pageWidthTwips, pageHeightTwips, outPath),
-  printPdfBuffer: (pageWidthTwips: number, pageHeightTwips: number) =>
-    ipcRenderer.invoke('docs:print-pdf-buffer', pageWidthTwips, pageHeightTwips),
+    scale?: number,
+  ) =>
+    ipcRenderer.invoke(
+      'docs:export-pdf',
+      defaultName,
+      pageWidthTwips,
+      pageHeightTwips,
+      outPath,
+      scale,
+    ),
+  exportHtml: (defaultName: string, html: string, outPath?: string) =>
+    ipcRenderer.invoke('docs:export-html', defaultName, html, outPath),
+  printPdfBuffer: (pageWidthTwips: number, pageHeightTwips: number, scale?: number) =>
+    ipcRenderer.invoke('docs:print-pdf-buffer', pageWidthTwips, pageHeightTwips, scale),
   saveMergedPdf: (defaultName: string, base64Parts: string[], outPath?: string) =>
     ipcRenderer.invoke('docs:save-merged-pdf', defaultName, base64Parts, outPath),
   getAiSettings: () => ipcRenderer.invoke('ai:get-settings'),
@@ -87,10 +128,14 @@ const api: DesktopApi = {
   imageSearch: (query: string, maxResults?: number) =>
     ipcRenderer.invoke('ai:image-search', query, maxResults),
   fetchImage: (url: string) => ipcRenderer.invoke('ai:fetch-image', url),
+  aiGenerateImage: (op: { prompt: string; aspectRatio?: string }) =>
+    ipcRenderer.invoke('docs:ai-generate-image', op),
   pickAttachments: () => ipcRenderer.invoke('files:pick'),
   addAttachmentPaths: (paths: string[]) => ipcRenderer.invoke('files:add', paths),
   addPastedImage: (data: ArrayBuffer, ext: string) =>
     ipcRenderer.invoke('files:add-pasted-image', data, ext),
+  copyImageToClipboard: (dataUrl: string, metaJson?: string) =>
+    ipcRenderer.invoke('docs:copy-image-to-clipboard', dataUrl, metaJson),
   readAttachment: (path: string, offset: number, maxChars: number) =>
     ipcRenderer.invoke('files:read', path, offset, maxChars),
   readAttachmentImage: (path: string) => ipcRenderer.invoke('files:read-image', path),
@@ -149,3 +194,6 @@ const projectApi: ProjectApi = {
 
 contextBridge.exposeInMainWorld('desktop', api)
 contextBridge.exposeInMainWorld('projectApi', projectApi)
+
+// open documents dragged from the OS onto this tab as a new shell tab
+installDropOpenBridge()

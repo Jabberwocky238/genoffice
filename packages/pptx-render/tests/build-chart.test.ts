@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import type { ChartModel } from '@genoffice/pptx-engine'
 import { buildChartNode } from '../src/build-chart'
 import { HeuristicMetrics } from '../src/metrics'
-import { makeViewport } from '../src/coords'
+import { makeViewport, ptToPx } from '../src/coords'
 
 const vp = makeViewport({ cx: 12192000, cy: 6858000 }, 1280)
 const metrics = new HeuristicMetrics()
@@ -72,6 +72,28 @@ describe('buildChartNode', () => {
     expect(s2[0]!.x).toBeGreaterThanOrEqual(s1[0]!.x + s1[0]!.w - 0.01)
     // Larger values give taller bars (smaller y)
     expect(s1[1]!.y).toBeLessThan(s1[0]!.y)
+  })
+
+  it('negative overlap spreads clustered bars apart; positive overlap tucks them together', () => {
+    const base: ChartModel = {
+      kind: 'bar',
+      barDir: 'col',
+      grouping: 'clustered',
+      gapWidthPct: 76,
+      categories: ['a'],
+      series: [
+        { name: 's1', color: '#111111', values: [-0.7] },
+        { name: 's2', color: '#222222', values: [-1.0] },
+      ],
+    }
+    const flat = buildChartNode('r_o0', 'el', base, box, vp, metrics)!
+    const spread = buildChartNode('r_o1', 'el', { ...base, overlapPct: -95 }, box, vp, metrics)!
+    // overlap -95: adjacent series sit 1.95 bar-widths apart, so bars must shrink
+    expect(spread.bars[0]!.w).toBeLessThan(flat.bars[0]!.w * 0.75)
+    const gapPx = spread.bars[1]!.x - (spread.bars[0]!.x + spread.bars[0]!.w)
+    expect(gapPx).toBeCloseTo(spread.bars[0]!.w * 0.95, 0)
+    // all-negative data with autoZero: bars hang from the zero line (same top edge)
+    expect(spread.bars[0]!.y).toBeCloseTo(spread.bars[1]!.y, 1)
   })
 
   it('builds bar+line combo: bar series as bars, line series as overlaid polyline', () => {
@@ -189,6 +211,50 @@ describe('buildChartNode', () => {
     // 25/75 split
     const [h1, h2] = node.bars.map((b) => b.h).sort((a, b) => a - b)
     expect(h2! / h1!).toBeCloseTo(3, 1)
+  })
+
+  it('outline-only pie points carry noFill + per-point stroke; legend swatch takes the outline color', () => {
+    const pie: ChartModel = {
+      kind: 'pie',
+      categories: ['x', 'y', 'z'],
+      series: [
+        {
+          values: [1, 1, 2],
+          pointNoFill: [true, undefined, true],
+          pointLines: [{ color: '#AA0000', widthPt: 1.5 }, { color: null }, undefined],
+        },
+      ],
+      legendPos: 'r',
+    }
+    const node = buildChartNode('r_pie2', 'el', pie, box, vp, metrics)!
+    const [w0, w1, w2] = node.wedges!
+    expect(w0).toMatchObject({
+      noFill: true,
+      stroke: '#AA0000',
+      strokeWidthPx: ptToPx(1.5, vp.scale),
+    })
+    expect(w1!.noFill).toBeUndefined()
+    expect(w1!.strokeWidthPx).toBe(0)
+    expect(w1!.stroke).toBeUndefined()
+    expect(w2).toMatchObject({ noFill: true })
+    expect(w2!.stroke).toBeUndefined()
+    expect(node.swatches[0]!.color).toBe('#AA0000')
+
+    // Pseudo-3D: top faces follow the same semantics, outline-only points grow no rim
+    const node3d = buildChartNode('r_pie3', 'el', { ...pie, pseudo3D: true }, box, vp, metrics)!
+    expect(node3d.wedges).toHaveLength(0)
+    // rims are pushed first, then one top face per point
+    const faces = node3d.paths!.slice(-3)
+    expect(faces[0]).toMatchObject({
+      fill: 'transparent',
+      stroke: '#AA0000',
+      strokeWidthPx: ptToPx(1.5, vp.scale),
+    })
+    expect(faces[1]!.fill).not.toBe('transparent')
+    expect(faces[1]!.stroke).toBeUndefined()
+    expect(faces[2]).toMatchObject({ fill: 'transparent', stroke: '#ffffff' })
+    // rims exist only for the filled point
+    expect(node3d.paths!.length - faces.length).toBeGreaterThan(0)
   })
 
   it('builds pie wedges summing to 360° with per-point colors', () => {
@@ -316,6 +382,31 @@ describe('buildChartNode', () => {
     }
   })
 
+  it('horizontal bar honors the manual inner plot layout (labels stay in the reserved strip)', () => {
+    const model: ChartModel = {
+      kind: 'bar',
+      barDir: 'bar',
+      grouping: 'clustered',
+      categories: ['Alpha', 'Beta'],
+      series: [{ name: 's1', color: '#111111', values: [10, 30] }],
+      // Deck-authored inner rect: decks place hbar frames partly off-slide and
+      // rely on this for what stays visible
+      plotLayout: { x: 0.2, y: 0.05, w: 0.7, h: 0.8 },
+    }
+    const node = buildChartNode('r_hl', 'elhl', model, box, vp, metrics)!
+    for (const b of node.bars) {
+      expect(b.x).toBeCloseTo(0.2 * box.w, 5) // bars start at the manual plot left edge
+      expect(b.x + b.w).toBeLessThanOrEqual(0.9 * box.w + 1)
+    }
+    // Category labels sit inside the reserved left strip, right-aligned to the plot
+    const cats = node.labels.filter((l) => l.text === 'Alpha' || l.text === 'Beta')
+    expect(cats).toHaveLength(2)
+    for (const l of cats) {
+      expect(l.x).toBeGreaterThanOrEqual(0)
+      expect(l.x).toBeLessThan(0.2 * box.w)
+    }
+  })
+
   it('horizontal bar reversed (orientation maxMin): first category on top', () => {
     const model: ChartModel = {
       kind: 'bar',
@@ -327,6 +418,56 @@ describe('buildChartNode', () => {
     const node = buildChartNode('r_h2', 'elh2', model, box, vp, metrics)!
     const [b1, b2] = node.bars
     expect(b1!.y).toBeLessThan(b2!.y)
+  })
+
+  it('doughnut honors the manual inner plot rect and skips the 4mm ring on it', () => {
+    const model: ChartModel = {
+      kind: 'pie',
+      holePct: 50,
+      categories: ['A', 'B', 'C'],
+      series: [{ values: [8, 2, 2] }],
+      legendPos: 'b',
+      // the title must not shrink/shift the frame the manual rect measures against
+      title: 'Chart title',
+      plotLayout: { x: 0.2, y: 0.05, w: 0.5, h: 0.5 },
+    }
+    const node = buildChartNode('r_d', 'eld', model, box, vp, metrics)!
+    expect(node.wedges!.length).toBe(3)
+    const w0 = node.wedges![0]!
+    // Center = manual rect center; radius = half the rect's short side (no ring shrink)
+    expect(w0.cx).toBeCloseTo((0.2 + 0.25) * box.w, 3)
+    expect(w0.cy).toBeCloseTo((0.05 + 0.25) * box.h, 3)
+    expect(w0.outerR).toBeCloseTo(Math.min(0.5 * box.w, 0.5 * box.h) / 2, 3)
+  })
+
+  it('legend flows one entry per row inside a too-narrow manual rect, RTL rows right-aligned', () => {
+    const model: ChartModel = {
+      kind: 'pie',
+      categories: [
+        'first long legend entry text',
+        'second long legend entry text',
+        'third long legend entry text',
+      ],
+      series: [{ values: [5, 3, 2] }],
+      legendPos: 'b',
+      plotLayout: { x: 0.2, y: 0.05, w: 0.5, h: 0.5 },
+      legendLayout: { x: 0.05, xMode: 'edge', y: 0.6, yMode: 'edge', w: 0.3, h: 0.35 },
+      legendRtl: true,
+    }
+    const node = buildChartNode('r_dl', 'eldl', model, box, vp, metrics)!
+    const rows = node.labels.filter((l) => String(l.text).includes('legend entry'))
+    expect(rows).toHaveLength(3)
+    const ys = rows.map((l) => l.y)
+    expect(new Set(ys).size).toBe(3) // one row each
+    // right-aligned to the rect's right edge: every row ends at x + width ~= rect right
+    for (const l of rows) {
+      expect(l.x).toBeGreaterThanOrEqual(0.05 * box.w - 1)
+    }
+    // RTL: each row's swatch sits right of its text start
+    for (const swatch of node.swatches) {
+      const row = rows.find((l) => Math.abs(l.y - swatch.y + 0) < 20)!
+      expect(swatch.x).toBeGreaterThan(row.x)
+    }
   })
 
   it('builds scatter: positioned by two value axes, lineMarker draws points and lines by default', () => {
@@ -577,6 +718,24 @@ describe('chart wave2: palette idx colors, multi-level cats, barH hidden labels'
     expect(ca.y).toBeGreaterThan(leaf.y)
   })
 
+  it('reversed category axis (maxMin) mirrors the group label spans', () => {
+    const m: ChartModel = {
+      kind: 'bar',
+      categories: ['SF', 'LA', 'NY', 'Albany'],
+      series: [{ values: [1, 2, 3, 4] }],
+      catAxis: { reversed: true },
+      categoryGroups: [
+        { label: 'CA', start: 0 },
+        { label: 'NY2', start: 2 },
+      ],
+    } as any
+    const node = buildChartNode('r_1', 'el1', m, box, vp, metrics)!
+    const ca = node.labels.find((l) => l.text === 'CA')!
+    const ny = node.labels.find((l) => l.text === 'NY2')!
+    // categories render right-to-left, so CA's span now sits on the right
+    expect(ca.x).toBeGreaterThan(ny.x)
+  })
+
   it('barH with tickLblPos none draws no category labels', () => {
     const m: ChartModel = {
       kind: 'bar',
@@ -597,5 +756,248 @@ describe('legend swatch metrics (PowerPoint ~0.5em squares)', () => {
       expect(sw.w).toBeLessThan(20)
       expect(Math.abs(sw.w - sw.h)).toBeLessThan(1)
     }
+  })
+})
+
+describe('buildBar3DNode (c:bar3DChart true 3D stage)', () => {
+  const bar3DModel: ChartModel = {
+    kind: 'bar',
+    grouping: 'standard',
+    categories: ['C1', 'C2', 'C3', 'C4'],
+    series: [
+      { name: 'S1', values: [4.3, 2.5, 3.5, 4.5] },
+      { name: 'S2', values: [2.4, 4.4, 1.8, 2.8] },
+      { name: 'S3', values: [2, 2, 3, 5] },
+    ],
+    legendPos: 'r',
+    bar3D: { rotX: 15, rotY: 20, depthPct: 100, rAngAx: true, gapDepthPct: 150, serAxLabels: true },
+  }
+
+  it('draws three faces per bar in painter order (back series first)', () => {
+    const node = buildChartNode('r3d', 'e3d', bar3DModel, box, vp, metrics)!
+    // 12 bars × 3 faces (top/right/front)
+    expect(node.paths!.length).toBe(36)
+    // front face of the first-emitted (back row, series 3) bar is the series-3 palette color
+    expect(node.paths![2]!.fill).toBe('#A5A5A5')
+  })
+
+  it('3D value axis snaps to the data ceiling without headroom (max 5, not 6)', () => {
+    const node = buildChartNode('r3d2', 'e3d2', bar3DModel, box, vp, metrics)!
+    const tickTexts = node.labels.filter((l) => /^\d+$/.test(l.text)).map((l) => l.text)
+    expect(tickTexts).toContain('5')
+    expect(tickTexts).not.toContain('6')
+  })
+
+  it('labels series names along the depth axis and categories along the leaning front edge', () => {
+    const node = buildChartNode('r3d3', 'e3d3', bar3DModel, box, vp, metrics)!
+    // series names appear twice: legend + depth axis
+    expect(node.labels.filter((l) => l.text === 'S2').length).toBe(2)
+    const c1 = node.labels.find((l) => l.text === 'C1')!
+    const c4 = node.labels.find((l) => l.text === 'C4')!
+    expect(c4.y).toBeGreaterThan(c1.y) // category axis leans down to the right
+  })
+
+  it('stacked 3D bars stay on the pseudo-3D path (no depth stage)', () => {
+    const stacked = { ...bar3DModel, grouping: 'stacked' as const }
+    const node = buildChartNode('r3d4', 'e3d4', stacked, box, vp, metrics)!
+    expect(node.bars.length).toBeGreaterThan(0) // classic bars, not projected paths
+  })
+})
+
+describe('buildArea3DNode (c:area3DChart true 3D stage)', () => {
+  const area3DModel: ChartModel = {
+    kind: 'area',
+    grouping: 'standard',
+    categories: ['', '', '', '', ''],
+    series: [
+      { name: 'Series 1', values: [32, 28, 12, 15, 28] },
+      { name: 'Series 2', values: [12, 12, 18, 24, 28] },
+    ],
+    area3D: { rotX: 15, rotY: 20, gapDepthPct: 150, serAxLabels: false },
+  }
+
+  it('standard grouping extrudes one ribbon per series, back row first', () => {
+    const node = buildChartNode('a3d', 'ea3d', area3DModel, box, vp, metrics)!
+    // per series: 4 roof segments + 1 end cap + 1 front silhouette
+    expect(node.paths!.length).toBe(12)
+    // back row (series 2) emits first; its front silhouette is the series-2 palette color
+    expect(node.paths![5]!.fill).toBe('#ED7D31')
+    expect(node.paths![11]!.fill).toBe('#4472C4')
+  })
+
+  it('stacked grouping piles all series into a single ribbon with one exposed roof', () => {
+    const stacked = { ...area3DModel, grouping: 'stacked' as const }
+    const node = buildChartNode('a3d2', 'ea3d2', stacked, box, vp, metrics)!
+    // 2 front bands + 2 end caps + 4 roof segments (topmost series only)
+    expect(node.paths!.length).toBe(8)
+  })
+
+  it('3D value axis snaps to the data ceiling without headroom and thins ticks to the stage height', () => {
+    const node = buildChartNode('a3d3', 'ea3d3', area3DModel, box, vp, metrics)!
+    const tickTexts = node.labels.map((l) => l.text)
+    expect(tickTexts).toContain('40')
+    expect(tickTexts).not.toContain('50')
+  })
+
+  it('percentStacked pins the axis to 0-100%', () => {
+    const pct = { ...area3DModel, grouping: 'percentStacked' as const }
+    const node = buildChartNode('a3d4', 'ea3d4', pct, box, vp, metrics)!
+    expect(node.labels.some((l) => l.text === '100%')).toBe(true)
+  })
+})
+
+// ── Plot-area geometry & axis calibration (PPT-measured, python-pptx/aspose corpus) ──
+
+describe('axis calibration', () => {
+  const negModel: ChartModel = {
+    kind: 'bar',
+    barDir: 'col',
+    grouping: 'clustered',
+    categories: ['C1', 'C2'],
+    series: [{ name: 'A', values: [-4, 5] }],
+    valAxis: { gridColor: '#E6E6E6' },
+  }
+
+  it('reversed value axis flips the mapping (maxMin: min renders at the top)', () => {
+    const normal = buildChartNode('n', 'e', negModel, box, vp, metrics)!
+    const reversed = buildChartNode(
+      'r',
+      'e',
+      { ...negModel, valAxis: { reversed: true } },
+      box,
+      vp,
+      metrics,
+    )!
+    const yNormal = normal.bars.map((b) => b.y)
+    const yReversed = reversed.bars.map((b) => b.y)
+    // The negative bar hangs below the zero line normally, above it when reversed
+    expect(yNormal[0]!).toBeGreaterThan(yNormal[1]!)
+    expect(yReversed[0]!).toBeLessThan(yReversed[1]!)
+    // Bar rects keep their real extent under the flipped mapping (Bugbot: h collapsed to 0.5)
+    for (const b of [...normal.bars, ...reversed.bars]) expect(b.h).toBeGreaterThan(20)
+  })
+
+  it('a range spanning zero puts the category axis and its labels at the zero line', () => {
+    const node = buildChartNode('z', 'e', negModel, box, vp, metrics)!
+    const xAxis = node.axisLines[0]!
+    // zero sits strictly inside the plot, not at its bottom
+    const plotBottom = Math.max(...node.gridLines.map((g) => g.y1))
+    expect(xAxis.y1).toBeLessThan(plotBottom - 10)
+    // category labels hug the axis line, not the frame bottom
+    const cat = node.labels.find((l) => l.text === 'C1')!
+    expect(Math.abs(cat.y - xAxis.y1)).toBeLessThan(30)
+  })
+
+  it('explicit majorUnit/minorUnit drive tick spacing and minor subdivision', () => {
+    const model: ChartModel = {
+      kind: 'line',
+      categories: ['a', 'b'],
+      series: [{ name: 'A', values: [1, 14] }],
+      valAxis: {
+        min: -2,
+        max: 15,
+        majorUnit: 2,
+        minorUnit: 0.5,
+        gridColor: '#0000FF',
+        minorGridColor: '#FF0000',
+      },
+    }
+    const node = buildChartNode('u', 'e', model, box, vp, metrics)!
+    const majors = node.gridLines.filter((g) => g.color === '#0000FF')
+    const minors = node.gridLines.filter((g) => g.color === '#FF0000')
+    // ticks -2..14 step 2 → 9 majors; minor slots k=1..33 minus the 8 major-coincident ones
+    expect(majors).toHaveLength(9)
+    expect(minors.length).toBe(25)
+  })
+
+  it('no-style-part charts default to the dark PPT gridline grays', () => {
+    const model: ChartModel = {
+      kind: 'line',
+      categories: ['a', 'b'],
+      series: [{ name: 'A', values: [1, 4] }],
+      valAxis: { gridColor: '#E6E6E6', gridColorAuto: true, minorGridAuto: true },
+    }
+    const node = buildChartNode('g', 'e', model, box, vp, metrics)!
+    expect(node.gridLines.some((g) => g.color === '#868686')).toBe(true)
+    expect(node.gridLines.some((g) => g.color === '#B7B7B7')).toBe(true)
+    // with a style part, the explicit-ish default stays light and minors stay hidden
+    const styled = buildChartNode('g2', 'e', { ...model, hasStylePart: true }, box, vp, metrics)!
+    expect(styled.gridLines.every((g) => g.color === '#E6E6E6')).toBe(true)
+  })
+
+  it('overlay axis titles reserve no plot space', () => {
+    const base: ChartModel = {
+      kind: 'line',
+      categories: ['a', 'b'],
+      series: [{ name: 'A', values: [1, 4] }],
+      valAxis: { title: 'Primary', gridColor: '#E6E6E6' },
+    }
+    const reserved = buildChartNode('t1', 'e', base, box, vp, metrics)!
+    const overlay = buildChartNode(
+      't2',
+      'e',
+      { ...base, valAxis: { title: 'Primary', titleOverlay: true, gridColor: '#E6E6E6' } },
+      box,
+      vp,
+      metrics,
+    )!
+    const left = (n: typeof reserved) => Math.min(...n.gridLines.map((g) => g.x1))
+    expect(left(overlay)).toBeLessThan(left(reserved) - 10)
+  })
+
+  it('garbage-baseline tick labels reserve a formatted-zero slot, not the full label width', () => {
+    // Aspose INT_MIN baseline (ChartEntities measured): nothing draws, but PowerPoint
+    // keeps a slot ≈ the formatted zero plus the top half-label headroom
+    const base: ChartModel = {
+      kind: 'line',
+      categories: ['a', 'b'],
+      series: [{ name: 'A', values: [1, 14] }],
+      valAxis: { min: -2, max: 15, majorUnit: 2, numFmt: '0.0%', gridColor: '#E6E6E6' },
+    }
+    const normal = buildChartNode('n', 'e', base, box, vp, metrics)!
+    const garbage = buildChartNode(
+      'g',
+      'e',
+      { ...base, valAxis: { ...base.valAxis, tickLblGarbage: true } },
+      box,
+      vp,
+      metrics,
+    )!
+    const left = (n: typeof normal) => Math.min(...n.gridLines.map((g) => g.x1))
+    const top = (n: typeof normal) => Math.min(...n.gridLines.map((g) => Math.min(g.y1, g.y2)))
+    // narrower than the real labels ("1400.0%") but wider than no reserve at all
+    expect(left(garbage)).toBeLessThan(left(normal) - 5)
+    expect(left(garbage)).toBeGreaterThan(40)
+    // headroom kept: same plot top as with drawn labels
+    expect(Math.abs(top(garbage) - top(normal))).toBeLessThan(1)
+    expect(garbage.labels.every((l) => !/%$/.test(l.text))).toBe(true)
+  })
+
+  it('value tick labels honor the axis numFmt', () => {
+    const model: ChartModel = {
+      kind: 'line',
+      categories: ['a', 'b'],
+      series: [{ name: 'A', values: [0.2, 0.8] }],
+      valAxis: { numFmt: '0%' },
+    }
+    const node = buildChartNode('f', 'e', model, box, vp, metrics)!
+    expect(node.labels.some((l) => /%$/.test(l.text))).toBe(true)
+  })
+
+  it('pure line charts stack in stacked/percentStacked grouping', () => {
+    const model: ChartModel = {
+      kind: 'line',
+      grouping: 'stacked',
+      categories: ['a', 'b'],
+      series: [
+        { name: 'A', values: [2, 3] },
+        { name: 'B', values: [4, 5] },
+      ],
+    }
+    const node = buildChartNode('ls', 'e', model, box, vp, metrics)!
+    // series B draws at the cumulative value (6/8), so its axis shows ticks up to 8
+    expect(node.labels.some((l) => l.text === '8')).toBe(true)
+    const [a, b] = node.polylines
+    expect(b!.points[1]!).toBeLessThan(a!.points[1]!)
   })
 })

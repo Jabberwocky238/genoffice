@@ -80,7 +80,7 @@
 .ai-settings-form input:focus,
 .ai-settings-form select:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 2px rgb(35 103 236 / 12%);
+  box-shadow: 0 0 0 2px var(--accent-soft);
 }
 
 .ai-settings-loading {
@@ -108,12 +108,12 @@
 
 .ai-settings-modal .primary-btn {
   border: 1px solid var(--accent);
-  background: var(--accent);
-  color: #fff;
+  background: var(--color-btn-primary);
+  color: var(--color-btn-primary-text);
 }
 
 .ai-settings-modal .primary-btn:hover:not(:disabled) {
-  background: var(--accent-hover);
+  background: var(--color-btn-primary-hover);
 }
 
 .ai-settings-modal .primary-btn:disabled {

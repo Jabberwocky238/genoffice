@@ -1,5 +1,8 @@
+import { CellValueType } from '@univerjs/core'
+
 import type {
   WorkbookCellEdit,
+  WorkbookBulkConstantFill,
   WorkbookChartEdit,
   WorkbookHyperlinkEdit,
   WorkbookRichRun,
@@ -14,8 +17,10 @@ import type {
 } from '../shared/desktop-api'
 import { columnLabel, parseRange } from '../domain/cell-address'
 import { splitSheetRef } from '../domain/chart-visual'
+import { CHART_CATEGORY_WIRE_MAX, CHART_TEXT_WIRE_MAX } from '../shared/desktop-api'
 import { ADDABLE_SHAPE_TYPES } from '../shared/shape-types'
 import { INDENT_STEP_PX } from './selection-format'
+import type { SharedFormulaResolver } from './shared-formula-journal'
 
 /// Tracks the user's cell edits on a streamed external workbook. Streaming
 /// evicts and re-installs viewport cells, so the journal is both the save
@@ -34,6 +39,12 @@ export interface JournalEntry {
   /// any remaining `style` delta applies.
   readonly styleReset?: boolean
 }
+
+interface JournalBulkConstantFill extends WorkbookBulkConstantFill {
+  readonly journalId: number
+}
+
+let bulkConstantFillSequence = 0
 
 /// alignment/@textRotation → Univer tr: 1-90 counter-clockwise, 91-180
 /// encodes clockwise as 90+deg, 255 is vertically stacked; 0 clears.
@@ -82,6 +93,14 @@ export type StructuralJournalOp =
       readonly hidden: boolean
     }
   | {
+      readonly kind: 'set-col-style'
+      readonly start: number
+      readonly end: number
+      /// Column default format (Excel select-all semantics): new cells in the
+      /// span inherit it at any row after reopen (alpha ledger r124).
+      readonly style: WorkbookStyleEdit
+    }
+  | {
       readonly kind: 'set-rows-outline' | 'set-cols-outline'
       readonly start: number
       readonly end: number
@@ -110,6 +129,9 @@ export interface SheetJournal {
 
 export interface EditJournal {
   readonly cells: Map<string, Map<string, JournalEntry>>
+  /// Constant range fills stay declarative so whole-column AI operations do
+  /// not allocate one JournalEntry (and one save object) per cell.
+  readonly bulkConstantFills: Map<string, JournalBulkConstantFill[]>
   /// Ordered per sheet; cell entries are kept in post-operation coordinates.
   readonly structuralOps: Map<string, StructuralJournalOp[]>
   /// Keyed by chart part path; successive edits to one chart merge.
@@ -202,6 +224,10 @@ export interface PageSetupJournalState {
   printGridlines?: boolean
   printHeadings?: boolean
   showGridlines?: boolean
+  /// sheetView/@zoomScale (10-400): normal-view zoom percent. Excel persists
+  /// zoom in the file; unjournaled, the post-save session reload snapped the
+  /// view back to the file's stored zoom (alpha r165).
+  zoomScale?: number
   /// sheetView/@showFormulas: the sheet renders formulas instead of values.
   showFormulas?: boolean
   /// sheetView/@showRowColHeaders: row/column heading strips.
@@ -232,6 +258,7 @@ interface CellRange {
 export function createEditJournal(): EditJournal {
   return {
     cells: new Map(),
+    bulkConstantFills: new Map(),
     structuralOps: new Map(),
     chartEdits: new Map(),
     visualAdds: [],
@@ -420,6 +447,21 @@ export function recordSheetDuplicate(
   if (sourceCells && sourceCells.size > 0) {
     journal.cells.set(sheetId, new Map(sourceCells))
   }
+  const sourceFills = journal.bulkConstantFills.get(sourceSheetId)
+  if (sourceFills && sourceFills.length > 0) {
+    const copiedIds = new Map<number, number>()
+    journal.bulkConstantFills.set(
+      sheetId,
+      sourceFills.map((fill) => {
+        let journalId = copiedIds.get(fill.journalId)
+        if (journalId === undefined) {
+          journalId = ++bulkConstantFillSequence
+          copiedIds.set(fill.journalId, journalId)
+        }
+        return { ...fill, sheetId, journalId }
+      }),
+    )
+  }
   const sourceLinks = journal.hyperlinks.get(sourceSheetId)
   if (sourceLinks && sourceLinks.size > 0) {
     journal.hyperlinks.set(sheetId, new Map(sourceLinks))
@@ -451,7 +493,10 @@ export function recordSheetRename(
 ): void {
   const added = journal.sheets.added.get(sheetId)
   if (added) {
-    journal.sheets.added.set(sheetId, { name })
+    // Keep the duplicate provenance: dropping sourceSheetId here made a
+    // renamed copy save as a BLANK added sheet (duplicate_sheet with a name
+    // renames immediately, so the copied part silently lost all content).
+    journal.sheets.added.set(sheetId, { ...added, name })
     return
   }
   if (name === originalName) journal.sheets.renamed.delete(sheetId)
@@ -661,10 +706,27 @@ export function removeTableAdd(journal: EditJournal, sheetId: string, name: stri
 /// Session pivot adds for the save request; pivots whose output or source
 /// sheet was removed drop.
 export function toSavePivotAdds(journal: EditJournal): WorkbookPivotAdd[] {
-  return journal.pivotAdds.filter(
-    (pivot) =>
-      !isSheetRemoved(journal, pivot.sheetId) && !isSheetRemoved(journal, pivot.sourceSheetId),
-  )
+  // Field names and item captions are cell texts; the wire schema caps them
+  // at 255 (Excel's pivot caption limit), so truncate rather than fail.
+  const clampCaptions = (items: readonly string[]): string[] =>
+    items.map((item) => clampWireText(item, 255))
+  return journal.pivotAdds
+    .filter(
+      (pivot) =>
+        !isSheetRemoved(journal, pivot.sheetId) && !isSheetRemoved(journal, pivot.sourceSheetId),
+    )
+    .map((pivot) => ({
+      ...pivot,
+      fieldNames: clampCaptions(pivot.fieldNames),
+      rowItems: clampCaptions(pivot.rowItems),
+      ...(pivot.rowLevelItems === undefined
+        ? {}
+        : { rowLevelItems: pivot.rowLevelItems.map(clampCaptions) }),
+      ...(pivot.columnItems === undefined ? {} : { columnItems: clampCaptions(pivot.columnItems) }),
+      ...(pivot.colLevelItems === undefined
+        ? {}
+        : { colLevelItems: pivot.colLevelItems.map(clampCaptions) }),
+    }))
 }
 
 export function recordVisualAdd(journal: EditJournal, visual: WorkbookVisualObject): void {
@@ -677,6 +739,8 @@ export interface VisualEditEntry {
   readonly drawingIndex: number
   readonly remove?: true
   readonly anchor?: WorkbookVisualObject['anchor']
+  /// New xfrm ext in EMU (a rotated shape resized through its AABB).
+  readonly frameSize?: { readonly width: number; readonly height: number }
 }
 
 /// Records a move/resize or removal of a visual that already lives in the
@@ -685,19 +749,25 @@ export interface VisualEditEntry {
 export function recordVisualEdit(
   journal: EditJournal,
   visual: WorkbookVisualObject,
-  changes: { remove?: true; anchor?: WorkbookVisualObject['anchor'] },
+  changes: {
+    remove?: true
+    anchor?: WorkbookVisualObject['anchor']
+    frameSize?: { width: number; height: number }
+  },
 ): boolean {
   if (visual.drawingPath === undefined || visual.drawingIndex === undefined) return false
   const previous = journal.visualEdits.get(visual.id)
   // A removal wins over any earlier move; a later move revives nothing.
   const remove = changes.remove ?? previous?.remove
   const anchor = changes.anchor ?? previous?.anchor
+  const frameSize = changes.frameSize ?? previous?.frameSize
   journal.visualEdits.set(visual.id, {
     sheetId: visual.sheetId,
     drawingPath: visual.drawingPath,
     drawingIndex: visual.drawingIndex,
     ...(remove ? { remove: true as const } : {}),
     ...(anchor ? { anchor } : {}),
+    ...(frameSize ? { frameSize } : {}),
   })
   return true
 }
@@ -746,9 +816,21 @@ export function toSaveVisualEdits(journal: EditJournal): WorkbookVisualEdit[] {
       drawingIndex: entry.drawingIndex,
       ...(entry.remove ? { remove: true as const } : {}),
       ...(entry.anchor ? { anchor: entry.anchor } : {}),
+      ...(entry.frameSize ? { frameSize: entry.frameSize } : {}),
     })
   }
   return edits
+}
+
+/// Cell-derived text (chart caches, pivot captions) can exceed the wire
+/// schema's string caps; the save emitters truncate instead of letting the
+/// whole save fail schema validation.
+function clampWireText(text: string, max: number): string {
+  return text.length > max ? text.slice(0, max) : text
+}
+
+function clampCategories(categories: readonly string[]): string[] {
+  return categories.map((label) => clampWireText(label, CHART_CATEGORY_WIRE_MAX))
 }
 
 /// Converts session visuals to the save-request wire shape. Skips visuals on
@@ -779,7 +861,7 @@ export function toSaveVisualAdds(journal: EditJournal): WorkbookVisualAdd[] {
         shape: {
           shapeType,
           ...(visual.fillColor === undefined ? {} : { fillColor: visual.fillColor }),
-          ...(visual.text === undefined ? {} : { text: visual.text }),
+          ...(visual.text === undefined ? {} : { text: clampWireText(visual.text, 1_000) }),
           ...(visual.name === 'TextBox' ? { isTextBox: true } : {}),
         },
       })
@@ -809,10 +891,10 @@ export function toSaveVisualAdds(journal: EditJournal): WorkbookVisualAdd[] {
     if (chartType === null) continue
     const axisTitles = {
       ...(typeof visual.chart.axisTitles?.category === 'string' && visual.chart.axisTitles.category
-        ? { category: visual.chart.axisTitles.category }
+        ? { category: clampWireText(visual.chart.axisTitles.category, CHART_TEXT_WIRE_MAX) }
         : {}),
       ...(typeof visual.chart.axisTitles?.value === 'string' && visual.chart.axisTitles.value
-        ? { value: visual.chart.axisTitles.value }
+        ? { value: clampWireText(visual.chart.axisTitles.value, CHART_TEXT_WIRE_MAX) }
         : {}),
     }
     additions.push({
@@ -820,10 +902,10 @@ export function toSaveVisualAdds(journal: EditJournal): WorkbookVisualAdd[] {
       anchor: visual.anchor,
       chart: {
         chartType,
-        title: visual.chart.title,
+        title: clampWireText(visual.chart.title, CHART_TEXT_WIRE_MAX),
         series: visual.chart.series.map((series) => ({
-          name: series.name,
-          categories: series.categories,
+          name: clampWireText(series.name, CHART_TEXT_WIRE_MAX),
+          categories: clampCategories(series.categories),
           values: series.values,
           ...(series.valuesRef === undefined ? {} : { valuesRef: series.valuesRef }),
           ...(series.categoriesRef === undefined ? {} : { categoriesRef: series.categoriesRef }),
@@ -850,7 +932,15 @@ export function toSaveVisualAdds(journal: EditJournal): WorkbookVisualAdd[] {
               }),
         })),
         ...(visual.chart.legend === undefined ? {} : { legend: visual.chart.legend }),
-        ...(visual.chart.dataLabels === undefined ? {} : { dataLabels: visual.chart.dataLabels }),
+        // The read-only combined mode narrows to the closest writable one.
+        ...(visual.chart.dataLabels === undefined
+          ? {}
+          : {
+              dataLabels:
+                visual.chart.dataLabels === 'category-value-percent'
+                  ? 'category-percent'
+                  : visual.chart.dataLabels,
+            }),
         ...(visual.chart.dataLabelPosition === undefined
           ? {}
           : { dataLabelPosition: visual.chart.dataLabelPosition }),
@@ -874,7 +964,57 @@ export function toSaveVisualAdds(journal: EditJournal): WorkbookVisualAdd[] {
 }
 
 export function toSaveChartEdits(journal: EditJournal): WorkbookChartEdit[] {
-  return [...journal.chartEdits].map(([chartPath, edit]) => ({ chartPath, ...edit }))
+  return [...journal.chartEdits].map(([chartPath, edit]) => ({
+    chartPath,
+    ...edit,
+    ...(edit.title === undefined ? {} : { title: clampWireText(edit.title, CHART_TEXT_WIRE_MAX) }),
+    ...(edit.axisTitles === undefined
+      ? {}
+      : {
+          axisTitles: {
+            ...(edit.axisTitles.category === undefined
+              ? {}
+              : {
+                  category:
+                    edit.axisTitles.category === null
+                      ? null
+                      : clampWireText(edit.axisTitles.category, CHART_TEXT_WIRE_MAX),
+                }),
+            ...(edit.axisTitles.value === undefined
+              ? {}
+              : {
+                  value:
+                    edit.axisTitles.value === null
+                      ? null
+                      : clampWireText(edit.axisTitles.value, CHART_TEXT_WIRE_MAX),
+                }),
+          },
+        }),
+    ...(edit.series === undefined
+      ? {}
+      : {
+          series: edit.series.map((entry) => ({
+            ...entry,
+            ...(entry.name === undefined
+              ? {}
+              : { name: clampWireText(entry.name, CHART_TEXT_WIRE_MAX) }),
+            ...(entry.categories === undefined
+              ? {}
+              : { categories: clampCategories(entry.categories) }),
+          })),
+        }),
+    ...(edit.seriesSet === undefined
+      ? {}
+      : {
+          seriesSet: edit.seriesSet.map((entry) => ({
+            ...entry,
+            name: clampWireText(entry.name, CHART_TEXT_WIRE_MAX),
+            ...(entry.categories === undefined
+              ? {}
+              : { categories: clampCategories(entry.categories) }),
+          })),
+        }),
+  }))
 }
 
 interface RowColumnShift {
@@ -1078,6 +1218,21 @@ export function shiftVisualForStructuralOp(
 /// the new coordinate space (entries inside a removed range are dropped).
 /// `sheetName` (the edited sheet's name) additionally shifts chart series
 /// references held in the journal.
+/// Removes a previously recorded op by identity (undo of a ribbon-recorded
+/// op, e.g. set-col-style — alpha ledger r124/bugbot). No-op if absent.
+export function removeStructuralOp(
+  journal: EditJournal,
+  sheetId: string,
+  op: StructuralJournalOp,
+): void {
+  const ops = journal.structuralOps.get(sheetId)
+  if (!ops) return
+  const index = ops.lastIndexOf(op)
+  if (index === -1) return
+  ops.splice(index, 1)
+  if (ops.length === 0) journal.structuralOps.delete(sheetId)
+}
+
 export function recordStructuralOp(
   journal: EditJournal,
   sheetId: string,
@@ -1140,6 +1295,46 @@ export function recordStructuralOp(
       shifted.set(`${next.row}:${next.column}`, next)
     }
     journal.cells.set(sheetId, shifted)
+  }
+  const fills = journal.bulkConstantFills.get(sheetId)
+  if (fills && fills.length > 0) {
+    const shiftedFills: JournalBulkConstantFill[] = []
+    for (const fill of fills) {
+      const start = axis === 'row' ? fill.startRow : fill.startColumn
+      const end = axis === 'row' ? fill.endRow : fill.endColumn
+      let segmentStart: number | null = null
+      let segmentEnd: number | null = null
+      const flush = () => {
+        if (segmentStart === null || segmentEnd === null) return
+        shiftedFills.push(
+          axis === 'row'
+            ? { ...fill, startRow: segmentStart, endRow: segmentEnd }
+            : { ...fill, startColumn: segmentStart, endColumn: segmentEnd },
+        )
+        segmentStart = null
+        segmentEnd = null
+      }
+      for (let position = start; position <= end; position += 1) {
+        const moved = movePosition(position)
+        if (moved === null) {
+          flush()
+          continue
+        }
+        if (segmentStart === null || segmentEnd === null) {
+          segmentStart = moved
+          segmentEnd = moved
+        } else if (moved === segmentEnd + 1) {
+          segmentEnd = moved
+        } else {
+          flush()
+          segmentStart = moved
+          segmentEnd = moved
+        }
+      }
+      flush()
+    }
+    if (shiftedFills.length > 0) journal.bulkConstantFills.set(sheetId, shiftedFills)
+    else journal.bulkConstantFills.delete(sheetId)
   }
   const links = journal.hyperlinks.get(sheetId)
   if (links && links.size > 0) {
@@ -1213,12 +1408,160 @@ export function toSaveStructuralOps(journal: EditJournal): WorkbookStructuralOp[
   return ops
 }
 
+export interface BulkConstantFillRecord {
+  readonly fill: JournalBulkConstantFill
+  /// The value entries the fill superseded, as plain data: the fill's undo
+  /// must put them back or undoing the fill would also revert the clear/copy
+  /// that preceded it.
+  readonly purgedCells: JournalEntry[]
+}
+
+export function recordBulkConstantFill(
+  journal: EditJournal,
+  fill: WorkbookBulkConstantFill,
+): BulkConstantFillRecord {
+  const entry: JournalBulkConstantFill =
+    'journalId' in fill && typeof fill.journalId === 'number'
+      ? (fill as JournalBulkConstantFill)
+      : { ...fill, journalId: ++bulkConstantFillSequence }
+  const fills = journal.bulkConstantFills.get(fill.sheetId) ?? []
+  fills.push(entry)
+  journal.bulkConstantFills.set(fill.sheetId, fills)
+  // Earlier per-cell value entries under the fill (a clear_range that emptied
+  // the column, a stale write) must not outlive it: reads give cell entries
+  // priority and the save planner applies them after fills, so leaving them
+  // in place silently reverts the filled cells. Drop their value part; keep
+  // styling, which the fill does not touch.
+  const purgedCells: JournalEntry[] = []
+  const cells = journal.cells.get(fill.sheetId)
+  if (cells) {
+    for (const [key, cell] of cells) {
+      if (
+        !cell.hasValue ||
+        cell.row < fill.startRow ||
+        cell.row > fill.endRow ||
+        cell.column < fill.startColumn ||
+        cell.column > fill.endColumn
+      )
+        continue
+      purgedCells.push(cell)
+      if (cell.style !== undefined || cell.styleReset !== undefined) {
+        cells.set(key, {
+          row: cell.row,
+          column: cell.column,
+          hasValue: false,
+          value: null,
+          ...(cell.style === undefined ? {} : { style: cell.style }),
+          ...(cell.styleReset === undefined ? {} : { styleReset: cell.styleReset }),
+        })
+      } else {
+        cells.delete(key)
+      }
+    }
+  }
+  return { fill: entry, purgedCells }
+}
+
+/// Reinstates entries a bulk fill purged, when that fill is undone.
+export function restoreJournalCells(
+  journal: EditJournal,
+  sheetId: string,
+  entries: readonly JournalEntry[],
+): void {
+  if (entries.length === 0) return
+  let cells = journal.cells.get(sheetId)
+  if (!cells) {
+    cells = new Map()
+    journal.cells.set(sheetId, cells)
+  }
+  for (const entry of entries) cells.set(`${entry.row}:${entry.column}`, entry)
+}
+
+export function removeBulkConstantFill(journal: EditJournal, fill: WorkbookBulkConstantFill): void {
+  const fills = journal.bulkConstantFills.get(fill.sheetId)
+  if (!fills) return
+  const journalId =
+    'journalId' in fill && typeof fill.journalId === 'number' ? fill.journalId : undefined
+  if (journalId === undefined) {
+    const at = fills.lastIndexOf(fill as JournalBulkConstantFill)
+    if (at >= 0) fills.splice(at, 1)
+  } else {
+    for (let at = fills.length - 1; at >= 0; at -= 1) {
+      if (fills[at]?.journalId === journalId) fills.splice(at, 1)
+    }
+  }
+  if (fills.length === 0) journal.bulkConstantFills.delete(fill.sheetId)
+}
+
+export function toSaveBulkConstantFills(journal: EditJournal): WorkbookBulkConstantFill[] {
+  const fills: WorkbookBulkConstantFill[] = []
+  for (const [sheetId, entries] of journal.bulkConstantFills) {
+    if (isSheetRemoved(journal, sheetId)) continue
+    for (const { journalId: _journalId, ...fill } of entries) fills.push(fill)
+  }
+  return fills
+}
+
+/// Ordered range fills use last-write-wins semantics; an explicit per-cell
+/// journal entry always wins because it represents a later/specific edit.
+export function bulkConstantFillValueAt(
+  journal: EditJournal,
+  sheetId: string,
+  row: number,
+  column: number,
+): { found: true; value: WorkbookBulkConstantFill['value'] } | { found: false } {
+  if (journal.cells.get(sheetId)?.get(`${row}:${column}`)?.hasValue) return { found: false }
+  const fills = journal.bulkConstantFills.get(sheetId)
+  if (!fills) return { found: false }
+  for (let at = fills.length - 1; at >= 0; at -= 1) {
+    const fill = fills[at]
+    if (
+      fill &&
+      row >= fill.startRow &&
+      row <= fill.endRow &&
+      column >= fill.startColumn &&
+      column <= fill.endColumn
+    ) {
+      return { found: true, value: fill.value }
+    }
+  }
+  return { found: false }
+}
+
+export function journalCellContentAt(
+  journal: EditJournal,
+  sheetId: string,
+  row: number,
+  column: number,
+):
+  | {
+      found: true
+      value: WorkbookBulkConstantFill['value']
+      formula: string | null
+    }
+  | { found: false } {
+  const entry = journal.cells.get(sheetId)?.get(`${row}:${column}`)
+  if (entry?.hasValue) {
+    return {
+      found: true,
+      value: entry.value,
+      formula: entry.formula ?? null,
+    }
+  }
+  const fill = bulkConstantFillValueAt(journal, sheetId, row, column)
+  return fill.found ? { found: true, value: fill.value, formula: null } : fill
+}
+
 /// Ingests a `sheet.mutation.set-range-values` payload. Returns the entries
-/// that were recorded.
+/// that were recorded. `resolveSharedFormula` materializes shared-formula
+/// followers (`si` with no `f` — tiled paste / fill) into a concrete formula
+/// string; without it such cells journal as plain values and the follow-up
+/// recalc mutation can wipe them entirely.
 export function recordSetRangeValues(
   journal: EditJournal,
   sheetId: string,
   cellValue: unknown,
+  resolveSharedFormula?: SharedFormulaResolver,
 ): JournalEntry[] {
   if (typeof cellValue !== 'object' || cellValue === null) return []
   const recorded: JournalEntry[] = []
@@ -1229,7 +1572,16 @@ export function recordSetRangeValues(
     for (const [columnKey, cell] of Object.entries(rowValue as Record<string, unknown>)) {
       const column = Number(columnKey)
       if (!Number.isInteger(column) || column < 0) continue
-      const entry = mergeIntoJournal(journal, sheetId, row, column, cell)
+      let ingest = cell
+      if (resolveSharedFormula && typeof cell === 'object' && cell !== null) {
+        const data = cell as { f?: unknown; si?: unknown }
+        const hasFormula = typeof data.f === 'string' && data.f.length > 0
+        if (!hasFormula && typeof data.si === 'string' && data.si.length > 0) {
+          const materialized = resolveSharedFormula(row, column, data.si)
+          if (materialized) ingest = { ...cell, f: materialized }
+        }
+      }
+      const entry = mergeIntoJournal(journal, sheetId, row, column, ingest)
       if (entry) recorded.push(entry)
     }
   }
@@ -1374,7 +1726,7 @@ function mergeCellIntoEntry(
     // only an explicit `f: null` (editor overwrite) clears a journaled
     // formula — otherwise the value is just the formula's cached result.
     const isCalculationResult = previous?.formula !== undefined && !('f' in data)
-    const raw = data.v
+    const raw = plainCellValue(data.v, data.t)
     if (isCalculationResult) {
       // keep the journaled formula; the file stores <f> and Excel recalcs
     } else if (raw === null || raw === undefined) {
@@ -1405,6 +1757,30 @@ function mergeCellIntoEntry(
     ...(rich === undefined ? {} : { rich }),
     ...(styleReset ? { styleReset: true } : {}),
   }
+}
+
+/// Univer keeps booleans as `{v: 0|1, t: BOOLEAN}` (set-range-values
+/// normalizes a bare `true` the same way); the file model needs a real
+/// boolean or the save writes a number where Excel had TRUE/FALSE.
+export function plainCellValue(v: unknown, t: unknown): unknown {
+  if (t !== CellValueType.BOOLEAN) return v
+  if (typeof v === 'number') return v !== 0
+  if (typeof v === 'string') return v === '1' || v.toUpperCase() === 'TRUE'
+  return v
+}
+
+/// CSS <family-name>s can't start with a digit unless quoted or escaped, and
+/// Univer's font-string builder only quotes names containing spaces — an
+/// unescaped "12롯데마트행복Medium" invalidates the whole ctx.font assignment
+/// and the text paints at the canvas default (10px serif). The renderer
+/// escapes the leading digit before handing a family to Univer; the escape
+/// must never leak back into the file model.
+export function escapeCssLeadingDigit(family: string): string {
+  return /^[0-9]/.test(family) ? `\\3${family[0]} ${family.slice(1)}` : family
+}
+
+export function unescapeCssLeadingDigit(family: string): string {
+  return family.replace(/^\\3([0-9]) /, '$1')
 }
 
 function extractRichText(p: unknown): { text: string; runs?: WorkbookRichRun[] } | undefined {
@@ -1453,7 +1829,13 @@ function extractRichRuns(text: string, textRuns: unknown): WorkbookRichRun[] | u
       strikethrough: (style.st as { s?: unknown } | undefined)?.s === 1,
       ...(typeof color === 'string' ? { color } : {}),
       ...(typeof style.fs === 'number' ? { size: style.fs } : {}),
-      ...(typeof style.ff === 'string' ? { family: style.ff } : {}),
+      ...(typeof style.ff === 'string' ? { family: unescapeCssLeadingDigit(style.ff) } : {}),
+      // BaselineOffset: 2 = SUBSCRIPT, 3 = SUPERSCRIPT.
+      ...(style.va === 2
+        ? { vertAlign: 'subscript' as const }
+        : style.va === 3
+          ? { vertAlign: 'superscript' as const }
+          : {}),
     }
     if (
       run.bold ||
@@ -1462,7 +1844,8 @@ function extractRichRuns(text: string, textRuns: unknown): WorkbookRichRun[] | u
       run.strikethrough ||
       run.color !== undefined ||
       run.size !== undefined ||
-      run.family !== undefined
+      run.family !== undefined ||
+      run.vertAlign !== undefined
     ) {
       anyStyled = true
     }
@@ -1530,6 +1913,14 @@ const UNIVER_VERTICAL: Record<number, WorkbookStyleEdit['verticalAlignment']> = 
   3: 'bottom',
 }
 
+/// "No fill" as a Univer bg value. Univer composes cell/row/column styles by
+/// key, so a MISSING bg lets a <col style=> fill bleed through the cell —
+/// and set-range-values strips `bg: null` (Tools.removeNull), so null cannot
+/// pin it. An empty rgb is defined (blocks the compose fallthrough) yet falsy
+/// for every painter that checks bg.rgb. Shared by the file installer, the
+/// journal overlay replay, and the ribbon's No Fill.
+export const NO_FILL_STYLE: { readonly rgb: '' } = { rgb: '' }
+
 /// Converts a Univer IStyleData delta (from a set-range-values mutation) to
 /// the renderer-neutral wire format. Unknown keys are ignored; `null` values
 /// mean "remove the attribute" and map to explicit `false`.
@@ -1545,16 +1936,19 @@ export function toNeutralStyle(s: Record<string, unknown>): WorkbookStyleEdit | 
     }
   }
   if ('st' in s) style.strikethrough = isLineOn(s.st)
-  if (typeof s.ff === 'string' && s.ff.length > 0) style.fontFamily = s.ff
+  if (typeof s.ff === 'string' && s.ff.length > 0) {
+    style.fontFamily = unescapeCssLeadingDigit(s.ff)
+  }
   if (typeof s.fs === 'number' && Number.isFinite(s.fs) && s.fs > 0) style.fontSize = s.fs
-  if ('cl' in s && s.cl === null) {
-    style.fontColor = null
-  } else {
-    const fontColor = extractRgb(s.cl)
-    if (fontColor) style.fontColor = fontColor
+  if ('cl' in s) {
+    if (isColorClear(s.cl)) style.fontColor = null
+    else {
+      const fontColor = extractRgb(s.cl)
+      if (fontColor) style.fontColor = fontColor
+    }
   }
   if ('bg' in s) {
-    if (s.bg === null) style.fillColor = null
+    if (isColorClear(s.bg)) style.fillColor = null
     else {
       const fillColor = extractRgb(s.bg)
       if (fillColor) style.fillColor = fillColor
@@ -1621,6 +2015,20 @@ function extractRgb(value: unknown): string | undefined {
   return match?.[1] ? `#${match[1].toUpperCase()}` : undefined
 }
 
+/// The three shapes Univer uses for "no color": a bare `null` (Clear
+/// Formats / setFontColor(null)), `{ rgb: null }` (the facade's
+/// setBackground(null) and the reset-*-color commands — SetStyleCommand
+/// always wraps the value in `{ rgb }`), and the empty-rgb sentinel the
+/// installer writes for fill-less xfs (see toUniverStyle). Missing any of
+/// them left "No Fill" out of the journal: the ribbon showed the fill gone,
+/// Save stayed disabled, and the file kept the fill.
+function isColorClear(value: unknown): boolean {
+  if (value === null) return true
+  if (typeof value !== 'object') return false
+  const rgb = (value as Record<string, unknown>).rgb
+  return rgb === null || rgb === ''
+}
+
 const XLSX_HORIZONTAL_TO_UNIVER: Record<string, number> = {
   left: 1,
   center: 2,
@@ -1646,13 +2054,16 @@ export function fromNeutralStyle(style: WorkbookStyleEdit): Record<string, unkno
       : null
   }
   if (style.strikethrough !== undefined) s.st = style.strikethrough ? { s: 1 } : null
-  if (style.fontFamily !== undefined) s.ff = style.fontFamily
+  if (style.fontFamily !== undefined) s.ff = escapeCssLeadingDigit(style.fontFamily)
   if (style.fontSize !== undefined) s.fs = style.fontSize
   if (style.fontColor !== undefined) {
     s.cl = style.fontColor === null ? null : { rgb: style.fontColor }
   }
   if (style.fillColor !== undefined) {
-    s.bg = style.fillColor === null ? null : { rgb: style.fillColor }
+    // Same empty-rgb sentinel as toUniverStyle: a bare bg: null is stripped
+    // by the mutation's removeNull, after which a <col style=> fill composes
+    // straight back through the cell the user just cleared.
+    s.bg = style.fillColor === null ? { ...NO_FILL_STYLE } : { rgb: style.fillColor }
   }
   if (style.horizontalAlignment !== undefined) {
     s.ht = XLSX_HORIZONTAL_TO_UNIVER[style.horizontalAlignment]
@@ -1760,6 +2171,9 @@ export function journalSize(journal: EditJournal): number {
   }
   for (const [sheetId, sheetEntries] of journal.cells) {
     if (!isSheetRemoved(journal, sheetId)) total += sheetEntries.size
+  }
+  for (const [sheetId, fills] of journal.bulkConstantFills) {
+    if (!isSheetRemoved(journal, sheetId)) total += fills.length
   }
   return total
 }

@@ -23,7 +23,10 @@ export function ChartBody({
           y={0}
           width={chart.box.w}
           height={chart.box.h}
-          {...fillToKonva(chart.bgFill, chart.box.w, chart.box.h, images)}
+          {...fillToKonva(chart.bgFill, chart.box.w, chart.box.h, images, {
+            x: chart.box.x,
+            y: chart.box.y,
+          })}
         />
       )}
       {chart.plotRect && (
@@ -33,7 +36,10 @@ export function ChartBody({
           width={chart.plotRect.w}
           height={chart.plotRect.h}
           {...(chart.plotRect.fill
-            ? fillToKonva(chart.plotRect.fill, chart.plotRect.w, chart.plotRect.h, images)
+            ? fillToKonva(chart.plotRect.fill, chart.plotRect.w, chart.plotRect.h, images, {
+                x: chart.box.x + chart.plotRect.x,
+                y: chart.box.y + chart.plotRect.y,
+              })
             : {})}
           {...(chart.plotRect.borderColor
             ? {
@@ -52,9 +58,10 @@ export function ChartBody({
           outerRadius={wd.outerR}
           angle={wd.sweepDeg}
           rotation={wd.startDeg}
-          fill={wd.color}
-          stroke="#ffffff"
-          strokeWidth={1}
+          fill={wd.noFill ? undefined : wd.color}
+          {...(wd.strokeWidthPx === 0
+            ? {}
+            : { stroke: wd.stroke ?? '#ffffff', strokeWidth: wd.strokeWidthPx ?? 1 })}
         />
       ))}
       {chart.gridLines.map((g, i) => (
@@ -80,7 +87,7 @@ export function ChartBody({
           data={p.d}
           y={p.dy ?? 0}
           fill={p.fill}
-          {...(p.stroke ? { stroke: p.stroke, strokeWidth: 1 } : {})}
+          {...(p.stroke ? { stroke: p.stroke, strokeWidth: p.strokeWidthPx ?? 1 } : {})}
         />
       ))}
       {chart.bars.map((b, i) => (
@@ -121,9 +128,9 @@ export function ChartBody({
           y={l.y}
           text={l.text}
           fontSize={l.fontSizePx}
-          fontFamily="Arial"
+          fontFamily="Calibri, Carlito, Arial, sans-serif"
           fill={l.color}
-          fontStyle={l.bold ? 'bold' : 'normal'}
+          fontStyle={[l.italic && 'italic', l.bold && 'bold'].filter(Boolean).join(' ') || 'normal'}
           {...(l.rotationDeg ? { rotation: l.rotationDeg } : {})}
         />
       ))}

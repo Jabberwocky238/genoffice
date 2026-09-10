@@ -34,6 +34,7 @@ import {
   type PictureElement,
   type TextElement,
 } from '../src/index'
+import { relsPathFor } from '../src/zip'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const fx = (name: string) => readFileSync(join(here, 'fixtures', name))
@@ -585,8 +586,51 @@ describe('setElementLink / getElementLink', () => {
     const el = addElement(slide, { kind: 'rect', offset: { ...OFF } })
     const s1 = setElementLink(opened, 0, el.id, { kind: 'url', url: 'https://x.dev' })!
     const linked = s1.elements.at(-1)!
+    const oldRid = /r:id="([^"]+)"/.exec(linked.anchor.originalXml)![1]!
     const s2 = setElementLink(opened, 0, linked.id, null)!
     expect(getElementLink(opened, 0, s2.elements.at(-1)!.id)).toBeNull()
+    expect(opened.archive.readText(relsPathFor(s2.path))).not.toContain(`Id="${oldRid}"`)
+  })
+
+  it('replacing a link prunes the obsolete hyperlink relationship', async () => {
+    const opened = await openPptx(fx('01_standard_business.pptx'))
+    const slide = opened.deck.slides[0]!
+    const el = addElement(slide, { kind: 'rect', offset: { ...OFF } })
+    const first = setElementLink(opened, 0, el.id, { kind: 'url', url: 'https://old.dev' })!
+    const linked = first.elements.at(-1)!
+    const oldRid = /r:id="([^"]+)"/.exec(linked.anchor.originalXml)![1]!
+
+    const second = setElementLink(opened, 0, linked.id, { kind: 'url', url: 'https://new.dev' })!
+    const rels = opened.archive.readText(relsPathFor(second.path))!
+    expect(rels).not.toContain(`Id="${oldRid}"`)
+    expect(rels).not.toContain('Target="https://old.dev"')
+    expect(rels).toContain('Target="https://new.dev"')
+  })
+
+  it('keeps an old hyperlink relationship while another element still uses its rId', async () => {
+    const opened = await openPptx(fx('01_standard_business.pptx'))
+    const slide = opened.deck.slides[0]!
+    const el = addElement(slide, { kind: 'rect', offset: { ...OFF } })
+    const linkedSlide = setElementLink(opened, 0, el.id, {
+      kind: 'url',
+      url: 'https://shared.dev',
+    })!
+    const linked = linkedSlide.elements.at(-1)!
+    const oldRid = /r:id="([^"]+)"/.exec(linked.anchor.originalXml)![1]!
+    const sharer = addElement(linkedSlide, {
+      kind: 'ellipse',
+      offset: { ...OFF, x: 5486400 },
+    })
+    // Newborn cNvPr carries a creationId extLst (paired tag); hlinkClick goes
+    // right after the opening tag — its schema slot is before extLst
+    sharer.anchor.originalXml = sharer.anchor.originalXml.replace(
+      /(<p:cNvPr[^>]*>)/,
+      `$1<a:hlinkClick r:id="${oldRid}"/>`,
+    )
+    linkedSlide.structureDirty = true
+
+    setElementLink(opened, 0, linked.id, { kind: 'url', url: 'https://new.dev' })
+    expect(opened.archive.readText(relsPathFor(linkedSlide.path))).toContain(`Id="${oldRid}"`)
   })
 
   it('getSlideLinks collects every linked element on the slide', async () => {
@@ -827,5 +871,47 @@ describe('3-D chart kinds survive insert and edit round-trips', () => {
     el = reopened.deck.slides[0]!.elements.at(-1) as ChartElement
     expect(el.chart.pseudo3D).toBe(true)
     expect(el.chart.categories).toEqual(['A', 'B', 'C'])
+  })
+})
+
+describe('editChartElement doughnut hole preservation', () => {
+  it('a custom holeSizePct survives a data-only rebuild and is patchable', async () => {
+    const opened = await openPptx(fx('01_standard_business.pptx'))
+    const r = addChart(opened, 0, {
+      kind: 'doughnut',
+      categories: ['A', 'B'],
+      series: [{ name: 'S', values: [1, 2] }],
+      offset: { ...OFF },
+      holeSizePct: 72,
+    })!
+    const chartXml = (path: string) => {
+      const rels = opened.archive.readText(relsPathFor('ppt/slides/slide1.xml'))!
+      const target = /Target="([^"]*chart\d+\.xml)"/.exec(rels)![1]!
+      return opened.archive.readText(path || `ppt/charts/${target.split('/').pop()}`)!
+    }
+    expect(chartXml('')).toContain('<c:holeSize val="72"/>')
+    // Data-only edit: the hole used to reset to the build default (50)
+    expect(editChartElement(opened, 0, r.elementId, { categories: ['A', 'B', 'C'] })).toBe(true)
+    expect(chartXml('')).toContain('<c:holeSize val="72"/>')
+    // Explicit patch wins
+    expect(editChartElement(opened, 0, r.elementId, { holeSizePct: 30 })).toBe(true)
+    expect(chartXml('')).toContain('<c:holeSize val="30"/>')
+  })
+})
+
+describe('pie → doughnut type switch (Bugbot: parsed pie holePct 0 must not clamp to a 1% hole)', () => {
+  it('switching a pie to doughnut gets the default 50% hole', async () => {
+    const opened = await openPptx(fx('01_standard_business.pptx'))
+    const r = addChart(opened, 0, {
+      kind: 'pie',
+      categories: ['A', 'B'],
+      series: [{ name: 'S', values: [1, 2] }],
+      offset: { ...OFF },
+    })!
+    expect(editChartElement(opened, 0, r.elementId, { kind: 'doughnut' })).toBe(true)
+    const rels = opened.archive.readText(relsPathFor('ppt/slides/slide1.xml'))!
+    const target = /Target="([^"]*chart\d+\.xml)"/.exec(rels)![1]!
+    const xml = opened.archive.readText(`ppt/charts/${target.split('/').pop()}`)!
+    expect(xml).toContain('<c:holeSize val="50"/>')
   })
 })

@@ -323,8 +323,63 @@ describe('circularArrow presets', () => {
     for (const preset of ['circularArrow', 'leftCircularArrow']) {
       const r = presetPath(preset, 100, 100)
       expect(r?.path).toBeTruthy()
-      // annular: the path contains two arc sweeps (many cubic segments), not a 4-corner box
-      expect((r!.path!.match(/C /g) ?? []).length).toBeGreaterThan(4)
+      // annular: two arc sweeps of cubic segments (≥2 each at the default 161° sweep),
+      // not a 4-corner box (which would have none)
+      expect((r!.path!.match(/C /g) ?? []).length).toBeGreaterThanOrEqual(4)
     }
+  })
+})
+
+describe('gear9', () => {
+  it('returns a 36-point toothed polygon, not a rect fallback', () => {
+    const pts = presetPolygon('gear9', 100, 100)
+    expect(pts).toBeTruthy()
+    expect(pts!.length).toBe(9 * 4 * 2)
+  })
+})
+
+describe('arrow callouts (tdf150789 SmartArt section arrows)', () => {
+  it('upArrowCallout outlines a bottom box with a centered up arrow', () => {
+    const pts = presetPolygon('upArrowCallout', 200, 100)!
+    expect(pts).toHaveLength(22)
+    // Arrow tip at top center
+    expect(pts[8]).toBe(100)
+    expect(pts[9]).toBe(0)
+    // Callout box top at h - h*0.64977 (default adj4)
+    expect(pts[1]).toBeCloseTo(100 - 64.977, 1)
+    // Box spans the full width at the bottom
+    expect(pts.slice(-4)).toEqual([200, 100, 0, 100])
+  })
+
+  it('downArrowCallout mirrors vertically (box on top, arrow tip at bottom center)', () => {
+    const pts = presetPolygon('downArrowCallout', 200, 100)!
+    expect(pts[8]).toBe(100)
+    expect(pts[9]).toBe(100)
+    expect(pts[1]).toBeCloseTo(64.977, 1)
+  })
+
+  it('rightArrowCallout points right with the box on the left', () => {
+    const pts = presetPolygon('rightArrowCallout', 100, 200)!
+    expect(pts[8]).toBe(100)
+    expect(pts[9]).toBe(100)
+  })
+})
+
+describe('swooshArrow (prod SmartArt rising-arrow diagrams)', () => {
+  it('returns a curved arrow path, not a rect fallback', () => {
+    const r = presetPath('swooshArrow', 788, 358, { adj1: 25000, adj2: 25000 })
+    expect(r).toBeTruthy()
+    // Body sweep = two quad beziers; arrowhead = straight segments
+    expect((r!.path!.match(/Q /g) ?? []).length).toBe(2)
+    // Starts at bottom-left corner
+    expect(r!.path!.startsWith('M 0 358')).toBe(true)
+    // Arrowhead tip on the right edge, in the upper part (yD = yE/2 + h/20)
+    expect(r!.path).toContain('L 788 ')
+  })
+
+  it('clamps adj2 to maxAdj2 = 70000*w/ss', () => {
+    const r = presetPath('swooshArrow', 100, 100, { adj1: 25000, adj2: 999999 })
+    // ad2 capped at 70% of ss → xB = w - 70
+    expect(r!.path).toContain('Q 16.67 33.33 30 12.5')
   })
 })

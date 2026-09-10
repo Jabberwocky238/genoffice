@@ -1,5 +1,14 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type { IpcRendererEvent } from 'electron'
+import {
+  AI_MEDIA_PROVIDERS,
+  AI_PROVIDERS,
+  AI_SEARCH_PROVIDERS,
+  getProviderAdapter,
+} from '@genoffice/ai-provider/browser'
+import type { AiSettings, CodexModelCatalog } from '@genoffice/ai-provider/browser'
+import { installDropOpenBridge } from '@genoffice/electron-utils/drop-open'
+import { normalizeAiPanelPrefs } from '@genoffice/ui/ai-panel-prefs'
 import type {
   AccountLoginEvent,
   AccountStatus,
@@ -16,7 +25,6 @@ import type {
 import { HOME_CHANNELS, PROJECT_CHANNELS } from '../shared/home-api'
 import type { TabsApi, TabSummary } from '../shared/tabs-api'
 import { TABS_CHANNELS } from '../shared/tabs-api'
-import { createWjkjAiSettingsApi } from '../../../../ee/wjkj/preload'
 
 const UI_LANGUAGES: readonly UiLanguage[] = [
   'zh',
@@ -33,6 +41,7 @@ const UI_LANGUAGES: readonly UiLanguage[] = [
   'pt',
   'it',
   'pl',
+  'cs',
   'nl',
   'ms',
   'he',
@@ -86,6 +95,12 @@ const homeApi: HomeApi = {
   },
   async newMarkdown(opts) {
     await ipcRenderer.invoke(HOME_CHANNELS.newMarkdown, opts)
+  },
+  async newHtml(opts) {
+    await ipcRenderer.invoke(HOME_CHANNELS.newHtml, opts)
+  },
+  async newPdf(opts) {
+    await ipcRenderer.invoke(HOME_CHANNELS.newPdf, opts)
   },
   async removeRecent(paths) {
     await ipcRenderer.invoke(HOME_CHANNELS.removeRecent, paths)
@@ -157,7 +172,8 @@ const homeApi: HomeApi = {
     return result === true
   },
   async setOnboardingSeen() {
-    await ipcRenderer.invoke(HOME_CHANNELS.setOnboardingSeen)
+    const result: unknown = await ipcRenderer.invoke(HOME_CHANNELS.setOnboardingSeen)
+    return result === true
   },
   async getTheme() {
     const result: unknown = await ipcRenderer.invoke(HOME_CHANNELS.getTheme)
@@ -167,6 +183,33 @@ const homeApi: HomeApi = {
     if (theme !== 'light' && theme !== 'dark' && theme !== 'system')
       throw new Error('Invalid theme.')
     await ipcRenderer.invoke(HOME_CHANNELS.setTheme, theme)
+  },
+  async getAutoSaveDefault() {
+    const result: unknown = await ipcRenderer.invoke(HOME_CHANNELS.getAutoSaveDefault)
+    const r = result as { on?: unknown; updatedAt?: unknown } | null
+    return {
+      on: r?.on === true,
+      updatedAt: typeof r?.updatedAt === 'number' ? r.updatedAt : 0,
+    }
+  },
+  async setAutoSaveDefault(on) {
+    if (typeof on !== 'boolean') throw new Error('Invalid AutoSave default.')
+    await ipcRenderer.invoke(HOME_CHANNELS.setAutoSaveDefault, on)
+  },
+  async getAnalyticsEnabled() {
+    const result: unknown = await ipcRenderer.invoke(HOME_CHANNELS.getAnalyticsEnabled)
+    return result !== false
+  },
+  async setAnalyticsEnabled(enabled) {
+    if (typeof enabled !== 'boolean') throw new Error('Invalid analytics consent.')
+    const result: unknown = await ipcRenderer.invoke(HOME_CHANNELS.setAnalyticsEnabled, enabled)
+    return result === true
+  },
+  async getAiPanelPrefs() {
+    return normalizeAiPanelPrefs(await ipcRenderer.invoke(HOME_CHANNELS.getAiPanelPrefs))
+  },
+  async setAiPanelPrefs(patch) {
+    return normalizeAiPanelPrefs(await ipcRenderer.invoke(HOME_CHANNELS.setAiPanelPrefs, patch))
   },
   async getDefaultSaveDir() {
     const result: unknown = await ipcRenderer.invoke(HOME_CHANNELS.getDefaultSaveDir)
@@ -226,7 +269,64 @@ const homeApi: HomeApi = {
     if (typeof projectUrl !== 'string' || !projectUrl) throw new Error('Invalid project URL.')
     await ipcRenderer.invoke(HOME_CHANNELS.openCloudProject, projectUrl)
   },
-  ...createWjkjAiSettingsApi((channel, ...args) => ipcRenderer.invoke(channel, ...args)),
+  // AI settings channels are registered once by the shell's aggregated docs handlers
+  async getAiSettings() {
+    return (await ipcRenderer.invoke('ai:get-settings')) as AiSettings
+  },
+  async setAiSettings(settings) {
+    await ipcRenderer.invoke('ai:set-settings', settings)
+  },
+  getAiProviders() {
+    return AI_PROVIDERS.map((meta) => {
+      let defaultBaseUrl = ''
+      // genspark routes by model and custom has no default — both stay ''
+      if (meta.id !== 'genspark' && !meta.needsBaseUrl && !meta.needsCliPath) {
+        defaultBaseUrl = getProviderAdapter(meta.id).resolveEndpoint({
+          apiKey: '',
+          model: meta.defaultModel,
+        }).baseUrl
+      }
+      return { ...meta, defaultBaseUrl }
+    })
+  },
+  async getCodexModels(cliPath) {
+    return (await ipcRenderer.invoke('ai:codex-models', cliPath)) as CodexModelCatalog
+  },
+  async testAiSettings(settings) {
+    const result: unknown = await ipcRenderer.invoke('ai:chat', {
+      settings,
+      system: 'You are a connectivity test. Reply with the single word OK.',
+      user: 'ping',
+    })
+    const raw = (result ?? {}) as { ok?: unknown; error?: unknown }
+    return raw.ok === true
+      ? { ok: true }
+      : { ok: false, error: typeof raw.error === 'string' ? raw.error : 'Connection failed' }
+  },
+  getAiMediaProviders() {
+    return AI_MEDIA_PROVIDERS
+  },
+  getAiSearchProviders() {
+    return AI_SEARCH_PROVIDERS
+  },
+  async testAiSearchSettings(input) {
+    const raw = ((await ipcRenderer.invoke('ai:search-test', input)) ?? {}) as {
+      ok?: unknown
+      error?: unknown
+    }
+    return raw.ok === true
+      ? { ok: true }
+      : { ok: false, error: typeof raw.error === 'string' ? raw.error : 'Connection failed' }
+  },
+  async testAiMediaSettings(input) {
+    const raw = ((await ipcRenderer.invoke('ai:media-test', input)) ?? {}) as {
+      ok?: unknown
+      error?: unknown
+    }
+    return raw.ok === true
+      ? { ok: true }
+      : { ok: false, error: typeof raw.error === 'string' ? raw.error : 'Connection failed' }
+  },
 }
 
 function asCloudProjectsSnapshot(result: unknown): CloudProjectsSnapshot | null {
@@ -313,3 +413,6 @@ const tabsApi: TabsApi = {
 }
 
 contextBridge.exposeInMainWorld('aiOfficeTabs', tabsApi)
+
+// open documents dragged from the OS anywhere over Home or the tab strip
+installDropOpenBridge()

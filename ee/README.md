@@ -2,8 +2,8 @@
 
 Enterprise modules live here, behind the enterprise license boundary.
 
-- [WJKJ](wjkj/README.md): shared AI provider settings, model suggestions,
-  and the home sidebar configuration entry.
+- [WJKJ](wjkj/README.md): custom API configuration dialog and home sidebar entry,
+  integrated with upstream AI settings.
 
 ## License boundary
 

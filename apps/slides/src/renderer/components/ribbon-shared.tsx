@@ -11,6 +11,7 @@ import type {
   EditChartOp,
   EditTableStyleOp,
   GetLayoutsResult,
+  GradientFillSpec,
   InsertKind,
   TransitionKind,
 } from '../../shared/ipc'
@@ -238,6 +239,7 @@ export type RibbonPanelKey =
   | 'slideSize'
   | 'transparency'
   | 'pictureBorder'
+  | 'changeShape'
   | 'shapeStyle'
   | 'shapeFill'
   | 'table'
@@ -392,11 +394,15 @@ export interface Props {
   curBulletChar: string | null
   /** Current paragraph alignment of the selection ('left' when unset; null = mixed/no text, nothing highlighted) */
   curAlign: 'left' | 'center' | 'right' | 'justify' | null
+  /** Effective base direction of the selection's paragraphs (null = mixed/no text, nothing highlighted) */
+  curRtl: boolean | null
   /** Editing: change the selection's font / set size (pt) */
   onFontFamily: (family: string) => void
   onFontSize: (pt: number) => void
   /** Paragraph alignment: execCommand while editing, element-level op when elements are selected */
   onAlign: (align: 'left' | 'center' | 'right' | 'justify') => void
+  /** Paragraph base direction toggle (selection while editing, element-level otherwise) */
+  onDirection: (rtl: boolean) => void
   /** Strikethrough: element-level toggle when selected but not editing (editing goes through onFormat) */
   onStrike: () => void
   /** B/I/U element-level toggle (when selected but not editing) */
@@ -551,18 +557,29 @@ export interface Props {
   onPictureOpacity?: (opacity: number) => void
   /** Picture: enter cutout (background removal) mode */
   onPictureCutout?: () => void
+  /** Picture: pick a file and swap the image in place */
+  onPictureReplace?: () => void
+  /** Picture: quarter turn (±90°) around its centre */
+  onPictureRotate?: (deltaDeg: -90 | 90) => void
   /** Selected picture's current border (null = none) */
   contextPictureStroke?: { color: string; widthPt: number; dashPreset?: string } | null
   /** Picture border (null clears it) */
   onPictureStroke?: (stroke: { color: string; widthPt: number; dash?: string } | null) => void
+  /** Replace the selected shape's preset geometry while preserving its formatting and text */
+  onChangeShape?: (prst: string) => void
   /** Shape style preset: fill + outline applied together (dash absent = solid) */
   onShapeStyle?: (style: ShapeStylePreset) => void
-  /** Shape fill color ('none' clears the fill) */
-  onShapeFill?: (fill: string) => void
+  /** Shape fill: color ('none' clears the fill) or gradient */
+  onShapeFill?: (fill: string | GradientFillSpec) => void
+  /** Shape picture/texture fill: stretch or tile onto the selection; source = bundled
+      texture preset bytes (base64), absent = system picker */
+  onShapeFillImage?: (mode: 'stretch' | 'tile', source?: { base64: string; ext: string }) => void
+  /** Selected shape's current fill (#RRGGBB, 'none' = no fill, null = non-solid): picker highlight + gradient preset base */
+  contextShapeFill?: string | null
   /** Execute a table style operation */
   onEditTableStyle?: (op: Omit<EditTableStyleOp, 'slideIndex' | 'sourceId'>) => void
   /** Selected table's header-row/banded-rows current state (toggle display) */
-  tableStyleFlags?: { firstRow: boolean; bandRow: boolean } | null
+  tableStyleFlags?: { firstRow: boolean; bandRow: boolean; rtl?: boolean } | null
   /** Cell being edited in the selected table; shading applies to just this cell */
   tableActiveCell?: { row: number; col: number } | null
   /** Execute a chart edit operation */
@@ -596,6 +613,7 @@ export interface RibbonTabCtx extends Pick<
   | 'canPaste'
   | 'curBulletChar'
   | 'curAlign'
+  | 'curRtl'
   | 'curFontFamily'
   | 'curFontSizeMixed'
   | 'curFontSizePt'
@@ -614,6 +632,7 @@ export interface RibbonTabCtx extends Pick<
   | 'onAddSlideWithLayout'
   | 'onAiPreset'
   | 'onAlign'
+  | 'onDirection'
   | 'onArrange'
   | 'onFlip'
   | 'onCopy'

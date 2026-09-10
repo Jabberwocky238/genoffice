@@ -13,6 +13,7 @@
  *    (keeping the unstyled rendering).
  */
 import { XMLParser } from 'fast-xml-parser'
+import { applyColorMods } from './color'
 import { resolveSchemeColor, type Theme } from './theme'
 import type { Fill, Stroke } from './types'
 import { asXmlNode, xmlArray, type XmlNode } from './xml-utils'
@@ -390,6 +391,11 @@ export function resolveTableStyle(
     const def = parseTableStylesXml(tableStylesXml, styleId, theme)
     if (def) return def
   }
+  // A tableStyles part that defines explicit styles but not this id renders unstyled in
+  // PowerPoint — the built-in gallery only backs an empty part (def-id only). Measured on
+  // prod imports: same undefined Medium2/Accent1 id styled with an empty part, transparent
+  // with a populated one (decorative shapes behind the table show through).
+  if (tableStylesXml && /<a:tblStyle[\s>]/.test(tableStylesXml)) return undefined
   const builtin = BUILTIN[styleId]
   if (builtin) return builtinStyle(builtin.family, builtin.accent, theme)
   if (styleId === LEGACY_NO_STYLE) return {}
@@ -434,30 +440,19 @@ const tsParser = new XMLParser({
 function readColor(node: unknown, theme: Theme | undefined): string | undefined {
   if (!node || typeof node !== 'object') return undefined
   const n = asXmlNode(node)
-  // tint/shade/alpha child modifiers; alpha lands as an #RRGGBBAA suffix so
-  // banded fills composite over <a:tblBg> instead of collapsing to opaque
-  const withMods = (base: string, clr: XmlNode): string => {
-    let c = base
-    const t = asXmlNode(clr['a:tint'])['@_val']
-    if (t) c = tint(c, parseInt(String(t), 10) / 100000)
-    const sh = asXmlNode(clr['a:shade'])['@_val']
-    if (sh) c = shade(c, parseInt(String(sh), 10) / 100000)
-    const al = asXmlNode(clr['a:alpha'])['@_val']
-    if (al) {
-      const a = Math.max(0, Math.min(255, Math.round((parseInt(String(al), 10) / 100000) * 255)))
-      c = c + a.toString(16).padStart(2, '0').toUpperCase()
-    }
-    return c
-  }
+  // tint/shade/alpha via the canonical linear-gamma modifier path (PPT computes
+  // table-style tints in linear space: accent tint 20% renders ≈(244,231,231),
+  // not the straight-sRGB (242,204,204) — prod_043 pixel-verified); alpha lands
+  // as an #RRGGBBAA suffix so banded fills composite over <a:tblBg>
   if (n['a:srgbClr']) {
     const srgb = asXmlNode(n['a:srgbClr'])
-    return withMods('#' + String(srgb['@_val']).toUpperCase(), srgb)
+    return applyColorMods('#' + String(srgb['@_val']).toUpperCase(), srgb)
   }
   if (n['a:schemeClr']) {
     const scheme = asXmlNode(n['a:schemeClr'])
     const base = resolveSchemeColor(String(scheme['@_val']), theme)
     if (!base) return undefined
-    return withMods(base, scheme)
+    return applyColorMods(base, scheme)
   }
   const prst = asXmlNode(n['a:prstClr'])['@_val']
   if (prst === 'black') return '#000000'

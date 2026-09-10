@@ -7,6 +7,7 @@ import {
   type SheetsSkillDeps,
   type ToolExecution,
 } from '../src/renderer/ai/tools'
+import { getActiveSheetInfo } from '../src/renderer/ai/workbook-readers'
 import type { ChangePlan } from '../src/domain/workbook.types'
 
 function call(name: string, input: Record<string, unknown>) {
@@ -141,6 +142,242 @@ describe('buildWorkbookContext', () => {
     expect(text).toContain('Budget')
     expect(text).toContain('streaming in')
     expect(text).toContain('Currently loaded viewport: A80:E160 (not the worksheet data extent)')
+  })
+})
+
+describe('getActiveSheetInfo: the run selection scope', () => {
+  const SHEETS = [
+    { id: 'sh1', name: 'Data', cells: { A1: {} } },
+    { id: 'sh2', name: 'My Summary', cells: {} },
+  ]
+
+  function demoReadContext(
+    liveSelection: string | null,
+    activeSheetId = 'sh1',
+  ): Parameters<typeof getActiveSheetInfo>[0] {
+    const worksheet = (id: string) => ({
+      getSheetId: () => id,
+      getSheetName: () => SHEETS.find((sheet) => sheet.id === id)?.name ?? '',
+      getMergedRanges: () => [],
+    })
+    return {
+      univerRef: {
+        current: {
+          univerAPI: {
+            getActiveWorkbook: () => ({
+              getActiveRange: () =>
+                liveSelection === null ? null : { getA1Notation: () => liveSelection },
+              getActiveSheet: () => worksheet(activeSheetId),
+              getSheetBySheetId: (id: string) =>
+                SHEETS.some((sheet) => sheet.id === id) ? worksheet(id) : null,
+              getSheets: () => SHEETS.map((sheet) => worksheet(sheet.id)),
+            }),
+          },
+        },
+      },
+      lazyWorkbookRef: { current: null },
+      adapterRef: { current: { getSnapshot: () => ({ revision: 3, sheets: SHEETS }) } },
+    } as unknown as Parameters<typeof getActiveSheetInfo>[0]
+  }
+
+  it('reports the live selection when no run owns a scope', () => {
+    const info = getActiveSheetInfo(demoReadContext('B2:B50'))
+    expect(info.selection).toBe('B2:B50')
+    expect(info.selectionFrozen).toBeUndefined()
+    expect(buildWorkbookContext(fakeDeps({ getActiveSheetInfo: () => info }))).toContain(
+      'Current selection: B2:B50',
+    )
+  })
+
+  it('keeps the send-time snapshot while the user clicks elsewhere mid-run', () => {
+    const info = getActiveSheetInfo(demoReadContext('D9'), { a1: 'B2:B50', sheetId: 'sh1' })
+    expect(info.selection).toBe('B2:B50')
+    expect(info.selectionFrozen).toBe(true)
+    const text = buildWorkbookContext(fakeDeps({ getActiveSheetInfo: () => info }))
+    expect(text).toContain('User selection: B2:B50')
+    expect(text).toContain('captured when the user sent this message')
+    expect(text).not.toContain('D9')
+  })
+
+  it('qualifies a snapshot taken on a sheet that is no longer active', () => {
+    const info = getActiveSheetInfo(demoReadContext('A1', 'sh1'), {
+      a1: 'B2:D9',
+      sheetId: 'sh2',
+    })
+    expect(info.selection).toBe('My Summary!B2:D9')
+  })
+
+  it('names the columns a whole-column scope covers', () => {
+    const info = getActiveSheetInfo(demoReadContext('D9'), {
+      a1: 'B1:B417',
+      sheetId: 'sh1',
+      columns: ['Amount'],
+    })
+    expect(info.selectionColumns).toEqual(['Amount'])
+    const text = buildWorkbookContext(fakeDeps({ getActiveSheetInfo: () => info }))
+    expect(text).toContain('User selection: B1:B417 (the whole "Amount" column) — captured')
+  })
+
+  it('pluralizes a scope covering several columns', () => {
+    const info = getActiveSheetInfo(demoReadContext('D9'), {
+      a1: 'B1:C417',
+      sheetId: 'sh1',
+      columns: ['Amount', 'Qty'],
+    })
+    expect(buildWorkbookContext(fakeDeps({ getActiveSheetInfo: () => info }))).toContain(
+      '(the whole "Amount", "Qty" columns)',
+    )
+  })
+
+  it('reports no selection at all once the user drops the scope', () => {
+    const info = getActiveSheetInfo(demoReadContext('B2:B50'), null)
+    expect(info.selection).toBeUndefined()
+    expect(info.selectionFrozen).toBeUndefined()
+    expect(buildWorkbookContext(fakeDeps({ getActiveSheetInfo: () => info }))).not.toContain(
+      'selection',
+    )
+  })
+})
+
+describe('getActiveSheetInfo: lazy extents after structural ops', () => {
+  function lazyReadContext(
+    structuralOps: Map<string, unknown[]>,
+  ): Parameters<typeof getActiveSheetInfo>[0] {
+    const worksheet = {
+      getSheetId: () => 'sh1',
+      getSheetName: () => 'Data',
+      getMergedRanges: () => [],
+    }
+    return {
+      univerRef: {
+        current: {
+          univerAPI: {
+            getActiveWorkbook: () => ({
+              getActiveRange: () => null,
+              getActiveSheet: () => worksheet,
+              getSheets: () => [worksheet],
+            }),
+          },
+        },
+      },
+      lazyWorkbookRef: {
+        current: {
+          file: {
+            sessionId: 'session-1',
+            visuals: [],
+            sheets: [{ id: 'sh1', name: 'Data', rowCount: 100, columnCount: 8 }],
+          },
+          loadedRanges: new Map(),
+          editJournal: { visualAdds: [], structuralOps },
+        },
+      },
+      adapterRef: { current: { getSnapshot: () => ({ revision: 0, sheets: [] }) } },
+    } as unknown as Parameters<typeof getActiveSheetInfo>[0]
+  }
+
+  it('reports the screen extent, not the stale file extent', () => {
+    const info = getActiveSheetInfo(
+      lazyReadContext(
+        new Map([
+          [
+            'sh1',
+            [
+              { kind: 'insert-rows', index: 10, count: 5 },
+              { kind: 'remove-cols', index: 0, count: 2 },
+            ],
+          ],
+        ]),
+      ),
+    )
+    expect(info.sheets[0]).toMatchObject({ id: 'sh1', rows: 105, columns: 6 })
+    const text = buildWorkbookContext(fakeDeps({ getActiveSheetInfo: () => info }))
+    expect(text).toContain('A1:F105')
+  })
+
+  it('reports a zero extent as empty, not unknown', () => {
+    const info = getActiveSheetInfo(
+      lazyReadContext(new Map([['sh1', [{ kind: 'remove-rows', index: 0, count: 100 }]]])),
+    )
+    expect(info.sheets[0]).toMatchObject({ id: 'sh1', rows: 0, columns: 8 })
+    const text = buildWorkbookContext(fakeDeps({ getActiveSheetInfo: () => info }))
+    expect(text).toContain('no data (empty sheet)')
+    expect(text).not.toContain('data extent about')
+  })
+
+  it('matches the file extent when no structural ops ran', () => {
+    const info = getActiveSheetInfo(lazyReadContext(new Map()))
+    expect(info.sheets[0]).toMatchObject({ id: 'sh1', rows: 100, columns: 8 })
+  })
+})
+
+describe('executeWorkbookTool: aggregate_range', () => {
+  it('rejects a missing/unparsable range and oversize ranges', async () => {
+    const deps = fakeDeps({ aggregateRange: vi.fn() })
+    expect((await executeWorkbookTool(call('aggregate_range', {}), deps)).isError).toBe(true)
+    expect(
+      (await executeWorkbookTool(call('aggregate_range', { range: 'nope' }), deps)).isError,
+    ).toBe(true)
+    const oversize = await executeWorkbookTool(
+      call('aggregate_range', { range: 'A1:ZZ99999' }),
+      deps,
+    )
+    expect(oversize.isError).toBe(true)
+    expect(oversize.output).toContain('one column')
+    expect(deps.aggregateRange).not.toHaveBeenCalled()
+  })
+
+  it('rejects an unknown sheetId instead of falling back to another sheet', async () => {
+    const deps = fakeDeps({ aggregateRange: vi.fn() })
+    const result = await executeWorkbookTool(
+      call('aggregate_range', { range: 'A1:A10', sheetId: 'sheet-9' }),
+      deps,
+    )
+    expect(result.isError).toBe(true)
+    expect(result.output).toContain('Unknown sheet: sheet-9')
+    expect(deps.aggregateRange).not.toHaveBeenCalled()
+  })
+
+  it('formats the aggregate returned by the dep', async () => {
+    const aggregateRange = vi.fn().mockResolvedValue({
+      ok: true,
+      aggregate: {
+        cells: 88_587,
+        nonEmpty: 88_587,
+        distinct: 312,
+        numericCount: 0,
+        sum: 0,
+        min: null,
+        max: null,
+        average: null,
+        topValues: [
+          { value: '供应商A', count: 900 },
+          { value: '供应商B', count: 800 },
+        ],
+      },
+    })
+    const result = await executeWorkbookTool(
+      call('aggregate_range', { range: 'D2:D88588', sheetId: 'sheet-1', topValues: 1 }),
+      fakeDeps({ aggregateRange }),
+    )
+    expect(result.isError).toBeUndefined()
+    expect(aggregateRange).toHaveBeenCalledWith(
+      'sheet-1',
+      expect.objectContaining({ startRow: 1, endRow: 88_587, startColumn: 3, endColumn: 3 }),
+    )
+    expect(result.output).toContain('distinct values: 312')
+    expect(result.output).toContain('供应商A: 900')
+    expect(result.output).not.toContain('供应商B')
+  })
+
+  it('propagates dep errors as tool errors', async () => {
+    const result = await executeWorkbookTool(
+      call('aggregate_range', { range: 'D2:D10' }),
+      fakeDeps({
+        aggregateRange: vi.fn().mockResolvedValue({ ok: false, error: 'still indexing' }),
+      }),
+    )
+    expect(result.isError).toBe(true)
+    expect(result.output).toContain('still indexing')
   })
 })
 
@@ -555,6 +792,26 @@ describe('executeWorkbookTool: propose_operations', () => {
     expect(result.output).toContain('old → new')
     expect(result.output).toContain('Auto-applied')
     expect(result.output).toContain('Undo')
+  })
+
+  it('surfaces apply-time notices from the applied outcome', async () => {
+    const proposeOperations = vi.fn().mockReturnValue({
+      ok: true,
+      plan: EMPTY_PLAN,
+      applied: Promise.resolve({
+        ok: true,
+        notices: ['copy_range A1:B2: 2 formula cell(s) were copied as their current values'],
+      }),
+    })
+    const result = await executeWorkbookTool(
+      call('propose_operations', {
+        operations: [{ op: 'set_cell', sheetId: 'sheet-1', address: 'A1', value: 'new' }],
+        summary: 'Update A1',
+      }),
+      fakeDeps({ proposeOperations }),
+    )
+    expect(result.isError).toBeFalsy()
+    expect(result.output).toContain('Note: copy_range A1:B2')
   })
 
   it('after writing a formula, reads back the computed value asynchronously (write → verify)', async () => {

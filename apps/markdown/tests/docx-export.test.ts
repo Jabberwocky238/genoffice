@@ -75,6 +75,31 @@ describe('docx export', () => {
     expect(table?.table?.rows[1]?.[1]?.paras.join('')).toBe('1')
   })
 
+  it('block math becomes a native OMML equation', async () => {
+    const editor = createEditor('$$\n\\frac{a}{b}\n$$')
+    const mapping = await mapDocToSaveBlocks(editor.getJSON(), noImages)
+    const xml = mapping.blocks.find((b) => b.kind === 'xml')
+    expect(xml && 'xml' in xml && xml.xml).toContain('<m:oMath>')
+  })
+
+  it('block math outside the OMML subset keeps its LaTeX source visible', async () => {
+    const editor = createEditor('$$\n\\notacommand{x}\n$$')
+    const mapping = await mapDocToSaveBlocks(editor.getJSON(), noImages)
+    const texts = mapping.blocks.map((b) =>
+      b.kind === 'generated' ? (b.block.runs ?? []).map((r) => r.text).join('') : '',
+    )
+    expect(texts.join('\n')).toContain('$$\\notacommand{x}$$')
+  })
+
+  it('inline math keeps its LaTeX in the run text', async () => {
+    const editor = createEditor('value $x_{1}$ end')
+    const mapping = await mapDocToSaveBlocks(editor.getJSON(), noImages)
+    const texts = mapping.blocks.map((b) =>
+      b.kind === 'generated' ? (b.block.runs ?? []).map((r) => r.text).join('') : '',
+    )
+    expect(texts.join('\n')).toContain('$x_{1}$')
+  })
+
   it('task lists render checkbox glyphs', async () => {
     const parsed = await exportAndParse('- [x] done\n- [ ] open')
     const texts = parsed.blocks.map((b) => (b.runs ?? []).map((r) => r.text).join(''))
@@ -90,6 +115,34 @@ describe('docx export', () => {
     expect(code).toBeDefined()
     expect(code?.runs?.[0]?.font).toBe('Consolas')
     expect(code?.runs?.[0]?.text).toContain('const b = 2')
+  })
+
+  it('mermaid blocks export as the rendered image when a renderer is given', async () => {
+    const editor = createEditor('```mermaid\nflowchart LR\n    A --> B\n```')
+    const png = { base64: 'iVBORw0KGgo=', mime: 'image/png' as const, widthPx: 200, heightPx: 100 }
+    const sources: string[] = []
+    const mapping = await mapDocToSaveBlocks(editor.getJSON(), noImages, async (src) => {
+      sources.push(src)
+      return png
+    })
+    expect(sources).toEqual(['flowchart LR\n    A --> B'])
+    expect(mapping.blocks[0]).toEqual({ kind: 'image', image: png })
+  })
+
+  it('mermaid blocks fall back to their source when rendering fails or is absent', async () => {
+    const md = '```mermaid\nflowchart LR\n    A --> B\n```'
+    const failing = await mapDocToSaveBlocks(createEditor(md).getJSON(), noImages, () =>
+      Promise.reject(new Error('no canvas')),
+    )
+    const none = await mapDocToSaveBlocks(createEditor(md).getJSON(), noImages)
+    for (const mapping of [failing, none]) {
+      const block = mapping.blocks[0]!
+      expect(block.kind).toBe('generated')
+      if (block.kind === 'generated') {
+        expect(block.block.runs?.[0]?.text).toBe('flowchart LR\n    A --> B')
+        expect(block.block.runs?.[0]?.font).toBe('Consolas')
+      }
+    }
   })
 
   it('links survive as hyperlink runs', async () => {

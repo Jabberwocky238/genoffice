@@ -32,9 +32,11 @@ export function contextTabForElement(type: ContextElementType): ContextTab | nul
 }
 
 /**
- * Shapes get their own format tab (styles/fill/outline), but selecting a text-bearing
- * shape should not pull the user away from Home's text controls.
+ * Tab the ribbon jumps to on selection. PowerPoint only reveals Shape Format for
+ * shapes and text boxes (Home stays active so text formatting is one click
+ * away); pictures/tables/charts still switch to their dedicated tools.
  */
 export function autoContextTabForElement(type: ContextElementType): ContextTab | null {
-  return type === 'textShape' ? null : contextTabForElement(type)
+  const tab = contextTabForElement(type)
+  return tab === 'shapeFormat' ? null : tab
 }

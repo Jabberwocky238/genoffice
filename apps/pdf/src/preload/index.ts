@@ -1,6 +1,8 @@
+import type { AiPanelPrefs } from '@genoffice/ui'
 import { contextBridge, ipcRenderer } from 'electron'
 import type { Lang } from '@genoffice/i18n'
 import type { AiStreamChunk } from '@genoffice/ai-provider'
+import { installDropOpenBridge } from '@genoffice/electron-utils/drop-open'
 import { AI_CHANNELS, PDF_CHANNELS } from '../shared/ipc'
 import type { PdfApi, UiTheme } from '../shared/ipc'
 
@@ -8,10 +10,15 @@ const api: PdfApi = {
   consumePending: () => ipcRenderer.invoke(PDF_CHANNELS.consumePending),
   readFile: (path) => ipcRenderer.invoke(PDF_CHANNELS.readFile, path),
   save: (request) => ipcRenderer.invoke(PDF_CHANNELS.save, request),
+  autoRename: (path, baseName) => ipcRenderer.invoke(PDF_CHANNELS.autoRename, path, baseName),
+  isUntitled: (path) => ipcRenderer.invoke(PDF_CHANNELS.isUntitled, path),
   validateTextEdits: (request) => ipcRenderer.invoke(PDF_CHANNELS.validateTextEdits, request),
   listEditFonts: () => ipcRenderer.invoke(PDF_CHANNELS.listEditFonts),
+  canDrawText: (text, font, bold, italic) =>
+    ipcRenderer.invoke(PDF_CHANNELS.canDrawText, text, font, bold, italic),
   listPageImages: (path) => ipcRenderer.invoke(PDF_CHANNELS.listPageImages, path),
   listStaticFormFills: (path) => ipcRenderer.invoke(PDF_CHANNELS.listStaticFormFills, path),
+  ocrPage: (png) => ipcRenderer.invoke(PDF_CHANNELS.ocrPage, png),
   pageImagePng: (request) => ipcRenderer.invoke(PDF_CHANNELS.pageImagePng, request),
   pagePreviewPng: (request) => ipcRenderer.invoke(PDF_CHANNELS.pagePreviewPng, request),
   extractPages: (request) => ipcRenderer.invoke(PDF_CHANNELS.extractPages, request),
@@ -25,6 +32,8 @@ const api: PdfApi = {
   splitPages: (request) => ipcRenderer.invoke(PDF_CHANNELS.splitPages, request),
   cropPages: (request) => ipcRenderer.invoke(PDF_CHANNELS.cropPages, request),
   exportImages: (request) => ipcRenderer.invoke(PDF_CHANNELS.exportImages, request),
+  convertOffice: (format) => ipcRenderer.invoke(PDF_CHANNELS.convertOffice, format),
+  createDocument: (request) => ipcRenderer.invoke(PDF_CHANNELS.createDocument, request),
   imageSearch: (query, maxResults) =>
     ipcRenderer.invoke(AI_CHANNELS.imageSearch, query, maxResults),
   fetchImage: (url) => ipcRenderer.invoke(AI_CHANNELS.fetchImage, url),
@@ -68,12 +77,19 @@ const api: PdfApi = {
     ipcRenderer.on(PDF_CHANNELS.themeChanged, listener)
     return () => ipcRenderer.removeListener(PDF_CHANNELS.themeChanged, listener)
   },
+  getAiPanelPrefs: () => ipcRenderer.invoke(PDF_CHANNELS.getAiPanelPrefs),
+  onAiPanelPrefsChanged: (handler) => {
+    const listener = (_event: Electron.IpcRendererEvent, prefs: AiPanelPrefs) => handler(prefs)
+    ipcRenderer.on(PDF_CHANNELS.aiPanelPrefsChanged, listener)
+    return () => ipcRenderer.removeListener(PDF_CHANNELS.aiPanelPrefsChanged, listener)
+  },
   onChromePressed: (handler) => {
     const listener = () => handler()
     ipcRenderer.on('app:chrome-pressed', listener)
     return () => ipcRenderer.removeListener('app:chrome-pressed', listener)
   },
   getAiSettings: () => ipcRenderer.invoke(AI_CHANNELS.getSettings),
+  gskStatus: () => ipcRenderer.invoke(AI_CHANNELS.gskStatus),
   aiStream: (request) => ipcRenderer.invoke(AI_CHANNELS.stream, request),
   aiStreamCancel: (requestId) => ipcRenderer.invoke(AI_CHANNELS.streamCancel, requestId),
   onAiStream: (handler) => {
@@ -83,4 +99,20 @@ const api: PdfApi = {
   },
 }
 
+// Shared project chat store (registered app-wide by the shell's main init):
+// AI PDF conversations persist per file, like Docs/Sheets (alpha ledger r142)
+const projectApi = {
+  resolveChat: (args: { filePath: string | null; tempChatId?: string }) =>
+    ipcRenderer.invoke('project:resolveChat', args),
+  appendChat: (args: unknown) => ipcRenderer.invoke('project:appendChat', args),
+  loadChat: (args: { projectId: string; chatId: string; limit?: number }) =>
+    ipcRenderer.invoke('project:loadChat', args),
+  rebindChat: (args: { projectId: string; tempChatId: string; newFilePath: string }) =>
+    ipcRenderer.invoke('project:rebindChat', args),
+}
+
 contextBridge.exposeInMainWorld('pdfApi', api)
+contextBridge.exposeInMainWorld('projectApi', projectApi)
+
+// open documents dragged from the OS onto this tab as a new shell tab
+installDropOpenBridge()

@@ -1,3 +1,4 @@
+import type { AiPanelPrefs } from '@genoffice/ui'
 import type { Lang } from '@genoffice/i18n'
 import type { AiSettings, AiStreamChunk, AiStreamRequest } from '@genoffice/ai-provider'
 
@@ -5,11 +6,15 @@ export const PDF_CHANNELS = {
   consumePending: 'pdf:consume-pending',
   readFile: 'pdf:read-file',
   save: 'pdf:save',
+  autoRename: 'pdf:auto-rename',
+  isUntitled: 'pdf:is-untitled',
   validateTextEdits: 'pdf:validate-text-edits',
   listEditFonts: 'pdf:list-edit-fonts',
+  canDrawText: 'pdf:can-draw-text',
   listPageImages: 'pdf:list-page-images',
   listStaticFormFills: 'pdf:list-static-form-fills',
   pageImagePng: 'pdf:page-image-png',
+  ocrPage: 'pdf:ocr-page',
   pagePreviewPng: 'pdf:page-preview-png',
   extractPages: 'pdf:extract-pages',
   insertPdf: 'pdf:insert-pdf',
@@ -22,6 +27,8 @@ export const PDF_CHANNELS = {
   splitPages: 'pdf:split-pages',
   cropPages: 'pdf:crop-pages',
   exportImages: 'pdf:export-images',
+  convertOffice: 'pdf:convert-office',
+  createDocument: 'pdf:create-document',
   generateImage: 'pdf:generate-image',
   listSignatures: 'pdf:list-signatures',
   addSignature: 'pdf:add-signature',
@@ -38,6 +45,8 @@ export const PDF_CHANNELS = {
   languageChanged: 'app:language-changed',
   getTheme: 'app:get-theme',
   themeChanged: 'app:theme-changed',
+  getAiPanelPrefs: 'app:get-ai-panel-prefs',
+  aiPanelPrefsChanged: 'app:ai-panel-prefs-changed',
 } as const
 
 export const VISUAL_SIGNATURE_CONTENT_PREFIX = 'GenOffice visual signature field: '
@@ -65,6 +74,26 @@ export interface SavedSignature {
   id: string
   createdAt: number
   data: SignatureData
+}
+
+export type PdfConvertFormat = 'docx' | 'xlsx' | 'pptx'
+
+/** target file type of the AI create_document tool (mirrors the docs app's contract) */
+export type CreateDocumentType = 'docx' | 'pdf' | 'md' | 'html'
+
+export interface CreateDocumentRequest {
+  type: CreateDocumentType
+  /** file name stem (sanitized main-side) */
+  title: string
+  /** docx/pdf: restricted HTML; md: Markdown source */
+  content: string
+}
+
+export interface CreateDocumentResult {
+  ok: boolean
+  /** the created file, when it is written directly (pdf/md); docx opens as a new tab that saves itself */
+  path?: string
+  error?: string
 }
 
 export type UiTheme = 'light' | 'dark' | 'system'
@@ -381,6 +410,15 @@ export interface StaticFormFillRecord {
   align?: 'left' | 'center' | 'right'
 }
 
+/** One OCR line from the system engine: normalized bottom-left boxes relative to
+    the submitted image ([x0,y0,x1,y1], 0..1), with optional word-level char boxes. */
+export interface PdfOcrLine {
+  text: string
+  confidence: number
+  box: [number, number, number, number]
+  chars?: { text: string; box: [number, number, number, number] }[]
+}
+
 /** Live-preview render request: a page region with some images removed */
 export interface PagePreviewRequest {
   path: string
@@ -461,6 +499,13 @@ export interface TextInsertFailure {
   reason: string
 }
 
+/** Answer to autoRename; `path`/`name` present when renamed */
+export interface PdfAutoRenameResult {
+  renamed: boolean
+  path?: string
+  name?: string
+}
+
 export type SavePdfResult =
   | {
       ok: true
@@ -479,7 +524,7 @@ export interface ValidateTextEditsRequest {
 /** Extract pages into a new PDF written to the GenOffice save dir and opened in a new tab */
 export interface ExtractPagesRequest {
   path: string
-  /** Original page indices */
+  /** Page indices in the file as saved (the renderer flushes first, so visible positions) */
   pages: number[]
   suggestedName: string
 }
@@ -603,6 +648,7 @@ export type ExportImagesResult =
 /** AI channels are app-wide shared ipcMain handlers (shell registers via docs-main registerAiIpc); pass-through only */
 export const AI_CHANNELS = {
   getSettings: 'ai:get-settings',
+  gskStatus: 'ai:gsk-status',
   stream: 'ai:stream',
   streamChunk: 'ai:stream-chunk',
   streamCancel: 'ai:stream-cancel',
@@ -632,14 +678,27 @@ export interface PdfApi {
   readFile(path: string): Promise<ArrayBuffer>
   /** Write markups/form values/page ops back to the original file (pdf-lib, content streams untouched); path grants same as readFile. With targetPath set (Save As), the original is only read and the result goes to targetPath */
   save(request: SavePdfRequest): Promise<SavePdfResult>
+  /** Content-derived naming (docs/sheets analog): propose a file base name after a save.
+      The main process renames only while the file still carries the shell's auto-created
+      untitled name, so user-chosen names are never touched. */
+  autoRename(path: string, baseName: string): Promise<PdfAutoRenameResult>
+  /** Whether the file is a shell-created blank still carrying its untitled name
+      (gates the after-AI-run silent save; a PDF the user merely opened must never auto-write) */
+  isUntitled(path: string): Promise<boolean>
   /** Dry-run match of pending text edits against the file: reason null = would apply */
   validateTextEdits(request: ValidateTextEditsRequest): Promise<TextEditValidation[]>
   /** EDIT_FONTS ids whose font file exists on this machine */
   listEditFonts(): Promise<string[]>
+  /** Whether any embeddable font on this machine can draw `text` (insert-time gate:
+      the preview renders with browser fallback, which proves nothing about save) */
+  canDrawText(text: string, font?: string, bold?: boolean, italic?: boolean): Promise<boolean>
   /** Enumerate the content-stream images of every page (for image edit mode) */
   listPageImages(path: string): Promise<PageImageRef[]>
   /** Read GenOffice static-fill metadata stored inside the PDF. */
   listStaticFormFills(path: string): Promise<StaticFormFillRecord[]>
+  /** System-OCR one rendered page image (PNG, base64); null when no engine is
+      available on this platform, [] when recognition failed for this image */
+  ocrPage(png: string): Promise<PdfOcrLine[] | null>
   /** Render one existing image object to PNG (base64) for move/resize ghost previews; null if it can't be matched */
   pageImagePng(request: {
     path: string
@@ -663,6 +722,10 @@ export interface PdfApi {
   splitPages(request: SplitPagesRequest): Promise<SplitPagesResult>
   cropPages(request: CropPagesRequest): Promise<CropPagesResult>
   exportImages(request: ExportImagesRequest): Promise<ExportImagesResult>
+  /** Convert the current PDF to Word / Excel / PowerPoint via the shell's local conversion flows */
+  convertOffice(format: PdfConvertFormat): Promise<void>
+  /** AI create_document: build a new standalone file in the default folder and open it in a new tab */
+  createDocument(request: CreateDocumentRequest): Promise<CreateDocumentResult>
   /** Web image search for AI tools (app-wide ai:image-search handler) */
   imageSearch(query: string, maxResults?: number): Promise<ImageSearchResponse>
   /** Download an image URL in the main process (SSRF-guarded, avoids CORS); null on failure */
@@ -696,10 +759,15 @@ export interface PdfApi {
   onLanguageChanged(handler: (lang: Lang) => void): () => void
   getTheme(): Promise<UiTheme>
   onThemeChanged(handler: (theme: UiTheme) => void): () => void
+  /** AI panel text size + chat-input spellcheck (Settings → General in the shell) */
+  getAiPanelPrefs(): Promise<AiPanelPrefs>
+  onAiPanelPrefsChanged(handler: (prefs: AiPanelPrefs) => void): () => void
   /** press on the shell chrome (tab strip is a sibling WebContentsView whose
    *  clicks produce no DOM event here) — dismiss open popovers */
   onChromePressed(handler: () => void): () => void
   getAiSettings(): Promise<AiSettings>
+  /** Genspark login state (gsk); gates the cloud-only generate_image tool */
+  gskStatus(): Promise<{ loggedIn: boolean }>
   aiStream(request: AiStreamRequest): Promise<void>
   aiStreamCancel(requestId: string): Promise<void>
   onAiStream(handler: (chunk: AiStreamChunk) => void): () => void

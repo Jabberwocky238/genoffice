@@ -6,15 +6,27 @@
  * simple shapes; everything else → passthrough.
  */
 import { XMLParser } from 'fast-xml-parser'
+import { layoutHierTree, parseHierConstraints } from './dgm-hier'
 import { scanSlide, type SpElement } from './scan'
 import { tableRowGridCols } from './table-grid'
-import { type Theme, resolveFontRef, resolveSchemeColor } from './theme'
+import {
+  type EaScript,
+  type Theme,
+  eaScriptOfLang,
+  resolveFontRef,
+  resolveSchemeColor,
+  themeWithOverride,
+} from './theme'
 import { resolveColorNode as resolveColorNodeShared } from './color'
 import {
+  resolvePlaceholderPresetGeom,
   resolvePlaceholderTransform,
   resolvePlaceholderAnchor,
+  resolvePlaceholderAnchorCtr,
+  resolvePlaceholderInsets,
   resolvePlaceholderFillSpPr,
   parseLstStyleLevels,
+  parseDefRPrStyle,
   placeholderStyleChain,
   mergeTextStyleChain,
   type PlaceholderMap,
@@ -32,6 +44,7 @@ import type {
   Transform,
   TextBody,
   Paragraph,
+  ParagraphDefaultRunProps,
   TextRun,
   Fill,
   Stroke,
@@ -83,6 +96,9 @@ const parser = new XMLParser({
 
 const EMU_PER_PT = 12700
 
+/** <a:bodyPr> inset defaults (EMU): 0.1" left/right, 0.05" top/bottom. */
+export const DEFAULT_BODY_INSETS = { l: 91440, t: 45720, r: 91440, b: 45720 }
+
 export interface ParseContext {
   theme?: Theme
   /** Effective fill of the enclosing group (<a:grpFill/> in a child resolves to this) */
@@ -113,7 +129,7 @@ export interface ParseContext {
   masterPlaceholders?: PlaceholderMap
   /** master <p:txStyles> text style defaults (title/body/other families) */
   masterTextStyles?: MasterTextStyles
-  /** presentation.xml <p:defaultTextStyle>: base defaults for non-placeholder text boxes */
+  /** presentation.xml <p:defaultTextStyle>: base defaults for every non-placeholder shape */
   defaultTextStyle?: TextStyleLevels
   /** Full layout XML (read-only, for background inheritance) */
   layoutBg?: string
@@ -126,6 +142,10 @@ export interface ParseContext {
   themeMediaRels?: Map<string, string>
   /** Chart rId → that chart part's own image rels (for chart background picture fills) */
   chartMediaRels?: Map<string, Map<string, string>>
+  /** Chart rIds whose part has a Microsoft chartStyle companion (modern gray label defaults) */
+  chartStyleRels?: Set<string>
+  /** chart rId → its themeOverride part XML (chart-local clrScheme/fontScheme) */
+  chartThemeOverrides?: Map<string, string>
   /** Diagram data rId → the drawing part's own image rels (SmartArt picture fills) */
   diagramMediaRels?: Map<string, Map<string, string>>
   /** ppt/tableStyles.xml source (table style definitions, read-only) */
@@ -241,6 +261,21 @@ export function parseBackground(xml: string, ctx: ParseContext): Fill | undefine
   return undefined
 }
 
+const NV_PR_KEYS: Record<string, string> = {
+  'p:sp': 'p:nvSpPr',
+  'p:pic': 'p:nvPicPr',
+  'p:grpSp': 'p:nvGrpSpPr',
+  'p:graphicFrame': 'p:nvGraphicFramePr',
+  'p:cxnSp': 'p:nvCxnSpPr',
+}
+
+function isHiddenElement(node: any, tagName: string): boolean {
+  const nvKey = NV_PR_KEYS[tagName]
+  if (!nvKey) return false
+  const hidden = node?.[nvKey]?.['p:cNvPr']?.['@_hidden']
+  return hidden === '1' || hidden === 'true'
+}
+
 function parseShapeFragment(
   sp: SpElement,
   fragXml: string,
@@ -262,13 +297,23 @@ function parseShapeFragment(
   const node = doc[sp.name] ? (Array.isArray(doc[sp.name]) ? doc[sp.name][0] : doc[sp.name]) : null
   if (!node) return null
 
+  // <p:cNvPr hidden="1">: PowerPoint never paints the shape (slideshow, PDF export,
+  // or editing canvas) — consulting templates hide whole scaffold layers this way.
+  // Keep the bytes (silent passthrough) so saves replay them verbatim.
+  if (isHiddenElement(node, sp.name)) {
+    const silent = passthrough(anchor, 'unknown', node)
+    silent.noChip = true
+    return silent
+  }
+
   switch (sp.name) {
     case 'p:sp':
       // fragXml explicitly: decoration anchors carry an empty originalXml, and custGeom
       // parses from raw bytes — without it master/layout freeforms degrade to rects
       return parseSpShape(node, anchor, ctx, fragXml)
     case 'p:pic':
-      return parsePicture(node, anchor, ctx)
+      // fragXml for the same reason as p:sp: pic custGeom parses from raw bytes
+      return parsePicture(node, anchor, ctx, fragXml)
     case 'p:grpSp':
       return parseGroup(node, anchor, ctx, fragXml)
     case 'p:graphicFrame':
@@ -340,7 +385,10 @@ function parseSpShape(
       : undefined
   let fill = parseFill(spPr, ctx)
   const txBody = node['p:txBody']
-  // Text style inheritance chain: placeholders inherit font size/color/font defaults from layout/master
+  // Text style inheritance chain: placeholders inherit font size/color/font defaults from
+  // layout/master; every other shape (text box or autoshape, on the slide, layout or master)
+  // sits on presentation.xml defaultTextStyle — the master otherStyle is not consulted
+  // (PowerPoint probe: defaultTextStyle 14pt / otherStyle 28pt → all seven shapes 14pt)
   const phChain = ph
     ? placeholderStyleChain(
         ctx.layoutPlaceholders,
@@ -349,7 +397,7 @@ function parseSpShape(
         phType,
         phIdx,
       )
-    : ctx.defaultTextStyle && node['p:nvSpPr']?.['p:cNvSpPr']?.['@_txBox'] === '1'
+    : ctx.defaultTextStyle
       ? [ctx.defaultTextStyle]
       : []
   // <p:style> fontRef color ranks between the shape's own lstStyle and the
@@ -357,7 +405,10 @@ function parseSpShape(
   // master txStyles color — PowerPoint behavior, bnc904423)
   const fontRefColor = resolveColorNode(node['p:style']?.['a:fontRef'], ctx)
   const chainLayers = fontRefColor ? [{ levels: [{ color: fontRefColor }] }, ...phChain] : phChain
-  const text = txBody ? parseTextBody(txBody, ctx, chainLayers) : undefined
+  const phInsets = ph
+    ? resolvePlaceholderInsets(ctx.layoutPlaceholders, ctx.masterPlaceholders, phType, phIdx)
+    : undefined
+  const text = txBody ? parseTextBody(txBody, ctx, chainLayers, phInsets) : undefined
   // bodyPr anchor inherits along the placeholder chain (e.g. master titles anchor="ctr")
   if (ph && text && !text.anchor) {
     const inherited = resolvePlaceholderAnchor(
@@ -368,10 +419,22 @@ function parseSpShape(
     )
     if (inherited) text.anchor = inherited
   }
+  if (ph && text && text.anchorCtr == null) {
+    const inherited = resolvePlaceholderAnchorCtr(
+      ctx.layoutPlaceholders,
+      ctx.masterPlaceholders,
+      phType,
+      phIdx,
+    )
+    if (inherited != null) text.anchorCtr = inherited
+  }
 
   let stroke = parseStroke(spPr, ctx)
   let shadow = parseShadow(spPr, ctx)
   let glow = parseGlow(spPr, ctx)
+  const reflection = parseReflection(spPr)
+  const scene3d = parseScene3D(spPr, ctx)
+  const softEdgeRad = spPr?.['a:effectLst']?.['a:softEdge']?.['@_rad']
   // <a:fillOverlay> holds a second fill element directly (a:gradFill/…), so parseFill reads it like an spPr
   const overlayNode = spPr?.['a:effectLst']?.['a:fillOverlay']
   const fillOverlay = overlayNode ? parseFill(overlayNode, ctx) : undefined
@@ -442,6 +505,7 @@ function parseSpShape(
     transform,
     // <p:ph> without a type (content placeholder) defaults to body per ECMA
     placeholder: ph ? (phType ?? 'body') : undefined,
+    ...(nv?.['p:cNvSpPr']?.['@_txBox'] === '1' ? { txBox: true } : {}),
     name,
     presetGeometry,
     ...(adjust ? { adjust } : {}),
@@ -452,6 +516,9 @@ function parseSpShape(
     ...(stroke ? { stroke } : {}),
     ...(shadow ? { shadow } : {}),
     ...(glow ? { glow } : {}),
+    ...(reflection ? { reflection } : {}),
+    ...(scene3d ? { scene3d } : {}),
+    ...(softEdgeRad != null ? { softEdge: intOr(softEdgeRad, 0) } : {}),
     text,
   }
   return el
@@ -494,6 +561,16 @@ function parseStroke(
   const capMap: Record<string, Stroke['cap']> = { flat: 'flat', rnd: 'round', sq: 'square' }
   const dash = ln['a:prstDash']?.['@_val']
   const cap = ln['@_cap'] ? capMap[ln['@_cap']] : undefined
+  const cmpdMap: Record<string, Stroke['compound']> = {
+    sng: 'sng',
+    dbl: 'dbl',
+    thickThin: 'thickThin',
+    thinThick: 'thinThick',
+    tri: 'tri',
+  }
+  const compound = ln['@_cmpd'] ? cmpdMap[ln['@_cmpd']] : undefined
+  const join: Stroke['join'] =
+    'a:round' in ln ? 'round' : 'a:bevel' in ln ? 'bevel' : 'a:miter' in ln ? 'miter' : undefined
   const headEnd = parseArrowEnd(ln['a:headEnd'])
   const tailEnd = parseArrowEnd(ln['a:tailEnd'])
   return {
@@ -501,6 +578,8 @@ function parseStroke(
     width: intOr(ln['@_w'], 12700),
     ...(dash ? { dash: String(dash) } : {}),
     ...(cap ? { cap } : {}),
+    ...(join ? { join } : {}),
+    ...(compound && compound !== 'sng' ? { compound } : {}),
     ...(headEnd ? { headEnd } : {}),
     ...(tailEnd ? { tailEnd } : {}),
   }
@@ -587,16 +666,72 @@ function parseGlow(spPr: any, ctx: ParseContext): import('./types').GlowEffect |
   return { color, radius: Number.isFinite(rad) ? rad : 0 }
 }
 
+/** <a:effectLst><a:reflection> element-level reflection (flipped fading copy). */
+function parseReflection(spPr: any): import('./types').ReflectionEffect | undefined {
+  const r = spPr?.['a:effectLst']?.['a:reflection']
+  if (!r || typeof r !== 'object') return undefined
+  return {
+    blurRad: intOr(r['@_blurRad'], 0),
+    startA: r['@_stA'] != null ? intOr(r['@_stA'], 100000) / 100000 : 1,
+    endPos: r['@_endPos'] != null ? intOr(r['@_endPos'], 100000) / 100000 : 1,
+    dist: intOr(r['@_dist'], 0),
+  }
+}
+
 function parseShadow(spPr: any, ctx: ParseContext): ShadowEffect | undefined {
-  const shdw = spPr?.['a:effectLst']?.['a:outerShdw']
+  const outer = spPr?.['a:effectLst']?.['a:outerShdw']
+  const shdw = outer ?? spPr?.['a:effectLst']?.['a:innerShdw']
   if (!shdw || typeof shdw !== 'object') return undefined
   const color = resolveColorNode(shdw, ctx)
   if (!color) return undefined
+  const sx = shdw['@_sx'] != null ? intOr(shdw['@_sx'], 100000) / 100000 : undefined
+  const sy = shdw['@_sy'] != null ? intOr(shdw['@_sy'], 100000) / 100000 : undefined
+  const kx = shdw['@_kx'] != null ? intOr(shdw['@_kx'], 0) / 60000 : undefined
+  const ky = shdw['@_ky'] != null ? intOr(shdw['@_ky'], 0) / 60000 : undefined
   return {
     color,
     blurRad: intOr(shdw['@_blurRad'], 0),
     dist: intOr(shdw['@_dist'], 0),
     dirDeg: intOr(shdw['@_dir'], 0) / 60000,
+    ...(outer ? {} : { inner: true }),
+    ...(sx != null ? { sx } : {}),
+    ...(sy != null ? { sy } : {}),
+    ...(kx ? { kxDeg: kx } : {}),
+    ...(ky ? { kyDeg: ky } : {}),
+    ...(typeof shdw['@_algn'] === 'string' ? { algn: shdw['@_algn'] } : {}),
+  }
+}
+
+/** <a:scene3d> (camera + light rig) and <a:sp3d> (extrusion). Only attached when a camera exists. */
+function parseScene3D(spPr: any, ctx: ParseContext): import('./types').Scene3D | undefined {
+  const s3 = spPr?.['a:scene3d']
+  const camera = s3?.['a:camera']
+  const cameraPreset = camera?.['@_prst']
+  if (!cameraPreset) return undefined
+  const sp3d = spPr?.['a:sp3d']
+  const rot = (node: any): { lat: number; lon: number; rev: number } | undefined => {
+    const r = node?.['a:rot']
+    if (!r || typeof r !== 'object') return undefined
+    return { lat: intOr(r['@_lat'], 0), lon: intOr(r['@_lon'], 0), rev: intOr(r['@_rev'], 0) }
+  }
+  const rig = s3['a:lightRig']
+  const extrusionClr = sp3d?.['a:extrusionClr']
+  const extrusionColor =
+    extrusionClr && typeof extrusionClr === 'object'
+      ? resolveColorNode(extrusionClr, ctx)
+      : undefined
+  const cameraRot = rot(camera)
+  const lightRot = rot(rig)
+  return {
+    cameraPreset,
+    ...(cameraRot ? { cameraRot } : {}),
+    ...(rig?.['@_rig'] ? { lightRig: rig['@_rig'] } : {}),
+    ...(rig?.['@_dir'] ? { lightDir: rig['@_dir'] } : {}),
+    ...(lightRot ? { lightRot } : {}),
+    ...(sp3d?.['@_extrusionH'] != null ? { extrusionEmu: intOr(sp3d['@_extrusionH'], 0) } : {}),
+    ...(sp3d?.['@_z'] != null ? { zEmu: intOr(sp3d['@_z'], 0) } : {}),
+    ...(extrusionColor ? { extrusionColor } : {}),
+    ...(sp3d?.['@_prstMaterial'] ? { material: sp3d['@_prstMaterial'] } : {}),
   }
 }
 
@@ -688,13 +823,14 @@ function parseGroupChild(
 ): SlideElement | null {
   // Child byte anchor: no independent byte roundtrip inside a group (whole group passes through), so use an empty anchor.
   const childAnchor: ByteAnchor = { spIndex: -1, originalXml: '', range: [0, 0] }
+  if (isHiddenElement(child, tag)) return null
   let el: SlideElement | null
   switch (tag) {
     case 'p:sp':
       el = parseSpShape(child, childAnchor, ctx, rawXml)
       break
     case 'p:pic':
-      el = parsePicture(child, childAnchor, ctx)
+      el = parsePicture(child, childAnchor, ctx, rawXml)
       break
     case 'p:grpSp':
       el = parseGroup(child, childAnchor, ctx, rawXml)
@@ -798,7 +934,12 @@ function blipEmbedId(blip: any): string | undefined {
   return undefined
 }
 
-function parsePicture(node: any, anchor: ByteAnchor, ctx: ParseContext): PictureElement {
+function parsePicture(
+  node: any,
+  anchor: ByteAnchor,
+  ctx: ParseContext,
+  rawXml?: string,
+): PictureElement {
   const spPr = node['p:spPr'] ?? {}
   let transform = parseXfrm(spPr['a:xfrm'])
   // Pictures dropped into a placeholder may omit <a:xfrm> entirely; geometry comes from layout/master
@@ -820,8 +961,28 @@ function parsePicture(node: any, anchor: ByteAnchor, ctx: ParseContext): Picture
   const descr = node['p:nvPicPr']?.['p:cNvPr']?.['@_descr']
   const srcRect = parseSrcRect(blipFill?.['a:srcRect'])
   // picture styles outline geometry (ellipse avatars/rounded-corner frames etc.); rect is the default and not recorded
-  const picGeom = spPr['a:prstGeom']?.['@_prst']
-  const picAdjust = parseAvLst(spPr['a:prstGeom']?.['a:avLst'])
+  let picGeom = spPr['a:prstGeom']?.['@_prst']
+  let picAdjust = parseAvLst(spPr['a:prstGeom']?.['a:avLst'])
+  // Placeholder pictures without their own geometry clip to the layout/master
+  // placeholder's shape (e.g. a parallelogram picture placeholder)
+  if (!picGeom && !spPr['a:custGeom'] && picPh) {
+    const inheritedGeom = resolvePlaceholderPresetGeom(
+      ctx.layoutPlaceholders,
+      ctx.masterPlaceholders,
+      picPh['@_type'],
+      picPh['@_idx'] != null ? String(picPh['@_idx']) : undefined,
+    )
+    if (inheritedGeom) {
+      picGeom = inheritedGeom.prst
+      picAdjust = parseAvLst(inheritedGeom.avLstRaw)
+    }
+  }
+  // custGeom picture frame (photo clipped to a freeform path, e.g. diagonal hero images)
+  const customGeometry =
+    spPr['a:custGeom'] != null
+      ? parseCustGeom(rawXml || anchor.originalXml, transform.offset.cx, transform.offset.cy)
+      : undefined
+  const scene3d = parseScene3D(spPr, ctx)
   const softEdgeRad = spPr['a:effectLst']?.['a:softEdge']?.['@_rad']
   const alphaAmt = blip?.['a:alphaModFix']?.['@_amt']
   const opacity =
@@ -829,10 +990,12 @@ function parsePicture(node: any, anchor: ByteAnchor, ctx: ParseContext): Picture
   const stroke = parseStroke(spPr, ctx)
   const shadow = parseShadow(spPr, ctx)
   const glow = parseGlow(spPr, ctx)
+  const reflection = parseReflection(spPr)
   // Pic's own spPr fill: PowerPoint draws it as a backdrop behind the (possibly translucent) blip
   const fill = parseFill(spPr, ctx)
   const duotone = parseDuotone(blip, ctx)
   const clrChange = parseClrChange(blip, ctx)
+  const lum = parseLum(blip)
   // Audio/video: a:videoFile/a:audioFile under p:nvPr; blipFill is the poster frame
   const nvPr = node['p:nvPicPr']?.['p:nvPr']
   const avNode = nvPr?.['a:videoFile'] ?? nvPr?.['a:audioFile']
@@ -858,15 +1021,19 @@ function parsePicture(node: any, anchor: ByteAnchor, ctx: ParseContext): Picture
     ...(picGeom && picGeom !== 'rect'
       ? { presetGeometry: picGeom, ...(picAdjust ? { adjust: picAdjust } : {}) }
       : {}),
+    ...(customGeometry ? { customGeometry } : {}),
+    ...(scene3d ? { scene3d } : {}),
     ...(opacity != null && opacity < 1 ? { opacity } : {}),
     ...(softEdgeRad != null ? { softEdge: intOr(softEdgeRad, 0) } : {}),
     ...(media ? { media } : {}),
     ...(fill ? { fill } : {}),
     ...(duotone ? { duotone } : {}),
     ...(clrChange ? { clrChange } : {}),
+    ...(lum ? { lum } : {}),
     ...(stroke ? { stroke } : {}),
     ...(shadow ? { shadow } : {}),
     ...(glow ? { glow } : {}),
+    ...(reflection ? { reflection } : {}),
   }
 }
 
@@ -935,7 +1102,9 @@ function graphicFramePassthrough(node: any, anchor: ByteAnchor, ctx: ParseContex
   if (uri.includes('/chartex')) {
     const rid = data?.['cx:chart']?.['@_r:id']
     const chartXml = rid ? ctx.chartXmls?.get(String(rid)) : undefined
-    const model = chartXml ? parseChartExXml(chartXml, ctx.theme) : null
+    const ovXml = rid ? ctx.chartThemeOverrides?.get(String(rid)) : undefined
+    const chartTheme = ovXml ? themeWithOverride(ctx.theme, ovXml) : ctx.theme
+    const model = chartXml ? parseChartExXml(chartXml, chartTheme) : null
     if (model) {
       const cNvPr = node['p:nvGraphicFramePr']?.['p:cNvPr']
       return {
@@ -952,11 +1121,19 @@ function graphicFramePassthrough(node: any, anchor: ByteAnchor, ctx: ParseContex
   if (uri.includes('/chart')) {
     const rid = data?.['c:chart']?.['@_r:id']
     const chartXml = rid ? ctx.chartXmls?.get(rid) : undefined
-    // Fill resolver bound to the chart part's own rels (blip rIds live there, not on the slide)
-    const chartFillCtx: ParseContext = { ...ctx, mediaRels: ctx.chartMediaRels?.get(String(rid)) }
+    const ovXml = rid ? ctx.chartThemeOverrides?.get(String(rid)) : undefined
+    const chartTheme = ovXml ? themeWithOverride(ctx.theme, ovXml) : ctx.theme
+    // Fill resolver bound to the chart part's own rels (blip rIds live there, not on
+    // the slide) and to the chart-local theme (accents may be remapped per chart)
+    const chartFillCtx: ParseContext = {
+      ...ctx,
+      mediaRels: ctx.chartMediaRels?.get(String(rid)),
+      theme: chartTheme,
+    }
     const model = chartXml
-      ? parseChartXml(chartXml, ctx.theme, (spPr) => parseFill(spPr, chartFillCtx))
+      ? parseChartXml(chartXml, chartTheme, (spPr) => parseFill(spPr, chartFillCtx))
       : null
+    if (model && ctx.chartStyleRels?.has(String(rid))) model.hasStylePart = true
     if (model) {
       const usXml = rid ? ctx.chartUserShapes?.get(String(rid)) : undefined
       if (usXml) {
@@ -998,9 +1175,18 @@ function graphicFramePassthrough(node: any, anchor: ByteAnchor, ctx: ParseContex
     if (drawingXml) {
       // Picture-fill rIds inside the drawing resolve against the drawing part's own rels
       const drawingRels = dm ? ctx.diagramMediaRels?.get(String(dm)) : undefined
+      // PowerPoint re-renders SmartArt from data+colors, so the drawing part's cached
+      // text color can be stale — resolve the truth per modelId from the color part
+      const csRel = data?.['dgm:relIds']?.['@_r:cs']
+      const txColors = diagramTextColors(
+        dm ? ctx.diagramDatas?.get(String(dm)) : undefined,
+        csRel ? ctx.diagramColors?.get(String(csRel)) : undefined,
+        ctx,
+      )
       const shapes = parseDiagramDrawing(
         drawingXml,
         drawingRels ? { ...ctx, mediaRels: drawingRels } : ctx,
+        txColors,
       )
       // A single text-less shape is a stub (writers emit just a background rect);
       // fall through to the layout fallback instead of drawing one giant block
@@ -1030,6 +1216,7 @@ function graphicFramePassthrough(node: any, anchor: ByteAnchor, ctx: ParseContex
           transform.offset.cy,
           uniqueId,
           colorsXml,
+          layoutXml,
         )
         if (shapes.length) el.previewShapes = shapes
       }
@@ -1066,7 +1253,47 @@ function graphicFramePassthrough(node: any, anchor: ByteAnchor, ctx: ParseContex
  * references). Coordinate system: the diagram canvas (origin 0,0, size ≈
  * graphicFrame ext).
  */
-function parseDiagramDrawing(drawingXml: string, ctx: ParseContext): SlideElement[] {
+/**
+ * dsp text-color truth: map dsp modelId → diagram-colors styleLbl txFillClrLst color,
+ * via the data part's presentation points (presStyleLbl). PowerPoint resolves SmartArt
+ * text from these, ignoring the drawing part's cached (possibly stale) fontRef color.
+ */
+function diagramTextColors(
+  dataXml: string | undefined,
+  colorsXml: string | undefined,
+  ctx: ParseContext,
+): Map<string, string> {
+  const out = new Map<string, string>()
+  if (!dataXml || !colorsXml) return out
+  const lblColor = new Map<string, string>()
+  for (const m of colorsXml.matchAll(/<dgm:styleLbl name="([^"]+)">([\s\S]*?)<\/dgm:styleLbl>/g)) {
+    const lst = /<dgm:txFillClrLst[^>]*>([\s\S]*?)<\/dgm:txFillClrLst>/.exec(m[2]!)?.[1]
+    if (!lst) continue
+    const cm = /<a:schemeClr val="([^"]+)"|<a:srgbClr val="([^"]+)"/.exec(lst)
+    if (!cm) continue
+    const c = cm[1]
+      ? resolveColorNode({ 'a:schemeClr': { '@_val': cm[1] } }, ctx)
+      : '#' + String(cm[2]).toUpperCase()
+    if (c) lblColor.set(m[1]!, c)
+  }
+  if (!lblColor.size) return out
+  for (const m of dataXml.matchAll(/<dgm:pt modelId="([^"]+)" type="pres"[\s\S]*?<\/dgm:pt>/g)) {
+    const lbl = /presStyleLbl="([^"]+)"/.exec(m[0])?.[1]
+    const c = lbl ? lblColor.get(lbl) : undefined
+    if (c) out.set(m[1]!, c)
+  }
+  return out
+}
+
+function parseDiagramDrawing(
+  drawingXml: string,
+  parentCtx: ParseContext,
+  txColors?: Map<string, string>,
+): SlideElement[] {
+  // SmartArt text inherits from the diagram's own text styles (theme minor font), not the
+  // presentation defaultTextStyle: POI customGeo has defaultTextStyle latin=Arial and
+  // PowerPoint still draws the diagram in Calibri
+  const ctx: ParseContext = { ...parentCtx, defaultTextStyle: undefined }
   const xml = drawingXml.replace(/<(\/?)dsp:/g, '<$1p:')
   let doc: any
   try {
@@ -1079,9 +1306,21 @@ function parseDiagramDrawing(drawingXml: string, ctx: ParseContext): SlideElemen
   const spsRaw = spTree['p:sp']
   const sps: any[] = Array.isArray(spsRaw) ? spsRaw : spsRaw ? [spsRaw] : []
   const out: SlideElement[] = []
-  for (const sp of sps) {
+  for (let sp of sps) {
     // The preview layer has no byte fidelity (never written back); the anchor is a placeholder
     const anchor: ByteAnchor = { spIndex: -1, originalXml: '', range: [0, 0] }
+    // Text color truth comes from the color part (see diagramTextColors); explicit run
+    // colors in the txBody still win since the fontRef is only the inherited fallback
+    const txC = txColors?.get(String(sp['@_modelId'] ?? ''))
+    if (txC && sp['p:txBody']) {
+      sp = {
+        ...sp,
+        'p:style': {
+          ...(sp['p:style'] ?? {}),
+          'a:fontRef': { '@_idx': 'minor', 'a:srgbClr': { '@_val': txC.replace('#', '') } },
+        },
+      }
+    }
     // dsp:txXfrm gives the text its own frame; split text off the shape so both
     // render with their proper transforms (text rotation is shape rot + txXfrm rot)
     const txXfrm = sp['p:txXfrm']
@@ -1133,6 +1372,10 @@ interface DgmTreeNode {
   texts: string[]
   spPr?: any
   children: DgmTreeNode[]
+  /** dgm:pt type="asst": org-chart assistant (own row, hangs left of the trunk) */
+  asst?: boolean
+  /** Explicit ST_HierBranchStyle from the presentation point ('hang'/'l'/'r'/'std'; init omitted) */
+  hierBranch?: string
 }
 
 /** Depth-first bullet lines of a node's descendants (lvl 1 = direct child). */
@@ -1179,6 +1422,8 @@ function dgmSp(
     stroke?: string
     noFill?: boolean
     adj?: number
+    /** Named adjust values (multi-adj presets like downArrow adj1/adj2) */
+    adjs?: Array<{ name: string; val: number }>
     /** xfrm rotation (60000ths of a degree) */
     rot?: number
   } = {},
@@ -1197,9 +1442,20 @@ function dgmSp(
       },
       'a:prstGeom': {
         '@_prst': opts.prst ?? 'rect',
-        ...(opts.adj != null
-          ? { 'a:avLst': { 'a:gd': { '@_name': 'adj', '@_fmla': 'val ' + Math.round(opts.adj) } } }
-          : {}),
+        ...(opts.adjs?.length
+          ? {
+              'a:avLst': {
+                'a:gd': opts.adjs.map((a) => ({
+                  '@_name': a.name,
+                  '@_fmla': 'val ' + Math.round(a.val),
+                })),
+              },
+            }
+          : opts.adj != null
+            ? {
+                'a:avLst': { 'a:gd': { '@_name': 'adj', '@_fmla': 'val ' + Math.round(opts.adj) } },
+              }
+            : {}),
       },
       ...fillNode,
       ...(opts.stroke
@@ -1268,6 +1524,7 @@ export function layoutDiagramFallback(
   frameCy: number,
   layoutId?: string,
   colorsXml?: string,
+  layoutXml?: string,
 ): SlideElement[] {
   let doc: any
   try {
@@ -1285,10 +1542,23 @@ export function layoutDiagramFallback(
   // dgm:pt type defaults to 'node'; some writers emit it explicitly
   const nodePts = new Map(
     pts
-      .filter((p) => p?.['@_type'] == null || p?.['@_type'] === 'node')
+      .filter((p) => p?.['@_type'] == null || p?.['@_type'] === 'node' || p?.['@_type'] === 'asst')
       .map((p) => [String(p['@_modelId']), p]),
   )
   // Plain parent-child connections (type absent or parOf), grouped by parent, ordered by srcOrd
+  // Node → explicit hierBranch (on its presentation point, via presOf): 'hang'/'l'/'r'
+  // force a hanging branch, 'std' forces side-by-side, 'init' leaves it to the heuristic
+  const presPts = new Map(
+    pts.filter((p) => p?.['@_type'] === 'pres').map((p) => [String(p['@_modelId']), p]),
+  )
+  const hierBranchOf = new Map<string, string>()
+  for (const pres of presPts.values()) {
+    const prSet = pres?.['dgm:prSet']
+    const hb = prSet?.['dgm:presLayoutVars']?.['dgm:hierBranch']?.['@_val']
+    const assoc = prSet?.['@_presAssocID']
+    if (hb && hb !== 'init' && assoc && !hierBranchOf.has(String(assoc)))
+      hierBranchOf.set(String(assoc), String(hb))
+  }
   const bySrc = new Map<string, any[]>()
   for (const c of cxns) {
     const t = c?.['@_type']
@@ -1311,6 +1581,8 @@ export function layoutDiagramFallback(
           id: d,
           texts: collectDgmTexts(pt),
           ...(pt?.['dgm:spPr']?.['a:solidFill'] ? { spPr: pt['dgm:spPr'] } : {}),
+          ...(pt?.['@_type'] === 'asst' ? { asst: true } : {}),
+          ...(hierBranchOf.has(d) ? { hierBranch: hierBranchOf.get(d) } : {}),
           children: build(d),
         }
       })
@@ -1346,44 +1618,50 @@ export function layoutDiagramFallback(
     }
     return Math.max(6, s)
   }
-  // Layouts our families still model worse than the neutral placeholder chip
-  if (layoutId === 'cycle4') return []
   const byLayout =
-    layoutId === 'hList1' || layoutId === 'hList2'
-      ? 'columns'
-      : layoutId === 'hList3'
-        ? 'tableList'
-        : layoutId != null && /^pList/.test(layoutId)
-          ? 'pictureList'
-          : layoutId != null && /^list/.test(layoutId)
-            ? 'boxList'
-            : layoutId === 'vList5' || (layoutId != null && /^Bracket/.test(layoutId))
-              ? 'sideList'
-              : layoutId === 'vProcess5'
-                ? 'stepped'
-                : layoutId != null && /^(vList|vProcess)/.test(layoutId)
-                  ? 'stacked'
-                  : layoutId != null && /^bList/.test(layoutId)
-                    ? 'cards'
-                    : layoutId != null && /^(process|hProcess|bProcess)/.test(layoutId)
-                      ? 'procCards'
-                      : layoutId != null && /^equation/.test(layoutId)
-                        ? 'equation'
-                        : layoutId != null && /^pyramid/.test(layoutId)
-                          ? 'pyramid'
-                          : layoutId != null && /^Picture/.test(layoutId)
-                            ? 'strips'
-                            : layoutId === 'chevron2'
-                              ? 'chevronList'
-                              : layoutId != null && /^chevron/.test(layoutId)
-                                ? 'chevronRow'
-                                : layoutId != null && /^(cycle[127]|radial)/.test(layoutId)
-                                  ? 'cycle'
-                                  : layoutId != null && /orgchart/i.test(layoutId)
-                                    ? 'orgChart'
-                                    : layoutId != null && /^hierarchy/.test(layoutId)
-                                      ? 'hierarchy'
-                                      : 'blocks'
+    layoutId === 'cycle4'
+      ? 'cycleMatrix'
+      : layoutId != null && /^arrow5/.test(layoutId)
+        ? 'arrowRing'
+        : layoutId != null && /^hProcess3(#|$)/.test(layoutId)
+          ? 'ruleArrow'
+          : layoutId === 'hList1' || layoutId === 'hList2'
+            ? 'columns'
+            : layoutId === 'hList3'
+              ? 'tableList'
+              : layoutId != null && /^pList/.test(layoutId)
+                ? 'pictureList'
+                : layoutId != null && /^list/.test(layoutId)
+                  ? 'boxList'
+                  : layoutId === 'vList5' || (layoutId != null && /^Bracket/.test(layoutId))
+                    ? 'sideList'
+                    : layoutId === 'vProcess5'
+                      ? 'stepped'
+                      : layoutId != null && /^(vList|vProcess)/.test(layoutId)
+                        ? 'stacked'
+                        : layoutId != null && /^bList/.test(layoutId)
+                          ? 'cards'
+                          : layoutId != null && /^(process|hProcess|bProcess)/.test(layoutId)
+                            ? 'procCards'
+                            : layoutId != null && /^lProcess/.test(layoutId)
+                              ? 'colProcess'
+                              : layoutId != null && /^equation/.test(layoutId)
+                                ? 'equation'
+                                : layoutId != null && /^pyramid/.test(layoutId)
+                                  ? 'pyramid'
+                                  : layoutId != null && /^Picture/.test(layoutId)
+                                    ? 'strips'
+                                    : layoutId === 'chevron2'
+                                      ? 'chevronList'
+                                      : layoutId != null && /^chevron/.test(layoutId)
+                                        ? 'chevronRow'
+                                        : layoutId != null && /^(cycle[127]|radial)/.test(layoutId)
+                                          ? 'cycle'
+                                          : layoutId != null && /orgchart/i.test(layoutId)
+                                            ? 'orgChart'
+                                            : layoutId != null && /^hierarchy/.test(layoutId)
+                                              ? 'hierarchy'
+                                              : 'blocks'
   const family = byLayout === 'blocks' && !hasHierarchy ? 'flatGrid' : byLayout
 
   if (family === 'flatGrid') {
@@ -1466,6 +1744,68 @@ export function layoutDiagramFallback(
           ),
         )
       }
+    })
+  } else if (family === 'colProcess') {
+    // lProcess1-style linear process: one column per top node — a colored header
+    // block, then each child in its own tinted block, with a small connector dot
+    // in every gap (all proportions measured against PowerPoint, napierone 0005 p8)
+    const n = roots.length
+    const gap = frameCx * 0.045
+    const cw = (frameCx - gap * (n - 1)) / n
+    const kMax = Math.max(...roots.map((r) => r.children.length), 1)
+    // Columns fill ~78% of the frame height, roughly centered (napierone 0005 p8)
+    const usedCy = frameCy * 0.78
+    const yTop = (frameCy - usedCy) * 0.55
+    const bh = usedCy / (1 + 1.48 * kMax) // header ≈ child-block height, gaps 0.48×
+    const vGap = bh * 0.48
+    roots.forEach((node, i) => {
+      const x = i * (cw + gap)
+      const base = colorOf(node, i)
+      const baseHex = typeof base === 'string' ? base : undefined
+      if (!roots.some((r) => r.children.length)) {
+        // Childless nodes render as the layout's background shape: a large tinted
+        // rounded panel with dark top-anchored text (lProcess2 bgShp look)
+        const pw = Math.min(cw, frameCy * 1.5)
+        const pt = fitSizeW(frameCy * 0.25, pw, node.texts, 22)
+        sps.push(
+          dgmSp(
+            { x: x + (cw - pw) / 2, y: frameCy * 0.06, cx: pw, cy: frameCy * 0.88 },
+            baseHex ? dgmTint(baseHex, 0.22) : base,
+            node.texts.map((tx) => ({ text: tx, lvl: 0, sizePt: pt })),
+            { textColor: '#000000', anchor: 't', prst: 'roundRect', adj: 10000 },
+          ),
+        )
+        return
+      }
+      const t = fitSizeW(bh * 0.9, cw, node.texts, 26)
+      sps.push(
+        dgmSp(
+          { x, y: yTop, cx: cw, cy: bh },
+          base,
+          node.texts.map((tx) => ({ text: tx, lvl: 0, sizePt: t })),
+        ),
+      )
+      node.children.forEach((kid, k) => {
+        const y = yTop + bh + k * (vGap + bh)
+        const dotD = bh * 0.14
+        sps.push(
+          dgmSp(
+            { x: x + cw / 2 - dotD / 2, y: y + vGap / 2 - dotD / 2, cx: dotD, cy: dotD },
+            base,
+            [],
+            { prst: 'ellipse' },
+          ),
+        )
+        const kt = fitSizeW(bh * 0.7, cw, kid.texts, 17)
+        sps.push(
+          dgmSp(
+            { x, y: y + vGap, cx: cw, cy: bh },
+            baseHex ? dgmTint(baseHex, 0.25) : base,
+            kid.texts.map((tx) => ({ text: tx, lvl: 0, sizePt: kt })),
+            { textColor: '#404040', prst: 'roundRect', adj: 8000 },
+          ),
+        )
+      })
     })
   } else if (family === 'columns') {
     // Per top node: colored header (title) + tinted body (descendant bullets);
@@ -1744,6 +2084,126 @@ export function layoutDiagramFallback(
         ),
       )
     })
+  } else if (family === 'arrowRing') {
+    // arrow5 (cycle alg, rotPath=alongPath): downArrows on a ring all pointing at the
+    // center, first at 12 o'clock going clockwise, tails on the ring's outer edge.
+    // Sizes calibrated against PowerPoint at n=3 (box 209×185 px in a 213px-radius ring)
+    // and n=16 (62×99): length = R·min(0.98, 4.66/n), aspect widens as the ring crowds.
+    const n = Math.max(roots.length, 1)
+    const R = Math.min(frameCx, frameCy) / 2
+    const bh = R * Math.min(0.98, 4.66 / n)
+    const aspect = Math.min(1.8, Math.max(0.8, 0.885 + (n - 3) * 0.055))
+    const bw = bh * aspect
+    const rc = R - bh / 2
+    const cxr = frameCx / 2
+    const cyr = frameCy / 2
+    const sizePt = Math.max(5, Math.min(20, 2 + (bh / 12700) * 0.08))
+    roots.forEach((node, i) => {
+      const ang = -Math.PI / 2 + (i * 2 * Math.PI) / n
+      const x = cxr + Math.cos(ang) * rc
+      const y = cyr + Math.sin(ang) * rc
+      sps.push(
+        dgmSp(
+          { x: x - bw / 2, y: y - bh / 2, cx: bw, cy: bh },
+          colorOf(node, i),
+          node.texts.map((tx) => ({ text: tx, lvl: 0, sizePt })),
+          {
+            prst: 'downArrow',
+            // Head shorter than the preset default (measured 29-36% of ss vs 50%)
+            adjs: [
+              { name: 'adj1', val: 50000 },
+              { name: 'adj2', val: 32000 },
+            ],
+            rot: Math.round(((ang * 180) / Math.PI + 90) * 60000),
+          },
+        ),
+      )
+    })
+  } else if (family === 'cycleMatrix') {
+    // Cycle Matrix (cycle4): four quadrant wedges around the center, one corner child
+    // card per quadrant, clockwise from top-left (geometry measured against PowerPoint:
+    // R = 0.44 x frame height, cross gap ~3% of H, cards 0.333W x 0.316H inset 6.4% x)
+    const nodes = roots.slice(0, 4)
+    const cxr = frameCx / 2
+    const cyr = frameCy / 2
+    const R = frameCy * 0.44
+    const gap = frameCy * 0.015
+    const bw = frameCx * 0.333
+    const bh = frameCy * 0.316
+    const bx = frameCx * 0.064
+    const quads = [
+      { a1: 10800000, dx: -1, dy: -1, bxy: { x: bx, y: 0 } },
+      { a1: 16200000, dx: 1, dy: -1, bxy: { x: frameCx - bx - bw, y: 0 } },
+      { a1: 0, dx: 1, dy: 1, bxy: { x: frameCx - bx - bw, y: frameCy - bh } },
+      { a1: 5400000, dx: -1, dy: 1, bxy: { x: bx, y: frameCy - bh } },
+    ]
+    const labelPt = Math.max(10, Math.min(24, (R / 12700) * 0.115))
+    // Corner cards first: PowerPoint tucks them behind the wedge circle
+    nodes.forEach((node, i) => {
+      const q = quads[i]!
+      const bullets = dgmBulletLines(node)
+      const strokeColor = node.spPr
+        ? (resolveColorNode(node.spPr['a:solidFill'], ctx) ?? colors[0]!)
+        : colors[0]!
+      sps.push(
+        dgmSp(
+          { x: q.bxy.x, y: q.bxy.y, cx: bw, cy: bh },
+          '#FFFFFF',
+          bullets.map((b) => ({
+            text: b.text,
+            lvl: b.lvl,
+            sizePt: Math.max(8, Math.min(12, labelPt * 0.45)),
+          })),
+          {
+            prst: 'roundRect',
+            adj: 9000,
+            stroke: strokeColor,
+            align: 'l',
+            anchor: 't',
+            textColor: '#000000',
+          },
+        ),
+      )
+    })
+    nodes.forEach((node, i) => {
+      const q = quads[i]!
+      const fill: string | { spPr: any } = node.spPr ? { spPr: node.spPr } : colors[0]!
+      const wcx = cxr + q.dx * gap
+      const wcy = cyr + q.dy * gap
+      sps.push(
+        dgmSp({ x: wcx - R, y: wcy - R, cx: 2 * R, cy: 2 * R }, fill, [], {
+          prst: 'pie',
+          adjs: [
+            { name: 'adj1', val: q.a1 },
+            { name: 'adj2', val: q.a1 + 5400000 },
+          ],
+        }),
+      )
+      // Quadrant label sits halfway out along the quadrant diagonal
+      const lw = R * 0.9
+      const lh = labelPt * 12700 * 1.6
+      sps.push(
+        dgmSp(
+          {
+            x: wcx + q.dx * R * 0.5 - lw / 2,
+            y: wcy + q.dy * R * 0.5 - lh / 2,
+            cx: lw,
+            cy: lh,
+          },
+          '#FFFFFF',
+          node.texts.filter(Boolean).map((t) => ({ text: t, lvl: 0, sizePt: labelPt })),
+          { noFill: true },
+        ),
+      )
+    })
+    // Center hub: white ring (stand-in for PowerPoint's circular-arrows glyph)
+    const r0 = frameCy * 0.07
+    sps.push(
+      dgmSp({ x: cxr - r0, y: cyr - r0, cx: 2 * r0, cy: 2 * r0 }, '#FFFFFF', [], {
+        prst: 'donut',
+        adj: 28000,
+      }),
+    )
   } else if (family === 'cycle') {
     // Nodes on a circle; radial* = big center circle with satellite circles touching it
     const central = layoutId != null && /^radial/.test(layoutId)
@@ -1805,88 +2265,35 @@ export function layoutDiagramFallback(
       })
     }
   } else if (family === 'orgChart') {
-    // Tidy-ish org tree: leaf-count spans, one row per depth
-    // hierBranch 'init': PowerPoint hangs a branch when all its children are leaves (>=2)
-    const hangs = (node: DgmTreeNode): boolean =>
-      node.children.length >= 2 && node.children.every((c) => !c.children.length)
-    const leaves = (node: DgmTreeNode): number =>
-      hangs(node) || !node.children.length
-        ? node.children.length
-          ? 1.5
-          : 1
-        : node.children.reduce((a, c) => a + leaves(c), 0)
-    const depthOf = (node: DgmTreeNode): number =>
-      hangs(node)
-        ? 1 + node.children.length
-        : node.children.length
-          ? 1 + Math.max(...node.children.map(depthOf))
-          : 1
-    const totalLeaves = roots.reduce((a, r) => a + leaves(r), 0)
-    const depth = Math.max(...roots.map(depthOf))
-    const rowCy = frameCy / depth
-    const bh = Math.min(rowCy * 0.66, frameCy * 0.2)
-    const slotW = frameCx / Math.max(totalLeaves, 1)
-    const bw = Math.min(slotW * 0.94, frameCx / 5.5)
-    const lineW = Math.max(frameCx * 0.0012, 9525)
-    const lineColor = typeof colors[0] === 'string' ? colors[0]! : '#4472C4'
-    const rowY = (d: number) => d * rowCy + (rowCy - bh) / 2
-    const vline = (x: number, y1: number, y2: number) =>
-      sps.push(dgmSp({ x: x - lineW / 2, y: y1, cx: lineW, cy: y2 - y1 }, lineColor, []))
-    const hline = (x1: number, x2: number, y: number) =>
-      sps.push(
-        dgmSp(
-          {
-            x: Math.min(x1, x2) - lineW / 2,
-            y: y - lineW / 2,
-            cx: Math.abs(x2 - x1) + lineW,
-            cy: lineW,
-          },
-          lineColor,
-          [],
-        ),
-      )
-    const box = (node: DgmTreeNode, cx: number, d: number) =>
-      sps.push(
-        dgmSp(
-          { x: cx - bw / 2, y: rowY(d), cx: bw, cy: bh },
-          colorOf(node, 0),
-          node.texts.map((tx) => ({
-            text: tx,
-            lvl: 0,
-            sizePt: fitSize(bh, Math.max(node.texts.length, 1), 20),
-          })),
-        ),
-      )
-    const place = (node: DgmTreeNode, slot0: number, d: number): number => {
-      const span = leaves(node)
-      const cx = (slot0 + span / 2) * slotW
-      box(node, cx, d)
-      if (hangs(node)) {
-        // Hanging branch: children stack in rows below, trunk at the parent's left third
-        const trunkX = cx - bw * 0.3
-        vline(trunkX, rowY(d) + bh, rowY(d + node.children.length) + bh / 2)
-        node.children.forEach((c, j) => {
-          const cy0 = rowY(d + 1 + j)
-          const ccx = cx + bw * 0.14
-          hline(trunkX, ccx - bw / 2, cy0 + bh / 2)
-          box(c, ccx, d + 1 + j)
-        })
-      } else {
-        let sNext = slot0
-        for (const c of node.children) {
-          const cSpan = leaves(c)
-          const ccx = (sNext + cSpan / 2) * slotW
-          const midY = (rowY(d) + bh + rowY(d + 1)) / 2
-          vline(cx, rowY(d) + bh, midY)
-          hline(cx, ccx, midY)
-          vline(ccx, midY, rowY(d + 1))
-          sNext += place(c, sNext, d + 1)
-        }
-      }
-      return span
+    // Constraint interpreter: factors and branch rules come from the layout part
+    // (see dgm-hier.ts); connectors render as thin rects like the other families
+    const cons = parseHierConstraints(layoutXml)
+    const geo = layoutHierTree(roots, cons, frameCx, frameCy)
+    if (geo) {
+      const lineW = Math.max(frameCx * 0.0012, 9525)
+      const lineColor = typeof colors[0] === 'string' ? colors[0]! : '#4472C4'
+      // primFontSz op=equ: every node box shares the smallest fitting size
+      const withText = geo.boxes.filter((b) => b.node.texts.length)
+      const sizePt = withText.length
+        ? Math.min(...withText.map((b) => fitSizeW(b.h, b.w, b.node.texts, cons.fontMax)))
+        : cons.fontMax
+      for (const ln of geo.lines)
+        sps.push(
+          dgmSp(
+            { x: ln.x - lineW / 2, y: ln.y - lineW / 2, cx: ln.cx + lineW, cy: ln.cy + lineW },
+            lineColor,
+            [],
+          ),
+        )
+      for (const b of geo.boxes)
+        sps.push(
+          dgmSp(
+            { x: b.x, y: b.y, cx: b.w, cy: b.h },
+            colorOf(b.node as DgmTreeNode, 0),
+            b.node.texts.map((tx) => ({ text: tx, lvl: 0, sizePt })),
+          ),
+        )
     }
-    let s0 = 0
-    for (const r of roots) s0 += place(r, s0, 0)
   } else if (family === 'cards') {
     // bList cards: outlined white card with child bullets, accent footer strip with the parent title
     const n = roots.length
@@ -2103,33 +2510,69 @@ export function layoutDiagramFallback(
         ),
       )
     })
-  } else if (family === 'boxList') {
-    // Vertical Box List: per item a rounded title box upper-left + a light body panel below
-    const n = roots.length
-    const gap = frameCy * 0.05
-    const ih = (frameCy - gap * (n - 1)) / n
+  } else if (family === 'ruleArrow') {
+    // hProcess3 (linear rule): one big frame-wide rightArrow, top-node texts spread
+    // across the shaft (PowerPoint measured: arrow 90% of frame height centered,
+    // shaft 40% of the arrow box, head ≈ 25% of the width)
+    const n = Math.max(roots.length, 1)
+    const ah = frameCy * 0.9
+    const ay = (frameCy - ah) / 2
+    const headLen = Math.min(frameCx * 0.255, ah * 0.554)
+    sps.push(
+      dgmSp({ x: 0, y: ay, cx: frameCx, cy: ah }, colorOf(roots[0]!, 0), [], {
+        prst: 'rightArrow',
+        adjs: [
+          { name: 'adj1', val: 40400 },
+          { name: 'adj2', val: Math.round((headLen / Math.min(frameCx, ah)) * 100000) },
+        ],
+      }),
+    )
+    const bodyW = frameCx - headLen
+    const slot = bodyW / n
+    const shaftH = ah * 0.404
     roots.forEach((node, i) => {
-      const y = i * (ih + gap)
-      const base = colorOf(node, i)
-      const baseHex = typeof base === 'string' ? base : undefined
-      const titleCy = ih * 0.45
       sps.push(
         dgmSp(
-          { x: frameCx * 0.03, y, cx: frameCx * 0.55, cy: titleCy },
+          { x: i * slot, y: ay + (ah - shaftH) / 2, cx: slot, cy: shaftH },
+          '#FFFFFF',
+          node.texts.map((tx) => ({
+            text: tx,
+            lvl: 0,
+            sizePt: fitSize(shaftH, Math.max(node.texts.length, 1), 26),
+            bold: true,
+          })),
+          { noFill: true },
+        ),
+      )
+    })
+  } else if (family === 'boxList') {
+    // Vertical Box List (PowerPoint measured on smartart-linear-rule-vert): per item a
+    // rounded title pill (69% width, inset 5.3%) over a full-width outlined body panel
+    // that starts at the pill's vertical middle and runs to just above the next pill
+    const n = roots.length
+    const pitch = frameCy / Math.max(n, 1)
+    roots.forEach((node, i) => {
+      const y = i * pitch + pitch * 0.04
+      const base = colorOf(node, i)
+      const baseHex = typeof base === 'string' ? base : undefined
+      const titleCy = pitch * 0.7
+      sps.push(
+        dgmSp(
+          { x: frameCx * 0.053, y, cx: frameCx * 0.692, cy: titleCy },
           base,
           node.texts.map((tx) => ({
             text: tx,
             lvl: 0,
-            sizePt: fitSize(titleCy, Math.max(node.texts.length, 1), 20),
+            sizePt: fitSize(titleCy, Math.max(node.texts.length, 1) * 2, 14),
           })),
           { prst: 'roundRect', align: 'l' },
         ),
       )
       const bullets = dgmBulletLines(node)
-      const bodyCy = ih - titleCy * 0.55
+      const bodyCy = titleCy * 0.9
       sps.push(
         dgmSp(
-          { x: 0, y: y + titleCy * 0.55, cx: frameCx * 0.72, cy: bodyCy },
+          { x: 0, y: y + titleCy * 0.5, cx: frameCx, cy: bodyCy },
           base,
           bullets.map((l) => ({
             text: l.text,
@@ -2303,6 +2746,7 @@ function parseTable(
     rowHeights,
     rows,
     styleFlags: { firstRow: flags.firstRow, bandRow: flags.bandRow },
+    ...(tblPr['@_rtl'] === '1' || tblPr['@_rtl'] === 'true' ? { rtl: true } : {}),
     ...(bgFill && bgFill.type !== 'none' ? { bgFill } : {}),
   }
 }
@@ -2344,10 +2788,12 @@ function parseTableCell(
     cell.text = text
   }
 
-  // Fill: explicit tcPr fill > table-style region fill
+  // Fill: explicit tcPr fill > table-style region fill; an explicit <a:noFill/> means
+  // transparent and still overrides the style fill (only an absent fill falls through)
   const fill = parseFill(tcPr, ctx)
-  if (fill && fill.type !== 'none') cell.fill = fill
-  else if (part?.fill) cell.fill = part.fill
+  if (fill) {
+    if (fill.type !== 'none') cell.fill = fill
+  } else if (part?.fill) cell.fill = part.fill
 
   // Borders on four edges: a:lnL/R/T/B share a:ln's structure, so reuse parseStroke; style inside-borders as fallback
   const borders: TableCellBorders = {}
@@ -2413,10 +2859,24 @@ function parseXfrm(xfrm: any): Transform {
 
 // ── Fill ─────────────────────────────────────────────────────────────
 
+/** <a:lum bright/contrast>: legacy picture brightness/contrast (attribute per-100k -> -1..1). */
+function parseLum(blipNode: any): { bright: number; contrast: number } | undefined {
+  const lum = blipNode?.['a:lum']
+  if (lum === undefined) return undefined
+  const attrs = lum && typeof lum === 'object' ? lum : {}
+  const pct = (v: unknown) =>
+    Math.max(-1, Math.min(1, (v != null ? parseInt(String(v), 10) || 0 : 0) / 100000))
+  const bright = pct(attrs['@_bright'])
+  const contrast = pct(attrs['@_contrast'])
+  if (!bright && !contrast) return undefined
+  return { bright, contrast }
+}
+
 /** <a:duotone>: two colors mapping image luminance dark→light (theme texture backgrounds). */
 function parseDuotone(blipNode: any, ctx: ParseContext): [string, string] | undefined {
   const duoRaw = blipNode?.['a:duotone']
-  if (!duoRaw) return undefined
+  // <a:grayscl/>: luminance-only rendering — exactly a black→white duotone ramp
+  if (!duoRaw) return blipNode?.['a:grayscl'] !== undefined ? ['#000000', '#FFFFFF'] : undefined
   const clrs: Array<{ c: string; tag: string }> = []
   for (const tag of ['a:schemeClr', 'a:srgbClr', 'a:prstClr', 'a:sysClr']) {
     const raw = duoRaw[tag]
@@ -2478,6 +2938,7 @@ function parseFill(spPr: any, ctx: ParseContext): Fill | undefined {
         alphaAmt != null ? Math.max(0, Math.min(1, parseInt(alphaAmt, 10) / 100000)) : undefined
       const duotone = parseDuotone(blip['a:blip'], ctx)
       const clrChange = parseClrChange(blip['a:blip'], ctx)
+      const lum = parseLum(blip['a:blip'])
       const fr = blip['a:stretch']?.['a:fillRect']
       const pct = (v: unknown) => (v != null ? (parseInt(String(v), 10) || 0) / 100000 : 0)
       const fillRect =
@@ -2485,14 +2946,16 @@ function parseFill(spPr: any, ctx: ParseContext): Fill | undefined {
           ? { l: pct(fr['@_l']), t: pct(fr['@_t']), r: pct(fr['@_r']), b: pct(fr['@_b']) }
           : undefined
       const tl = blip['a:tile']
+      // A bare self-closing <a:tile/> parses to '' — it still tiles with all defaults
+      const tlAttrs = tl && typeof tl === 'object' ? tl : {}
       const tile =
-        tl && typeof tl === 'object'
+        tl !== undefined
           ? {
-              tx: intOr(tl['@_tx'], 0),
-              ty: intOr(tl['@_ty'], 0),
-              sx: intOr(tl['@_sx'], 100000) / 100000,
-              sy: intOr(tl['@_sy'], 100000) / 100000,
-              algn: String(tl['@_algn'] ?? 'tl'),
+              tx: intOr(tlAttrs['@_tx'], 0),
+              ty: intOr(tlAttrs['@_ty'], 0),
+              sx: intOr(tlAttrs['@_sx'], 100000) / 100000,
+              sy: intOr(tlAttrs['@_sy'], 100000) / 100000,
+              algn: String(tlAttrs['@_algn'] ?? 'tl'),
             }
           : undefined
       return {
@@ -2503,6 +2966,7 @@ function parseFill(spPr: any, ctx: ParseContext): Fill | undefined {
         ...(fillRect ? { fillRect } : {}),
         ...(duotone ? { duotone } : {}),
         ...(clrChange ? { clrChange } : {}),
+        ...(lum ? { lum } : {}),
         ...(tile ? { tile } : {}),
       }
     }
@@ -2530,10 +2994,15 @@ function parseGradFill(grad: any, ctx: ParseContext): Fill | undefined {
     })
     .filter((s: any): s is { pos: number; color: string } => !!s)
   if (!stops.length) return undefined
-  // Linear gradient angle: <a:lin ang=""> (unit 1/60000 degree); radial etc. get the default angle for now
-  const ang = grad['a:lin']?.['@_ang']
-  const angle = ang != null ? parseInt(ang, 10) || 0 : undefined
+  // Linear gradient angle: <a:lin ang=""> (unit 1/60000 degree). A gradFill with neither
+  // a:lin nor a:path renders top→bottom in PowerPoint (tdf104788 measured), not the spec's 0°
+  const lin = grad['a:lin']
   const pathType = grad['a:path']?.['@_path']
+  // An explicit a:lin without ang keeps the schema default 0; only a fully
+  // directionless gradFill gets the measured vertical default
+  const angle =
+    lin != null ? parseInt(lin['@_ang'], 10) || 0 : grad['a:path'] == null ? 5400000 : undefined
+  const scaled = lin != null && (lin['@_scaled'] === '1' || lin['@_scaled'] === 'true')
   const ftr = grad['a:path']?.['a:fillToRect']
   // Omitted fillToRect attributes default to 0 (whole tile rect), not to a centered inset
   const frac = (v: unknown) => (v != null ? (parseInt(String(v), 10) || 0) / 100000 : 0)
@@ -2541,6 +3010,7 @@ function parseGradFill(grad: any, ctx: ParseContext): Fill | undefined {
     type: 'gradient',
     stops,
     ...(angle != null ? { angle } : {}),
+    ...(scaled ? { scaled: true } : {}),
     ...(pathType === 'circle' || pathType === 'rect' || pathType === 'shape'
       ? { path: pathType }
       : {}),
@@ -2562,9 +3032,70 @@ function resolveColorNode(node: any, ctx: ParseContext): string | undefined {
   return resolveColorNodeShared(node, ctx.theme, ctx.phClr)
 }
 
+const COLOR_NODE_TAGS = [
+  'a:srgbClr',
+  'a:schemeClr',
+  'a:sysClr',
+  'a:prstClr',
+  'a:hslClr',
+  'a:scrgbClr',
+]
+
+const xmlAttrEsc = (v: string): string =>
+  v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;')
+
+/** Re-serialize a parsed color node (tag + attrs + flat modifier children like tint/lumMod)
+ * so the rebuild path can restore it verbatim instead of baking in the resolved value. */
+/** colorNodeXml, but only for non-plain colors (schemeClr/prstClr/srgbClr+mods): a bare
+ *  srgbClr already round-trips through the baked path, so it need not be stored. */
+function nonPlainColorNode(container: any): string | undefined {
+  if (container == null) return undefined
+  const srgb = container['a:srgbClr']
+  const srgbPlain =
+    srgb != null && typeof srgb === 'object' && !Object.keys(srgb).some((k) => k.startsWith('a:'))
+  if (srgbPlain) return undefined
+  return colorNodeXml(container)
+}
+
+function colorNodeXml(fillNode: any): string | undefined {
+  for (const tag of COLOR_NODE_TAGS) {
+    const n = fillNode?.[tag]
+    if (n == null) continue
+    const node = typeof n === 'object' ? n : {}
+    const attrs = Object.keys(node)
+      .filter((k) => k.startsWith('@_'))
+      .map((k) => ` ${k.slice(2)}="${xmlAttrEsc(String(node[k]))}"`)
+      .join('')
+    const kids = Object.keys(node)
+      .filter((k) => k.startsWith('a:'))
+      .map((k) => {
+        const arr = Array.isArray(node[k]) ? node[k] : [node[k]]
+        return arr
+          .map((c: any) => {
+            const cAttrs = Object.keys(c ?? {})
+              .filter((x) => x.startsWith('@_'))
+              .map((x) => ` ${x.slice(2)}="${xmlAttrEsc(String(c[x]))}"`)
+              .join('')
+            return `<${k}${cAttrs}/>`
+          })
+          .join('')
+      })
+      .join('')
+    return kids ? `<${tag}${attrs}>${kids}</${tag}>` : `<${tag}${attrs}/>`
+  }
+  return undefined
+}
+
 // ── Text ─────────────────────────────────────────────────────────────
 
-function parseTextBody(txBody: any, ctx: ParseContext, phChain: TextStyleLevels[] = []): TextBody {
+function parseTextBody(
+  txBody: any,
+  ctx: ParseContext,
+  phChain: TextStyleLevels[] = [],
+  // Per-attribute bodyPr inset inheritance from the placeholder chain (layout over master);
+  // only attrs absent on this bodyPr fall through to it (then to the spec defaults)
+  inheritedInsets?: { l?: number; t?: number; r?: number; b?: number },
+): TextBody {
   const bodyPrRaw = txBody['a:bodyPr']
   const bodyPr = bodyPrRaw && typeof bodyPrRaw === 'object' ? bodyPrRaw : {}
   const anchorMap: Record<string, TextBody['anchor']> = { t: 'top', ctr: 'middle', b: 'bottom' }
@@ -2597,14 +3128,52 @@ function parseTextBody(txBody: any, ctx: ParseContext, phChain: TextStyleLevels[
       ? vertRaw
       : undefined
 
+  // WordArt text extrusion: bodyPr-level sp3d depth + camera tilt decide the offset direction
+  let extrusion3d: TextBody['extrusion3d']
+  const bodySp3d = bodyPr['a:sp3d']
+  const depthEmu = bodySp3d ? intOr(bodySp3d['@_extrusionH'], 0) : 0
+  if (depthEmu > 0) {
+    const extClr = bodySp3d['a:extrusionClr']
+    const color =
+      (extClr && typeof extClr === 'object' ? resolveColorNode(extClr, ctx) : undefined) ??
+      '#808080'
+    const rot = bodyPr['a:scene3d']?.['a:camera']?.['a:rot']
+    extrusion3d = {
+      color,
+      depthEmu,
+      latDeg: intOr(rot?.['@_lat'], 0) / 60000,
+      lonDeg: intOr(rot?.['@_lon'], 0) / 60000,
+    }
+  }
+
+  // WordArt preset text warp (<a:prstTxWarp prst avLst>): read-only display, the original
+  // bodyPr bytes carry it through save
+  let txWarp: TextBody['txWarp']
+  const warpNode = bodyPr['a:prstTxWarp']
+  if (warpNode && typeof warpNode === 'object' && warpNode['@_prst']) {
+    const prst = String(warpNode['@_prst'])
+    if (prst !== 'textNoShape' && prst !== 'textPlain') {
+      const adj: Record<string, number> = {}
+      const gds = warpNode['a:avLst']?.['a:gd']
+      for (const gd of Array.isArray(gds) ? gds : gds ? [gds] : []) {
+        const m = /^val (-?\d+)$/.exec(String(gd['@_fmla'] ?? ''))
+        if (gd['@_name'] && m) adj[String(gd['@_name'])] = parseInt(m[1]!, 10)
+      }
+      txWarp = { prst, ...(Object.keys(adj).length ? { adj } : {}) }
+    }
+  }
+
   return {
     paragraphs,
     anchor: bodyPr['@_anchor'] ? anchorMap[bodyPr['@_anchor']] : undefined,
+    ...(bodyPr['@_anchorCtr'] != null
+      ? { anchorCtr: String(bodyPr['@_anchorCtr']) === '1' || bodyPr['@_anchorCtr'] === 'true' }
+      : {}),
     insets: {
-      l: intOr(bodyPr['@_lIns'], 91440),
-      t: intOr(bodyPr['@_tIns'], 45720),
-      r: intOr(bodyPr['@_rIns'], 91440),
-      b: intOr(bodyPr['@_bIns'], 45720),
+      l: intOr(bodyPr['@_lIns'], inheritedInsets?.l ?? DEFAULT_BODY_INSETS.l),
+      t: intOr(bodyPr['@_tIns'], inheritedInsets?.t ?? DEFAULT_BODY_INSETS.t),
+      r: intOr(bodyPr['@_rIns'], inheritedInsets?.r ?? DEFAULT_BODY_INSETS.r),
+      b: intOr(bodyPr['@_bIns'], inheritedInsets?.b ?? DEFAULT_BODY_INSETS.b),
     },
     autofit,
     ...(fontScale != null ? { fontScale } : {}),
@@ -2614,6 +3183,8 @@ function parseTextBody(txBody: any, ctx: ParseContext, phChain: TextStyleLevels[
     ...(intOr(bodyPr['@_numCol'], 1) > 1
       ? { numCol: intOr(bodyPr['@_numCol'], 1), spcCol: intOr(bodyPr['@_spcCol'], 0) }
       : {}),
+    ...(extrusion3d ? { extrusion3d } : {}),
+    ...(txWarp ? { txWarp } : {}),
   }
 }
 
@@ -2644,9 +3215,16 @@ function parseParagraph(
   const level = pPr['@_lvl'] ? parseInt(pPr['@_lvl'], 10) : undefined
   // Inherited default style for this level (shape lstStyle → layout ph → master ph → master txStyles)
   const dflt = mergeTextStyleChain(chain, level ?? 0)
+  // The paragraph's own <a:pPr><a:defRPr> sits between the runs and that chain:
+  // PowerPoint resolves run rPr → paragraph defRPr → inherited level style, so a run
+  // without sz/b/fill takes them from here (python-pptx paragraph.font, WPS exports).
+  const defRPrNode = pPr['a:defRPr']
+  const paraStyle = parseDefRPrStyle(defRPrNode, ctx.theme, ctx.phClr)
+  const runDflt = paraStyle ? { ...dflt, ...paraStyle } : dflt
+  const defRPr = paraStyle ? parseParagraphDefRPr(defRPrNode, paraStyle) : undefined
   const runsRaw = p['a:r'] ? (Array.isArray(p['a:r']) ? p['a:r'] : [p['a:r']]) : []
   const runs: TextRun[] = runsRaw.map((r: any) => {
-    const run = parseRun(r, ctx, dflt)
+    const run = parseRun(r, ctx, runDflt)
     // a:fld rewritten to a:r by parseShapeFragment (a genuine a:r never carries @_type)
     if (r?.['@_type']) run.field = String(r['@_type'])
     return run
@@ -2656,9 +3234,21 @@ function parseParagraph(
   // legacy fallback — a footer fld usually owns its paragraph.
   const fldsRaw = p['a:fld'] ? (Array.isArray(p['a:fld']) ? p['a:fld'] : [p['a:fld']]) : []
   for (const f of fldsRaw) {
-    const run = parseRun(f, ctx, dflt)
+    const run = parseRun(f, ctx, runDflt)
     if (f?.['@_type']) run.field = String(f['@_type'])
     runs.push(run)
+  }
+
+  // Empty paragraph: line height comes from <a:endParaRPr> (the paragraph mark) and
+  // overrides even an empty run's own rPr (probe-measured; Google Slides exports lean
+  // on this with 80pt marks between text blocks). Parsed as a textless marker run.
+  // A field with no cached text (<a:fld type="slidenum"> straight from the layout,
+  // never opened in PowerPoint) is not empty: its value is substituted at render time.
+  const endPr = p['a:endParaRPr']
+  if (endPr && typeof endPr === 'object' && runs.every((r) => !r.text && !r.field)) {
+    const mark = parseRun({ 'a:rPr': endPr, 'a:t': '' }, ctx, runDflt)
+    mark.paraMark = true
+    runs.splice(0, runs.length, mark)
   }
 
   // Line spacing: spcPct (%) or spcPts (absolute pt); space before/after: spcPts / spcPct (as % of single line height).
@@ -2688,6 +3278,8 @@ function parseParagraph(
     if (pPr['a:buClr']) {
       const c = resolveColorNode(pPr['a:buClr'], ctx)
       if (c) bullet.color = c
+      const node = nonPlainColorNode(pPr['a:buClr'])
+      if (node) bullet.colorNodeXml = node
     }
     if (pPr['a:buFont']?.['@_typeface']) bullet.font = String(pPr['a:buFont']['@_typeface'])
     if (pPr['a:buSzPct']?.['@_val']) {
@@ -2697,16 +3289,38 @@ function parseParagraph(
   }
 
   const marLRaw = pPr['@_marL'] != null ? parseInt(pPr['@_marL'], 10) : undefined
+  const marRRaw = pPr['@_marR'] != null ? parseInt(pPr['@_marR'], 10) : undefined
   const indentRaw = pPr['@_indent'] != null ? parseInt(pPr['@_indent'], 10) : undefined
+  const defTabSzRaw = pPr['@_defTabSz'] != null ? parseInt(pPr['@_defTabSz'], 10) : undefined
+  const tabNodes = pPr['a:tabLst']?.['a:tab']
+  const tabStops = (Array.isArray(tabNodes) ? tabNodes : tabNodes ? [tabNodes] : [])
+    .map((t: any) => ({
+      pos: parseInt(t['@_pos'], 10),
+      ...(t['@_algn'] ? { algn: String(t['@_algn']) } : {}),
+    }))
+    .filter((t: { pos: number }) => Number.isFinite(t.pos))
+    .sort((a: { pos: number }, b: { pos: number }) => a.pos - b.pos)
   // Inheritance fallback: explicit pPr wins, level defaults from the placeholder/lstStyle chain fill gaps
   // (the master bodyStyle's buChar/marL/indent is where classic-template body bullets come from).
   // No field-wise merge: a paragraph redefining its bullet resets unspecified buClr/buSzPct/buFont
   // to follow the text (buClrTx/buSzTx/buFontTx semantics), not the chain's values.
   const effBullet = bullet ?? dflt?.bullet
   const hasMarL = marLRaw != null && !Number.isNaN(marLRaw)
+  const hasMarR = marRRaw != null && !Number.isNaN(marRRaw)
   const hasIndent = indentRaw != null && !Number.isNaN(indentRaw)
+  const hasDefTabSz = defTabSzRaw != null && !Number.isNaN(defTabSzRaw)
   const marL = hasMarL ? marLRaw : dflt?.marL
   const indent = hasIndent ? indentRaw : dflt?.indent
+
+  // rtl attribute: "1"/"true" and "0"/"false" are both explicit (an explicit LTR base
+  // overrides first-strong-character inference in layout); absent stays undefined
+  const rtlAttr = pPr['@_rtl']
+  const rtl =
+    rtlAttr === '1' || rtlAttr === 'true'
+      ? true
+      : rtlAttr === '0' || rtlAttr === 'false'
+        ? false
+        : undefined
 
   // Record which properties come from an explicit pPr (the rebuild path writes only explicit items; inherited values are not baked in)
   const pPrExplicit: NonNullable<Paragraph['pPrExplicit']> = {
@@ -2716,12 +3330,16 @@ function parseParagraph(
     ...(aftNode ? { spcAft: true } : {}),
     ...(bullet ? { bullet: true } : {}),
     ...(hasMarL ? { marL: true } : {}),
+    ...(hasMarR ? { marR: true } : {}),
     ...(hasIndent ? { indent: true } : {}),
+    ...(tabStops.length ? { tabLst: true } : {}),
+    ...(hasDefTabSz ? { defTabSz: true } : {}),
   }
 
   return {
     runs,
     align: pPr['@_algn'] ? alignMap[pPr['@_algn']] : dflt?.align,
+    ...(rtl != null ? { rtl } : {}),
     level,
     pPrExplicit,
     ...(lineHeight != null ? { lineHeight } : {}),
@@ -2732,7 +3350,38 @@ function parseParagraph(
     ...(spaceAfterPct != null ? { spaceAfterPct } : {}),
     ...(effBullet ? { bullet: effBullet } : {}),
     ...(marL != null ? { marL } : {}),
+    ...(hasMarR ? { marR: marRRaw } : {}),
     ...(indent != null ? { indent } : {}),
+    ...(tabStops.length ? { tabStops } : {}),
+    ...(hasDefTabSz ? { defTabSz: defTabSzRaw } : {}),
+    ...(defRPr ? { defRPr } : {}),
+  }
+}
+
+/**
+ * Model form of a paragraph's <a:pPr><a:defRPr> for write-back: the resolved display
+ * values (size/bold/italic/cap/color) plus the raw typeface attributes so theme font
+ * references (+mn-lt …) survive a rebuild.
+ */
+function parseParagraphDefRPr(defRPrNode: any, style: LevelTextStyle): ParagraphDefaultRunProps {
+  const typeface = (slot: string): string | undefined => {
+    const v = defRPrNode?.[slot]?.['@_typeface']
+    return v != null && v !== '' ? String(v) : undefined
+  }
+  const latinFont = typeface('a:latin')
+  const eaFont = typeface('a:ea')
+  const csFont = typeface('a:cs')
+  const colorNode = nonPlainColorNode(defRPrNode?.['a:solidFill'])
+  return {
+    ...(style.fontSize != null ? { fontSize: style.fontSize } : {}),
+    ...(style.bold != null ? { bold: style.bold } : {}),
+    ...(style.italic != null ? { italic: style.italic } : {}),
+    ...(style.cap != null ? { cap: style.cap } : {}),
+    ...(style.color != null ? { color: style.color } : {}),
+    ...(colorNode ? { colorNodeXml: colorNode } : {}),
+    ...(latinFont ? { latinFont } : {}),
+    ...(eaFont ? { eaFont } : {}),
+    ...(csFont ? { csFont } : {}),
   }
 }
 
@@ -2765,26 +3414,116 @@ function parseRun(r: any, ctx: ParseContext, dflt?: LevelTextStyle): TextRun {
   const hlink = rPr['a:hlinkClick']
   const hlinkTarget = hlink?.['@_r:id'] ? ctx.hlinkRels?.get(String(hlink['@_r:id'])) : undefined
   const fill = rPr['a:solidFill']
+  // WordArt gradient text fill: resolved stops for display, mid-stop as the flat fallback color
+  let gradient: TextRun['gradient']
+  if (rPr['a:gradFill'] && typeof rPr['a:gradFill'] === 'object') {
+    const g = parseFill(rPr, ctx)
+    if (g?.type === 'gradient' && g.stops.length) {
+      gradient = {
+        stops: g.stops,
+        ...(g.angle != null ? { angle: g.angle } : {}),
+        ...(g.scaled ? { scaled: true } : {}),
+      }
+    }
+  }
   // PowerPoint styles linked runs with the theme hlink color unless the run has an explicit fill
   const color =
     (fill ? resolveColorNode(fill, ctx) : undefined) ??
+    gradient?.stops[Math.floor(gradient.stops.length / 2)]?.color ??
     (hlinkTarget ? ctx.theme?.colors?.hlink : undefined) ??
     dflt?.color
   // Whether the color is display-only: from schemeClr/inheritance (not an explicit run srgbClr).
-  // The patch path uses this to avoid baking theme colors into srgbClr (theme switches must stay linked)
-  const colorFollowsTheme = color != null && !(fill && fill['a:srgbClr'])
+  // The patch path uses this to avoid baking theme colors into srgbClr (theme switches must stay linked).
+  // An srgbClr carrying transform children (lumMod/lumOff/alpha…) resolves to a computed display
+  // value too: rewriting would bake the computation in and drop the modifiers, so it gets the same
+  // keep-bytes-unless-changed treatment.
+  const srgb = fill?.['a:srgbClr']
+  const srgbHasMods =
+    srgb != null && typeof srgb === 'object' && Object.keys(srgb).some((k) => k.startsWith('a:'))
+  const colorFollowsTheme = color != null && (!(fill && srgb) || srgbHasMods)
   const colorInherited = color != null && !fill
   // Text highlight <a:highlight> (PowerPoint draws it as a background behind the run)
   const highlightNode = rPr['a:highlight']
   const highlight = highlightNode ? resolveColorNode(highlightNode, ctx) : undefined
+  const langScript = eaScriptOfLang
+  const runLangScript = langScript(rPr['@_altLang']) ?? langScript(rPr['@_lang'])
+  // An ea theme ref on a theme with an empty <a:ea/>: the run's East Asian language (altLang
+  // first), else the text's own kana/hangul, else the placeholder level's lang, else — for
+  // bare ideographs — the theme's single Han script, picks the fontScheme per-script entry
+  const eaScript: EaScript | undefined =
+    runLangScript ??
+    (/[\u3040-\u30ff\u31f0-\u31ff]/.test(text)
+      ? 'ja'
+      : /[\uac00-\ud7af\u1100-\u11ff]/.test(text)
+        ? 'ko'
+        : undefined) ??
+    dflt?.eaScript ??
+    (/[\u3400-\u9fff\uf900-\ufaff]/.test(text) ? 'han' : undefined)
   // Font: run explicit (incl. +mj/+mn theme refs) → inherited default → theme font
-  const latin = resolveFontRef(rPr['a:latin']?.['@_typeface'], ctx.theme) ?? dflt?.latinFont
-  const ea = resolveFontRef(rPr['a:ea']?.['@_typeface'], ctx.theme) ?? dflt?.eaFont
-  const cs = resolveFontRef(rPr['a:cs']?.['@_typeface'], ctx.theme) ?? dflt?.csFont
+  const latin =
+    resolveFontRef(rPr['a:latin']?.['@_typeface'], ctx.theme, eaScript) ?? dflt?.latinFont
+  const ea = resolveFontRef(rPr['a:ea']?.['@_typeface'], ctx.theme, eaScript) ?? dflt?.eaFont
+  const cs = resolveFontRef(rPr['a:cs']?.['@_typeface'], ctx.theme, eaScript) ?? dflt?.csFont
+  const sym = resolveFontRef(rPr['a:sym']?.['@_typeface'], ctx.theme)
+  // Symbol-slot characters (Wingdings dots/checkmarks stored as U+F0xx PUA) draw with a:sym,
+  // not the latin font; applied when the run is entirely PUA (the common single-glyph case)
+  const puaOnly =
+    sym != null && /^[\uf000-\uf0ff]+$/.test(text.replace(/\s+/g, '')) && !!text.trim()
+  // Substitution script hint (PowerPoint order): run altLang/lang CJK tag first,
+  // then the @charset declared on the bucket the family came from (own rPr only)
+  const CHARSET_SCRIPT: Record<number, 'ja' | 'ko' | 'sc' | 'tc'> = {
+    128: 'ja', // SHIFTJIS
+    129: 'ko', // HANGUL
+    130: 'ko', // JOHAB
+    134: 'sc', // GB2312
+    136: 'tc', // CHINESEBIG5
+  }
+  const charsetOf = (bucket: string): ('ja' | 'ko' | 'sc' | 'tc') | undefined => {
+    if (runLangScript) return runLangScript
+    if (rPr[bucket]?.['@_typeface'] == null) return undefined
+    const v = rPr[bucket]['@_charset']
+    if (v == null) return undefined
+    const n = parseInt(String(v), 10)
+    return Number.isFinite(n) ? CHARSET_SCRIPT[n & 0xff] : undefined
+  }
   // Pick the bucket by script: complex script → a:cs, CJK → a:ea, otherwise → a:latin; fall back through buckets when missing
-  const fontFamily =
-    (CS_RE.test(text) ? (cs ?? latin ?? ea) : CJK_RE.test(text) ? (ea ?? latin) : (latin ?? ea)) ??
-    ctx.theme?.minorFont
+  // Declared @charset alone (no lang): what PowerPoint consults for Latin text in a missing face
+  const charsetAttrOf = (bucket: string): ('ja' | 'ko' | 'sc' | 'tc') | undefined => {
+    const v = rPr[bucket]?.['@_charset']
+    if (rPr[bucket]?.['@_typeface'] == null || v == null) return undefined
+    const n = parseInt(String(v), 10)
+    return Number.isFinite(n) ? CHARSET_SCRIPT[n & 0xff] : undefined
+  }
+  const csPair =
+    cs != null ? { f: cs, cset: charsetOf('a:cs'), decl: charsetAttrOf('a:cs') } : undefined
+  const eaPair =
+    ea != null ? { f: ea, cset: charsetOf('a:ea'), decl: charsetAttrOf('a:ea') } : undefined
+  const latinPair =
+    latin != null
+      ? { f: latin, cset: charsetOf('a:latin'), decl: charsetAttrOf('a:latin') }
+      : undefined
+  const picked = puaOnly
+    ? sym != null
+      ? { f: sym, cset: undefined, decl: undefined }
+      : undefined
+    : ((CS_RE.test(text)
+        ? (csPair ?? latinPair ?? eaPair)
+        : CJK_RE.test(text)
+          ? (eaPair ?? latinPair)
+          : (latinPair ?? eaPair)) ??
+      (ctx.theme?.minorFont != null
+        ? { f: ctx.theme.minorFont, cset: undefined, decl: undefined }
+        : undefined))
+  const fontFamily = picked?.f
+  // Only ea-bucket runs record it: complex-script runs keep a:cs for everything non-wide
+  const latinFamily =
+    picked && picked === eaPair && latinPair && latinPair.f !== picked.f ? latinPair.f : undefined
+  // The hint steers CJK-glyph substitution only: latin-text runs substitute as western
+  // even when the run carries a CJK altLang (prod_043's "Rakuten Sans" ko-KR runs render
+  // with a latin substitute in PPT, not Malgun)
+  // Latin-only text: only an explicitly declared CJK charset on the picked bucket steers the
+  // substitute (prod_029: LG스마트체 charset=129 → Malgun digits); lang alone does not
+  const fontScriptHint = CJK_RE.test(text) ? picked?.cset : picked?.decl
   const bAttr = rPr['@_b']
   const iAttr = rPr['@_i']
   // Text outline <a:rPr><a:ln> (WordArt): only solid-color outlines are modeled, kept by the rebuild path
@@ -2798,6 +3537,8 @@ function parseRun(r: any, ctx: ParseContext, dflt?: LevelTextStyle): TextRun {
     }
   }
   const runShadow = parseShadow(rPr, ctx) ?? dflt?.shadow
+  const runGlow = parseGlow(rPr, ctx)
+  const reflection = rPr['a:effectLst']?.['a:reflection'] != null
   const uAttr = rPr['@_u']
   const strikeAttr = rPr['@_strike']
   const hasStrike = strikeAttr !== undefined && strikeAttr !== 'noStrike'
@@ -2809,15 +3550,20 @@ function parseRun(r: any, ctx: ParseContext, dflt?: LevelTextStyle): TextRun {
   return {
     text,
     bold: bAttr != null ? bAttr === '1' || bAttr === 'true' : !!dflt?.bold,
+    ...(bAttr == null ? { boldImplicit: true } : {}),
     italic: iAttr != null ? iAttr === '1' || iAttr === 'true' : !!dflt?.italic,
+    ...(iAttr == null ? { italicImplicit: true } : {}),
     ...(() => {
       const cap = rPr['@_cap'] != null ? String(rPr['@_cap']) : dflt?.cap
       return cap && cap !== 'none' ? { cap } : {}
     })(),
+    ...(rPr['@_cap'] != null ? { capExplicit: String(rPr['@_cap']) } : {}),
     underline: (uAttr !== undefined && uAttr !== 'none') || linkUnderline,
     ...(uAttr !== undefined && uAttr !== 'none' ? { underlineStyle: String(uAttr) } : {}),
+    ...(uAttr === 'none' ? { underlineExplicitNone: true } : {}),
     ...(linkUnderline ? { underlineImplicit: true } : {}),
     ...(hasStrike ? { strike: true, strikeStyle: String(strikeAttr) } : {}),
+    ...(strikeAttr === 'noStrike' ? { strikeExplicitNone: true } : {}),
     ...(latinRaw ? { latinFont: String(latinRaw) } : {}),
     ...(eaRaw ? { eaFont: String(eaRaw) } : {}),
     ...(csRaw ? { csFont: String(csRaw) } : {}),
@@ -2825,14 +3571,27 @@ function parseRun(r: any, ctx: ParseContext, dflt?: LevelTextStyle): TextRun {
     fontSize: rPr['@_sz'] ? parseInt(rPr['@_sz'], 10) / 100 : dflt?.fontSize,
     ...(rPr['@_sz'] ? {} : { fontSizeImplicit: true }),
     ...(rPr['@_spc'] ? { letterSpacing: parseInt(rPr['@_spc'], 10) / 100 } : {}),
+    ...(rPr['@_kern'] != null ? { kern: (parseInt(rPr['@_kern'], 10) || 0) / 100 } : {}),
     ...(rPr['@_baseline'] ? { baseline: parseInt(rPr['@_baseline'], 10) / 1000 } : {}),
     fontFamily,
+    ...(latinFamily ? { latinFamily } : {}),
+    ...(fontScriptHint != null ? { fontScriptHint } : {}),
     color,
     ...(colorFollowsTheme ? { colorFollowsTheme } : {}),
+    // Captured independent of resolution (a themeless parse still must not bake values in)
+    ...(fill && !(srgb != null && !srgbHasMods)
+      ? (() => {
+          const raw = colorNodeXml(fill)
+          return raw ? { colorNodeXml: raw } : {}
+        })()
+      : {}),
     ...(colorInherited ? { colorInherited } : {}),
     ...(highlight ? { highlight } : {}),
     ...(outline ? { outline } : {}),
     ...(runShadow ? { shadow: runShadow } : {}),
+    ...(gradient ? { gradient } : {}),
+    ...(runGlow ? { glow: runGlow } : {}),
+    ...(reflection ? { reflection: true } : {}),
     ...(hlink?.['@_r:id']
       ? {
           hyperlinkRId: String(hlink['@_r:id']),

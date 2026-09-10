@@ -41,6 +41,9 @@ export interface ChartSeries {
   xValues?: Array<number | null>
   /** Bubble: per-point sizes (c:bubbleSize); marker radius ∝ √size (area represents value) */
   bubbleSizes?: Array<number | null>
+  /** Value-from-cells data labels (c15:datalabelsRange cache), shown when the c15
+   *  showDataLabelsRange flag is on */
+  pointLabels?: string[]
   /** Line: smoothed curve */
   smooth?: boolean
   /** c:idx: automatic palette colors key off this, not document order */
@@ -56,6 +59,10 @@ export interface ChartSeries {
   marker?: boolean
   /** Explicit per-point colors <c:dPt> (common for pies; render layer palette otherwise) */
   pointColors?: Array<string | undefined>
+  /** Pie: <c:dPt><c:spPr><a:noFill/> — the wedge is outline-only */
+  pointNoFill?: Array<boolean | undefined>
+  /** Pie: per-point outline <c:dPt><c:spPr><a:ln> (color null = explicit no line) */
+  pointLines?: Array<{ color: string | null; widthPt?: number } | undefined>
   /** Pie: slice offset from center as percent of diameter (series-level c:explosion → all slices) */
   explosionPct?: number
   /** Pie: per-point explosion overrides (c:dPt/c:explosion) */
@@ -73,6 +80,12 @@ export interface ChartAxisStyle {
   labelColor?: string
   labelSizePt?: number
   labelBold?: boolean
+  /** Axis-title run styling (first rich run, else title txPr default run) */
+  titleSizePt?: number
+  titleBold?: boolean
+  titleItalic?: boolean
+  titleColor?: string
+
   /** Explicit tick-label rotation from txPr bodyPr rot (degrees, e.g. -45) */
   labelRotDeg?: number
   /** <c:delete val="1"/>: axis hidden (no tick labels or axis line) but its scale still applies */
@@ -85,6 +98,8 @@ export interface ChartAxisStyle {
   numFmt?: string
   lineColor?: string
   gridColor?: string
+  /** gridColor is the fallback (no explicit spPr color); the render layer picks the real default by hasStylePart */
+  gridColorAuto?: boolean
   gridDash?: boolean
   /** prstDash value (dash/dashDot/sysDash/...) for a finer dash pattern */
   gridDashVal?: string
@@ -93,7 +108,17 @@ export interface ChartAxisStyle {
   /** Minor gridlines: only drawn with an explicit color (PowerPoint hides them by default) */
   minorGridColor?: string
   minorGridWidthEmu?: number
+  /** <c:minorGridlines/> present without an explicit color */
+  minorGridAuto?: boolean
+  /** Explicit tick units (c:majorUnit / c:minorUnit) */
+  majorUnit?: number
+  minorUnit?: number
+  /** Category-axis explicit skips: label every Nth category / tick+gridline every Nth slot */
+  tickLblSkip?: number
+  tickMarkSkip?: number
   title?: string
+  /** <c:title><c:overlay val="1"/>: the axis title floats over the plot, reserving no space */
+  titleOverlay?: boolean
   /** <c:orientation val="maxMin"/>: categories/values reversed (common for bar charts with the first category on top) */
   reversed?: boolean
   /** The category axis is a c:dateAx (PowerPoint rotates its labels as soon as they collide) */
@@ -107,6 +132,8 @@ export interface ChartModel {
   grouping?: 'clustered' | 'stacked' | 'percentStacked' | 'standard'
   /** Gap between bars (% of bar width, c:gapWidth, default 150) */
   gapWidthPct?: number
+  /** Series overlap within a category (% of bar width, c:overlap; negative spreads bars apart) */
+  overlapPct?: number
   categories: string[]
   series: ChartSeries[]
   /** Legend position (undefined when there is no c:legend) */
@@ -116,6 +143,19 @@ export interface ChartModel {
   legendBold?: boolean
   /** <c:legend><c:overlay val="1"/>: the legend floats over the plot, reserving no space */
   legendOverlay?: boolean
+  /** c:legend manual layout: factor = offset from the auto position, edge = absolute, fractions of the frame */
+  legendLayout?: {
+    x?: number
+    y?: number
+    w?: number
+    h?: number
+    xMode?: 'edge' | 'factor'
+    yMode?: 'edge' | 'factor'
+  }
+  /** Legend paragraphs are RTL (<c:legend><c:txPr>…<a:pPr rtl="1">): entries mirror (swatch right of the text, right-aligned rows) */
+  legendRtl?: boolean
+  /** Chart part has a Microsoft chartStyle companion (style1.xml); without one PowerPoint uses black label text */
+  hasStylePart?: boolean
   /** Plot-area inner rectangle (c:plotArea/c:layout/c:manualLayout layoutTarget=inner), fractions of the chart frame */
   plotLayout?: { x: number; y: number; w: number; h: number }
   valAxis?: ChartAxisStyle
@@ -152,6 +192,10 @@ export interface ChartModel {
   titlePt?: number
   /** <c:title><c:overlay val="1"/>: the title floats over the plot, reserving no space */
   titleOverlay?: boolean
+  /** Explicit c:title run styling (txPr default run, else the first rich run) */
+  titleBold?: boolean
+  titleItalic?: boolean
+  titleColor?: string
   /** chartSpace-level <c:spPr> fill (whole-chart background, e.g. picture fill) */
   bgFill?: Fill
   /** Plot-area fill (c:plotArea's own spPr) */
@@ -192,6 +236,27 @@ export interface ChartModel {
   pseudo3D?: boolean
   /** c:view3D rotX (degrees) — controls the pie tilt / bar extrusion feel */
   rotXDeg?: number
+  /** c:bar3DChart: full 3D stage (series spread along a depth axis); angles in degrees */
+  bar3D?: {
+    rotX: number
+    rotY: number
+    /** c:depthPercent: bar depth as % of bar width */
+    depthPct: number
+    /** c:rAngAx: right-angle axes (parallel skew projection; PowerPoint's default) */
+    rAngAx: boolean
+    /** c:gapDepth: gap between depth rows as % of bar depth */
+    gapDepthPct: number
+    /** c:serAx present and visible: PowerPoint labels series names along the depth axis */
+    serAxLabels: boolean
+  }
+  /** c:area3DChart: full 3D stage (standard grouping spreads series along the depth axis) */
+  area3D?: {
+    rotX: number
+    rotY: number
+    /** c:gapDepth: gap between depth rows as % of ribbon depth */
+    gapDepthPct: number
+    serAxLabels: boolean
+  }
 }
 
 /** Parse one chartN.xml. Returns null for unrecognized plot types (caller falls back to a placeholder chip). */
@@ -214,17 +279,21 @@ export function parseChartXml(
   // Cartesian types (bar/area/line) may coexist combined (e.g. column+line combo); pie/scatter/radar stand alone.
   // 3D variants map onto the 2D pipelines (same data/palette/legend); the render layer adds a
   // pseudo-3D look (elliptical pie with a rim, extruded bars) driven by pseudo3D + c:view3D rotX.
-  const cartesian: Array<{ kind: 'bar' | 'area' | 'line'; plot: any }> = []
-  const barPlot = plotArea['c:barChart'] ?? plotArea['c:bar3DChart']
-  const areaPlot = plotArea['c:areaChart'] ?? plotArea['c:area3DChart']
-  const linePlot = plotArea['c:lineChart'] ?? plotArea['c:line3DChart']
+  // The same plot type may appear twice in one plotArea (primary + secondary-axis group:
+  // two c:lineChart nodes) — fast-xml-parser then yields an array; flatten each node into
+  // its own combo entry so the secondary group's series and axId still parse.
+  const plots = (n: any): any[] => (Array.isArray(n) ? n : n ? [n] : [])
+  const cartesian: Array<{ kind: 'bar' | 'area' | 'line'; plot: any; stock?: boolean }> = []
   // Stock (open-)high-low-close rides the line pipeline: category axis + one value series
   // per role; whiskers/up-down bars come from the stock flags, connecting lines stay off
   const stockPlot = plotArea['c:stockChart']
-  if (barPlot) cartesian.push({ kind: 'bar', plot: barPlot })
-  if (areaPlot) cartesian.push({ kind: 'area', plot: areaPlot })
-  if (linePlot) cartesian.push({ kind: 'line', plot: linePlot })
-  if (stockPlot) cartesian.push({ kind: 'line', plot: stockPlot })
+  for (const p of plots(plotArea['c:barChart'] ?? plotArea['c:bar3DChart']))
+    cartesian.push({ kind: 'bar', plot: p })
+  for (const p of plots(plotArea['c:areaChart'] ?? plotArea['c:area3DChart']))
+    cartesian.push({ kind: 'area', plot: p })
+  for (const p of plots(plotArea['c:lineChart'] ?? plotArea['c:line3DChart']))
+    cartesian.push({ kind: 'line', plot: p })
+  for (const p of plots(stockPlot)) cartesian.push({ kind: 'line', plot: p, stock: true })
 
   const piePlot = plotArea['c:pieChart'] ?? plotArea['c:pie3DChart'] ?? plotArea['c:doughnutChart']
 
@@ -289,6 +358,9 @@ export function parseChartXml(
       const s: ChartSeries = {
         values: readNumPoints(plotKind === 'scatter' ? ser['c:yVal'] : ser['c:val']),
       }
+      // A numRef with no numCache has no renderable data: PowerPoint plots nothing and
+      // omits the series from the legend (external workbook data is never re-fetched)
+      if (!s.values.length) continue
       if (tagPlotKind) s.plotKind = plotKind as 'line' | 'bar' | 'area'
       // Excel/PowerPoint pick automatic series colors by c:idx, not document order
       const palIdx = parseInt(ser['c:idx']?.['@_val'], 10)
@@ -311,6 +383,24 @@ export function parseChartXml(
       )
       if (color) s.color = color
       if (ser['c:smooth']?.['@_val'] === '1') s.smooth = true
+      // Value-from-cells data labels (2012 c15 extension): strings live in the range cache,
+      // gated by c15:showDataLabelsRange on the series dLbls
+      const serExtRaw = ser['c:extLst']?.['c:ext']
+      const serExts: any[] = Array.isArray(serExtRaw) ? serExtRaw : serExtRaw ? [serExtRaw] : []
+      const rangeCache = serExts
+        .map((e) => e?.['c15:datalabelsRange']?.['c15:dlblRangeCache'])
+        .find(Boolean)
+      const dLblExtRaw = ser['c:dLbls']?.['c:extLst']?.['c:ext']
+      const dLblExts: any[] = Array.isArray(dLblExtRaw)
+        ? dLblExtRaw
+        : dLblExtRaw
+          ? [dLblExtRaw]
+          : []
+      const showRange = dLblExts.some((e) => e?.['c15:showDataLabelsRange']?.['@_val'] === '1')
+      if (rangeCache && showRange) {
+        const labs = readPoints(rangeCache).map((v) => v ?? '')
+        if (labs.some((v) => v)) s.pointLabels = labs
+      }
       const serLn = ser['c:spPr']?.['a:ln']
       const serDash = serLn?.['a:prstDash']?.['@_val']
       if (typeof serDash === 'string' && serDash !== 'solid') s.dash = serDash
@@ -326,7 +416,9 @@ export function parseChartXml(
       const serDl = ser['c:dLbls']
       s.dataLabels = serDl && typeof serDl === 'object' ? dlOn(serDl) : dlOn(plotNode['c:dLbls'])
       const markerSym = ser['c:marker']?.['c:symbol']?.['@_val']
-      if (plotKind === 'line') s.marker = markerSym != null && markerSym !== 'none'
+      if (plotKind === 'line')
+        // Stock OHLC series show markers by default (PowerPoint draws marker-only lines)
+        s.marker = fromStock ? markerSym !== 'none' : markerSym != null && markerSym !== 'none'
       // scatter/radar: default marker decided by style; only set for explicit symbol (none → false)
       else if ((plotKind === 'scatter' || plotKind === 'radar') && markerSym != null)
         s.marker = markerSym !== 'none'
@@ -336,16 +428,32 @@ export function parseChartXml(
       const dPts: any[] = ser['c:dPt'] ?? []
       if (dPts.length) {
         const pointColors: Array<string | undefined> = []
+        const pointNoFill: Array<boolean | undefined> = []
+        const pointLines: Array<{ color: string | null; widthPt?: number } | undefined> = []
         const pointExpl: Array<number | undefined> = []
         for (const dPt of dPts) {
           const idx = parseInt(dPt['c:idx']?.['@_val'], 10)
           if (Number.isNaN(idx)) continue
-          const c = resolveColorNode(dPt['c:spPr']?.['a:solidFill'], theme)
+          const dSp = dPt['c:spPr']
+          const c = resolveColorNode(dSp?.['a:solidFill'], theme)
           if (c != null) pointColors[idx] = c
+          if (dSp && 'a:noFill' in dSp) pointNoFill[idx] = true
+          const dLn = dSp?.['a:ln']
+          if (dLn && typeof dLn === 'object') {
+            const lnColor = 'a:noFill' in dLn ? null : resolveColorNode(dLn['a:solidFill'], theme)
+            const lnW = parseInt(dLn['@_w'], 10)
+            if (lnColor !== undefined)
+              pointLines[idx] = {
+                color: lnColor,
+                ...(Number.isFinite(lnW) && lnW > 0 ? { widthPt: lnW / 12700 } : {}),
+              }
+          }
           const pe = parseInt(dPt['c:explosion']?.['@_val'], 10)
           if (Number.isFinite(pe)) pointExpl[idx] = pe
         }
         if (pointColors.length) s.pointColors = pointColors
+        if (pointNoFill.length) s.pointNoFill = pointNoFill
+        if (pointLines.length) s.pointLines = pointLines
         if (pointExpl.length) s.pointExplosionPct = pointExpl
       }
       series.push(s)
@@ -380,9 +488,9 @@ export function parseChartXml(
         c.kind,
         true,
         secAxId != null && plotAxIds(c.plot).includes(secAxId),
-        c.plot === stockPlot,
+        !!c.stock,
       )
-  } else parsePlotSeries(plot, kind, false, false, plot === stockPlot)
+  } else parsePlotSeries(plot, kind, false, false, !!cartesian[0]?.stock)
   if (!series.length) return null
   if (!categories.length) {
     // With no category cache, keep names empty (length from the longest series); never inject placeholders
@@ -397,9 +505,39 @@ export function parseChartXml(
     model.pseudo3D = true
     const rotX = parseInt(chart['c:view3D']?.['c:rotX']?.['@_val'], 10)
     if (Number.isFinite(rotX)) model.rotXDeg = rotX
+    const b3 = plotArea['c:bar3DChart']
+    const a3 = plotArea['c:area3DChart']
+    const v3 = chart['c:view3D']
+    const num = (node: any, dflt: number) => {
+      const v = parseInt(node?.['@_val'], 10)
+      return Number.isFinite(v) ? v : dflt
+    }
+    const serAx = plotArea['c:serAx']
+    const serAxLabels =
+      serAx != null &&
+      serAx['c:delete']?.['@_val'] !== '1' &&
+      serAx['c:tickLblPos']?.['@_val'] !== 'none'
+    if (b3) {
+      model.bar3D = {
+        rotX: num(v3?.['c:rotX'], 15),
+        rotY: num(v3?.['c:rotY'], 20),
+        depthPct: num(v3?.['c:depthPercent'], 100),
+        rAngAx: v3?.['c:rAngAx']?.['@_val'] !== '0',
+        gapDepthPct: num(b3['c:gapDepth'], 150),
+        serAxLabels,
+      }
+    }
+    if (a3) {
+      model.area3D = {
+        rotX: num(v3?.['c:rotX'], 15),
+        rotY: num(v3?.['c:rotY'], 20),
+        gapDepthPct: num(a3['c:gapDepth'], 150),
+        serAxLabels,
+      }
+    }
   }
 
-  if (kind === 'bar' || kind === 'area') {
+  if (kind === 'bar' || kind === 'area' || kind === 'line') {
     const grouping = plot['c:grouping']?.['@_val']
     if (grouping) model.grouping = grouping
   }
@@ -408,6 +546,8 @@ export function parseChartXml(
     model.barDir = dir === 'bar' ? 'bar' : 'col'
     const gap = plot['c:gapWidth']?.['@_val']
     model.gapWidthPct = gap != null ? parseInt(gap, 10) : 150
+    const ov = plot['c:overlap']?.['@_val']
+    if (ov != null) model.overlapPct = parseInt(ov, 10) || 0
   }
 
   if (kind === 'pie') {
@@ -447,8 +587,30 @@ export function parseChartXml(
   const legendPos = legendNode?.['c:legendPos']?.['@_val']
   if (legendNode) {
     model.legendPos = (legendPos as ChartModel['legendPos']) ?? 'r'
-    // <c:overlay val="1"/>: the legend floats over the plot, reserving no space
-    if (legendNode['c:overlay']?.['@_val'] === '1') model.legendOverlay = true
+    // Measured PowerPoint behavior: explicit <c:overlay val="1"/> floats the legend, and so does
+    // a legend with no <c:legendPos> at all (unless overlay is explicitly 0)
+    const overlay = legendNode['c:overlay']?.['@_val']
+    if (overlay === '1' || (overlay === undefined && legendPos === undefined)) {
+      model.legendOverlay = true
+    }
+    const man = legendNode['c:layout']?.['c:manualLayout']
+    if (man) {
+      const frac = (k: string) => {
+        const v = Number(man[k]?.['@_val'])
+        return Number.isFinite(v) ? v : undefined
+      }
+      const mode = (k: string): 'edge' | 'factor' =>
+        man[k]?.['@_val'] === 'edge' ? 'edge' : 'factor'
+      const [lx, ly, lw, lh] = [frac('c:x'), frac('c:y'), frac('c:w'), frac('c:h')]
+      if (lx !== undefined || ly !== undefined) {
+        model.legendLayout = {
+          ...(lx !== undefined ? { x: lx, xMode: mode('c:xMode') } : {}),
+          ...(ly !== undefined ? { y: ly, yMode: mode('c:yMode') } : {}),
+          ...(lw !== undefined && lw > 0 ? { w: lw } : {}),
+          ...(lh !== undefined && lh > 0 ? { h: lh } : {}),
+        }
+      }
+    }
     const legP = chart['c:legend']?.['c:txPr']?.['a:p']
     const legRPr = (Array.isArray(legP) ? legP[0] : legP)?.['a:pPr']?.['a:defRPr']
     // INT_MIN baseline sentinel: PowerPoint renders no legend at all
@@ -456,6 +618,8 @@ export function parseChartXml(
     const legSz = parseInt(legRPr?.['@_sz'], 10)
     if (Number.isFinite(legSz) && legSz > 0) model.legendPt = legSz / 100
     if (legRPr?.['@_b'] === '1') model.legendBold = true
+    const legPPr = (Array.isArray(legP) ? legP[0] : legP)?.['a:pPr']
+    if (legPPr?.['@_rtl'] === '1') model.legendRtl = true
   }
 
   // Plot-area inner rectangle (edge-mode fractions of the chart frame); PowerPoint positions
@@ -560,13 +724,22 @@ export function parseChartXml(
       10,
     )
     if (Number.isFinite(titleSz) && titleSz > 0) model.titlePt = titleSz / 100
-    // Rich-text titles usually carry the size on the first run, not on txPr
+    // Rich-text titles usually carry the styling on the first run, not on txPr
+    const rich = chart['c:title']?.['c:tx']?.['c:rich']
+    const p0 = Array.isArray(rich?.['a:p']) ? rich['a:p'][0] : rich?.['a:p']
+    const r0 = Array.isArray(p0?.['a:r']) ? p0['a:r'][0] : p0?.['a:r']
+    const titleRPr = r0?.['a:rPr'] ?? p0?.['a:pPr']?.['a:defRPr']
     if (!model.titlePt) {
-      const rich = chart['c:title']?.['c:tx']?.['c:rich']
-      const p0 = Array.isArray(rich?.['a:p']) ? rich['a:p'][0] : rich?.['a:p']
-      const r0 = Array.isArray(p0?.['a:r']) ? p0['a:r'][0] : p0?.['a:r']
-      const runSz = parseInt(r0?.['a:rPr']?.['@_sz'], 10)
+      const runSz = parseInt(titleRPr?.['@_sz'], 10)
       if (Number.isFinite(runSz) && runSz > 0) model.titlePt = runSz / 100
+    }
+    const styleRPr = titleRPr ?? (Array.isArray(titP) ? titP[0] : titP)?.['a:pPr']?.['a:defRPr']
+    if (styleRPr) {
+      // Explicit b="0" must reach the render layer (its default for chart titles is bold)
+      if (styleRPr['@_b'] != null) model.titleBold = styleRPr['@_b'] === '1'
+      if (styleRPr['@_i'] === '1') model.titleItalic = true
+      const c = resolveColorNode(styleRPr['a:solidFill'], theme)
+      if (c) model.titleColor = c
     }
   }
 
@@ -799,6 +972,7 @@ function parseAxis(ax: any, theme?: Theme): ChartAxisStyle | undefined {
     const ln = typeof grid === 'object' ? grid['c:spPr']?.['a:ln'] : undefined
     const gc = resolveColorNode(ln?.['a:solidFill'], theme)
     out.gridColor = gc ?? '#E6E6E6'
+    if (!gc) out.gridColorAuto = true
     const dash = ln?.['a:prstDash']?.['@_val']
     if (dash && dash !== 'solid') {
       out.gridDash = true
@@ -808,18 +982,48 @@ function parseAxis(ax: any, theme?: Theme): ChartAxisStyle | undefined {
     if (Number.isFinite(w) && w > 0) out.gridWidthEmu = w
   }
   const minor = ax['c:minorGridlines']
-  if (minor !== undefined && typeof minor === 'object') {
-    const ln = minor['c:spPr']?.['a:ln']
+  if (minor !== undefined) {
+    const ln = typeof minor === 'object' ? minor['c:spPr']?.['a:ln'] : undefined
     const gc = resolveColorNode(ln?.['a:solidFill'], theme)
     if (gc) {
       out.minorGridColor = gc
       const w = parseInt(ln?.['@_w'], 10)
       if (Number.isFinite(w) && w > 0) out.minorGridWidthEmu = w
+    } else {
+      out.minorGridAuto = true
     }
   }
+  const majorUnit = Number(ax['c:majorUnit']?.['@_val'])
+  if (Number.isFinite(majorUnit) && majorUnit > 0) out.majorUnit = majorUnit
+  const minorUnit = Number(ax['c:minorUnit']?.['@_val'])
+  if (Number.isFinite(minorUnit) && minorUnit > 0) out.minorUnit = minorUnit
+  const lblSkip = parseInt(ax['c:tickLblSkip']?.['@_val'], 10)
+  if (Number.isFinite(lblSkip) && lblSkip > 1) out.tickLblSkip = lblSkip
+  const markSkip = parseInt(ax['c:tickMarkSkip']?.['@_val'], 10)
+  if (Number.isFinite(markSkip) && markSkip > 1) out.tickMarkSkip = markSkip
   // Axis title (all a:t inside c:title/c:tx/c:rich concatenated)
-  const title = collectText(ax['c:title']?.['c:tx']?.['c:rich'])
-  if (title) out.title = title
+  const titleNode = ax['c:title']
+  const title = collectText(titleNode?.['c:tx']?.['c:rich'])
+  if (title) {
+    out.title = title
+    if (titleNode?.['c:overlay']?.['@_val'] === '1') out.titleOverlay = true
+    const tp0raw = titleNode?.['c:tx']?.['c:rich']?.['a:p']
+    const tp0 = Array.isArray(tp0raw) ? tp0raw[0] : tp0raw
+    const tr0 = Array.isArray(tp0?.['a:r']) ? tp0['a:r'][0] : tp0?.['a:r']
+    const txp = titleNode?.['c:txPr']?.['a:p']
+    const rPr =
+      tr0?.['a:rPr'] ??
+      tp0?.['a:pPr']?.['a:defRPr'] ??
+      (Array.isArray(txp) ? txp[0] : txp)?.['a:pPr']?.['a:defRPr']
+    if (rPr) {
+      const sz = parseInt(rPr['@_sz'], 10)
+      if (Number.isFinite(sz) && sz > 0) out.titleSizePt = sz / 100
+      if (rPr['@_b'] === '1') out.titleBold = true
+      if (rPr['@_i'] === '1') out.titleItalic = true
+      const c = resolveColorNode(rPr['a:solidFill'], theme)
+      if (c) out.titleColor = c
+    }
+  }
   return Object.keys(out).length ? out : undefined
 }
 

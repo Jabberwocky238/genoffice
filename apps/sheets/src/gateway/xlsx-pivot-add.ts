@@ -1,4 +1,6 @@
+import { ensureRelationshipNamespace } from './xlsx-namespace'
 import { columnLabel } from '../domain/cell-address'
+import { shortDateNumFmtId } from '../shared/short-date'
 import { isValidPivotFilter, type PivotFilterDef } from '../domain/pivot-filters'
 import { formatPivotFormula, parsePivotFormula } from '../domain/pivot-formula'
 import { groupLabel, isValidGrouping, type PivotFieldGrouping } from '../domain/pivot-grouping'
@@ -596,6 +598,7 @@ function maxCacheId(workbookXml: string): number {
 /// Adds a <pivotCache> entry; workbook.xml schema order puts pivotCaches
 /// after calcPr, before extLst.
 function addWorkbookPivotCache(workbookXml: string, cacheId: number, relId: string): string {
+  workbookXml = ensureRelationshipNamespace(workbookXml)
   const entry = `<pivotCache cacheId="${cacheId}" r:id="${relId}"/>`
   if (workbookXml.includes('</pivotCaches>')) {
     return workbookXml.replace('</pivotCaches>', `${entry}</pivotCaches>`)
@@ -917,6 +920,8 @@ function buildGroupingExtLst(addition: PivotAddition): string {
 /// Returns 0 (General) for unrecognised patterns.
 function resolveNumFmtId(numFmt: string): number {
   const fmt = numFmt.trim()
+  const shortDate = shortDateNumFmtId(fmt)
+  if (shortDate !== undefined) return shortDate
   const knownFormats: Record<string, number> = {
     '0': 1,
     '0.00': 2,
