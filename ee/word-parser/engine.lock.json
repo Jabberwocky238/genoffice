@@ -1,0 +1,17 @@
+{
+  "repository": "LilLeapo/rsWordParser",
+  "commit": "e70bc13e139a016753987e94b17e0d879dac0bc5",
+  "runId": "34681564080",
+  "artifactId": "10293969670",
+  "artifact": "rsword-jsbinding",
+  "artifactDigest": "sha256:a510e2f22cd3ae32fb68bb2d85aff3c752b006b6fbfadc593b33e1ff0cad86f6",
+  "protocol": "native/0",
+  "wasmBindgen": "0.2.128",
+  "files": {
+    "rsword-jsbinding.tar.gz": "a7e4fafa0ee3549fa929ad8251407e0cfbf030e9ae5c07f3f9ea5e8959a81ac7",
+    "rsword_js.js": "835a9f5a8486c85df1eaa4d3382e25b9a89d7c5bd4c9e1e382aac5efce80e358",
+    "rsword_js.d.ts": "4399d00bc833b86153c46e8e25041589eec0af93372f169dda7b4f6f797461db",
+    "rsword_js_bg.wasm": "f2bb0fa548c0267c796e296d6cd3071eaa5e71e6585faa53b906fce6fbf55814",
+    "rsword_js_bg.wasm.d.ts": "8235965777cc54f5c1d7701e52b947ffd8c1e9fa032d0dd51c5e8157e99eea8d"
+  }
+}

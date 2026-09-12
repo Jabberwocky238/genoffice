@@ -1,0 +1,40 @@
+.ee-rsword {
+  position: fixed;
+  right: 18px;
+  bottom: 40px;
+  z-index: 90;
+  font-size: 12px;
+  color: var(--text);
+}
+.ee-rsword button {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.ee-rsword button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.ee-rsword-panel {
+  position: absolute;
+  right: 0;
+  bottom: 36px;
+  width: min(340px, 85vw);
+  max-height: 65vh;
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  box-shadow: 0 4px 16px var(--border);
+  overflow-wrap: anywhere;
+}
+.ee-rsword-panel p {
+  margin: 10px 0;
+}
+.ee-rsword-panel button + button {
+  margin-left: 8px;
+}

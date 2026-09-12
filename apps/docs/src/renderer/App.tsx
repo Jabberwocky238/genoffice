@@ -1,4 +1,5 @@
 import { DOC_CSS_COMMITTED_EVENT } from './editor/cjk-punct-shrink'
+import { WordParserDiagnostics } from '@genoffice/word-parser-extension'
 import {
   useCallback,
   useEffect,
@@ -4611,6 +4612,11 @@ export function App() {
       className={`app ${readMode ? 'read-mode' : ''}${revisionDisplay !== 'all' ? ` rev-display-${revisionDisplay}` : ''}${revisionDisplay === 'all' && viewMode === 'print' ? ' rev-balloon' : ''}`}
     >
       <ToastHost />
+      <WordParserDiagnostics
+        bytes={doc?.parsed.internal.originalBytes}
+        dirty={dirtyRef.current}
+        language={lang}
+      />
       {docCss && <style data-doc-css="">{docCss}</style>}
       {doc && liveDocCjk != null && (
         <style data-doc-css="">{`.doc-page { --doc-line-factor:${docLineFactor(doc.parsed, liveDocCjk)} }`}</style>

@@ -17,6 +17,12 @@
     "packages/*"
   ],
   "scripts": {
+    "ee:word-parser:download": "node ee/word-parser/tools/artifact.mjs download",
+    "ee:word-parser:check": "node ee/word-parser/tools/artifact.mjs check",
+    "test:ee:word-parser": "npm run ee:word-parser:check && vitest run --config ee/word-parser/vitest.config.ts",
+    "typecheck:ee:word-parser": "tsc --noEmit -p ee/word-parser/tsconfig.json",
+    "dev:docs:rsword": "node ee/word-parser/tools/run-docs.mjs dev",
+    "build:docs:rsword": "node ee/word-parser/tools/run-docs.mjs build",
     "postinstall": "install-electron",
     "format": "node tools/format-changed.mjs --write",
     "format:check": "node tools/format-changed.mjs --check",

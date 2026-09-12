@@ -1,6 +1,9 @@
 import { resolve } from 'node:path'
 import react from '@vitejs/plugin-react'
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
+import { wordParserBuild } from '../../ee/word-parser/vite'
+
+const wordParser = wordParserBuild()
 
 // Resolve workspace packages from this checkout's sources: in a git worktree
 // node_modules is a symlink into the main checkout, so bare specifiers would
@@ -27,8 +30,8 @@ export default defineConfig({
     plugins: [externalizeDepsPlugin({ exclude: ['@genoffice/electron-utils'] })],
   },
   renderer: {
-    plugins: [react()],
-    resolve: { alias: localAlias },
+    plugins: [react(), ...wordParser.plugins],
+    resolve: { alias: { ...localAlias, ...wordParser.alias } },
     server: {
       // Overridable so multiple genoffice dev instances can coexist (default 5173).
       port: Number(process.env.DOCS_DEV_PORT) || 5173,

@@ -9,6 +9,7 @@ const local = (rel: string) => fileURLToPath(new URL(rel, import.meta.url))
 export default defineConfig({
   resolve: {
     alias: {
+      '@genoffice/word-parser-extension': local('./src/renderer/extensions/word-parser.ts'),
       '@genoffice/docx-engine': local('../../packages/docx-engine/src/index.ts'),
       '@genoffice/font-metrics': local('../../packages/font-metrics/src/index.ts'),
       '@genoffice/electron-utils': local('../../packages/electron-utils/src/index.ts'),
