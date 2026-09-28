@@ -24,7 +24,7 @@ The Rust engines are git submodules at the repository root, pinned by commit:
   GitHub Packages package `@lilleapo/rs-word-parser` built from its `crates/rsword-js`.
 - `rsWordLayout/` ([Jabberwocky238/rsWordLayout](https://github.com/Jabberwocky238/rsWordLayout)):
   Word layout engine, published as `@jabberwocky238/rs-word-layout` from its
-  `crates/webgl`; not yet integrated.
+  `crates/webgl` and installed the same way; no module uses it yet.
 
 Clone with `git clone --recurse-submodules`, or run `git submodule update --init` in an
 existing checkout. Root lint and formatting skip both trees.

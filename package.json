@@ -69,6 +69,7 @@
     "typescript-eslint": "^8.65.0"
   },
   "optionalDependencies": {
+    "@jabberwocky238/rs-word-layout": "0.1.0",
     "@lilleapo/rs-word-parser": "0.0.1"
   }
 }
