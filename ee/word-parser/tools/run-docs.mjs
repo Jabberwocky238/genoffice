@@ -7,7 +7,7 @@ const result = spawnSync(
   ['run', command, '-w', '@genoffice/docs'],
   {
     stdio: 'inherit',
-    env: { ...process.env, GENOFFICE_WORD_PARSER: 'shadow' },
+    env: { GENOFFICE_WORD_PARSER: 'rsword', ...process.env },
     shell: process.platform === 'win32',
   },
 )

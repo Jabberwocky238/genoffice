@@ -1,6 +1,6 @@
-import { parseDocx } from '@genoffice/docx-engine'
+import { wordBackend } from '@genoffice/word-parser-extension'
 
-type Parsed = Awaited<ReturnType<typeof parseDocx>>
+type Parsed = Awaited<ReturnType<typeof wordBackend.parse>>
 
 export interface ParseWorkerRequest {
   id: number
@@ -69,7 +69,7 @@ export async function parseDocxOffThread(
   const w = getWorker()
   if (!w) {
     parseStats.inline++
-    return parseDocx(bytes)
+    return wordBackend.parse(bytes)
   }
   const whole = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
   const owned =
@@ -87,7 +87,7 @@ export async function parseDocxOffThread(
   // a lost buffer (worker crash) is the one case with nothing to retry on
   if (response.bytes.byteLength === 0) throw new Error(response.error)
   parseStats.inline++
-  return parseDocx(new Uint8Array(response.bytes))
+  return wordBackend.parse(new Uint8Array(response.bytes))
 }
 if (typeof window !== 'undefined') {
   ;(window as unknown as Record<string, unknown>).__docsParseStats = parseStats

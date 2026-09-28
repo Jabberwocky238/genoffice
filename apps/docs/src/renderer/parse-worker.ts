@@ -1,4 +1,4 @@
-import { parseDocx } from '@genoffice/docx-engine'
+import { wordBackend } from '@genoffice/word-parser-extension'
 import type { ParseWorkerRequest, ParseWorkerResponse } from './parse-off-thread'
 
 /** Worker entry: parse a .docx off the UI thread and hand the model back. */
@@ -9,7 +9,7 @@ const post = (msg: ParseWorkerResponse, transfer: Transferable[] = []) =>
 self.onmessage = async (e: MessageEvent<ParseWorkerRequest>) => {
   const { id, bytes } = e.data
   try {
-    const parsed = await parseDocx(new Uint8Array(bytes))
+    const parsed = await wordBackend.parse(new Uint8Array(bytes))
     // HTML altChunks convert through the host's hidden window, reachable only
     // from the UI thread: hand the bytes back for the inline parse
     if (parsed.extras.altChunksNeedConverter) {

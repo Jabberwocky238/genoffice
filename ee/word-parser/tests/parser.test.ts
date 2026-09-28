@@ -6,6 +6,7 @@ import { parseDocx } from '../../../packages/docx-engine/src/parse'
 import { openWordDocument, type WordDocument } from '../src/index'
 import { ParserClient, type Request, type Transport } from '../src/client'
 import { wordParserBuild } from '../vite'
+import { loadRsword, wordBackend } from '../src/backend'
 
 // Only transport is in-process: all parsing/editing/saving uses the downloaded WASM.
 function transport(): Transport {
@@ -53,6 +54,11 @@ beforeAll(async () => {
     ),
   })
   bytes = await buildBlankDocx()
+  await loadRsword(() => ({
+    module_or_path: readFileSync(
+      new URL('../vendor/rsword-jsbinding/rsword_js_bg.wasm', import.meta.url),
+    ),
+  }))
 })
 afterEach(() => {
   documents.splice(0).forEach((doc) => doc.close())
@@ -68,7 +74,7 @@ async function open() {
 describe('downloaded native/0 binding', () => {
   it('opens, queries, saves identical bytes and closes idempotently', async () => {
     const doc = await open()
-    expect(doc.version.git).toBe('e70bc13e139a')
+    expect(doc.version.git).toBe('a8d24eaa4c65')
     expect(doc.version.protocol).toBe('native/0')
     expect((await doc.document()).truncated).toBe(false)
     expect(await doc.save()).toEqual(bytes)
@@ -162,6 +168,25 @@ it('keeps the default build independent and enables verified assets explicitly',
   expect(wordParserBuild().plugins).toEqual([])
   vi.stubEnv('GENOFFICE_WORD_PARSER', 'shadow')
   const build = wordParserBuild()
-  expect(build.alias['@genoffice/word-parser-extension']).toContain('Diagnostics.tsx')
+  expect(build.alias['@genoffice/word-parser-extension']).toContain('shadow.ts')
   expect(build.plugins[0].transformIndexHtml("script-src 'self';")).toContain("'wasm-unsafe-eval'")
+  vi.stubEnv('GENOFFICE_WORD_PARSER', 'rsword')
+  expect(wordParserBuild().alias['@genoffice/word-parser-extension']).toContain('extension.ts')
+})
+
+describe('rsword backend', () => {
+  it('parses into the editor model and saves an unedited document byte-identically', async () => {
+    const parsed = await wordBackend.parse(bytes)
+    expect(parsed.styles).toBeInstanceOf(Map)
+    expect(parsed.internal.originalBytes).toBe(bytes)
+    const blocks = parsed.blocks
+      .filter((b) => !b.hidden)
+      .map((b) => ({ kind: 'original' as const, docxIndex: b.docxIndex! }))
+    expect(await wordBackend.save(parsed, blocks)).toEqual(bytes)
+  })
+
+  it('creates a blank document it can reopen', async () => {
+    const blank = await wordBackend.blank({ eastAsiaFont: 'Microsoft YaHei' })
+    expect((await wordBackend.parse(blank)).blocks.length).toBeGreaterThan(0)
+  })
 })

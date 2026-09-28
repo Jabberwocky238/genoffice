@@ -4,8 +4,9 @@ Enterprise modules live here, behind the enterprise license boundary.
 
 - [WJKJ](wjkj/README.md): custom API configuration dialog and home sidebar entry,
   integrated with upstream AI settings.
-- [Word parser](word-parser/README.md): opt-in rsWordParser WASM session adapter
-  and Docs inspection panel; downloaded assets are gitignored.
+- [Word parser](word-parser/README.md): rsWordParser WASM as the Docs package
+  reader/writer (`GENOFFICE_WORD_PARSER=rsword`), parity tools and inspection panel;
+  built assets are gitignored.
 - [Word layout plan](docx-layout/PLAN.md): staged integration with docx-layout.
 
 ## License boundary

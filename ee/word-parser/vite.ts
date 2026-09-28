@@ -5,9 +5,9 @@ import lock from './engine.lock.json'
 
 export function wordParserBuild() {
   const mode = process.env.GENOFFICE_WORD_PARSER ?? 'off'
-  if (mode !== 'off' && mode !== 'shadow')
-    throw new Error('GENOFFICE_WORD_PARSER must be off or shadow')
-  if (mode === 'shadow') {
+  if (!['off', 'shadow', 'rsword'].includes(mode))
+    throw new Error('GENOFFICE_WORD_PARSER must be off, shadow or rsword')
+  if (mode !== 'off') {
     for (const [name, expected] of Object.entries(lock.files)) {
       const path = new URL(`./vendor/rsword-jsbinding/${name}`, import.meta.url)
       let bytes: Buffer
@@ -26,15 +26,17 @@ export function wordParserBuild() {
     alias: {
       '@genoffice/word-parser-extension': fileURLToPath(
         new URL(
-          mode === 'shadow'
-            ? './src/Diagnostics.tsx'
-            : '../../apps/docs/src/renderer/extensions/word-parser.ts',
+          {
+            off: '../../apps/docs/src/renderer/extensions/word-parser.ts',
+            shadow: './src/shadow.ts',
+            rsword: './src/extension.ts',
+          }[mode]!,
           import.meta.url,
         ),
       ),
     },
     plugins:
-      mode === 'shadow'
+      mode !== 'off'
         ? [
             {
               name: 'ee-word-parser-csp',

@@ -1,10 +1,35 @@
 # WJKJ EE: rsWordParser
 
-An experimental adapter for the actual rsWordParser WASM binding. It supports
-native document sessions, queries, edits, media and in-memory DOCX saving. Docs
-has an opt-in inspection panel; the editor still uses its existing parser/writer.
+Replaces the Docs package reader/writer with rsWordParser's WASM binding. With
+`GENOFFICE_WORD_PARSER=rsword`, every Docs open, patch-save and blank document goes
+through Rust; the editor, pagination and save planning are unchanged.
 
-## Use
+## Backend
+
+Docs reaches the package engine only through `wordBackend` from
+`@genoffice/word-parser-extension` (`parse`, `save`, `blank`). The public stub binds it
+to the TS `parseDocx` / `saveDocx` / `buildBlankDocx`; the build alias swaps the module:
+
+| `GENOFFICE_WORD_PARSER` | Alias target                              | Engine       | Panel             |
+| ----------------------- | ----------------------------------------- | ------------ | ----------------- |
+| `off` (default)         | `apps/docs/.../extensions/word-parser.ts` | TS           | none              |
+| `shadow`                | `src/shadow.ts`                           | TS           | Rust parser check |
+| `rsword`                | `src/extension.ts`                        | rsWordParser | Rust parser check |
+
+`src/backend.ts` drives upstream's `compat-ts` surface (`compat/1`): `parse(bytes)` is the
+`ParsedDoc` JSON (Maps and the caller-held source bytes are revived here), `save(bytes,
+blocks, options)` takes the same `SaveBlock[]` / `SaveOptions` as `saveDocx`, and
+`blank(options)` mirrors `buildBlankDocx`. The WASM loads once per realm, so the parse
+Worker and the UI thread each hold an instance. A version other than the pinned commit
+and protocol refuses to load.
+
+Upstream classifies `compat-ts` as a test-only differential adapter, so it tracks the TS
+engine's shape rather than promising it. The two tools below measure that gap.
+
+## Native sessions
+
+The same WASM also exports the stateful `native/0` protocol (`SessionTable`), wrapped by
+`openWordDocument` for the inspection panel and future native editing:
 
 ```ts
 import { openWordDocument } from './src'
@@ -25,90 +50,83 @@ try {
 ```
 
 `diagnostics()`, `resolve(kind, ids, part?)`, `media(id)`, `addMedia(bytes, mime)`,
-`nodeXml(node, part?)` and `partBytes(part)` expose the other native queries.
-IDs belong to one session and part; never reuse them after reopening.
-`document()` returns the native one-way JSON projection, not `ParsedDocFull`.
-Check `truncated` before treating a budgeted model as complete.
+`nodeXml(node, part?)` and `partBytes(part)` expose the other native queries. IDs belong
+to one session and part. Errors preserve the native `code`; a timeout closes the
+document's Worker. Source byte buffers are cloned, so the host retains ownership.
 
-The binding declarations come directly from the downloaded `.d.ts`. The wrapper
-handles JSON conversion, pinned version checking, Workers, errors and cleanup.
-It does not reproduce rsword's model or all edit-operation types. Errors preserve
-the native `code`. A timeout closes the document's Worker; reopening starts a new
-session. Source byte buffers are cloned, so the host retains ownership.
+## Build, pin and run
 
-## Download and run
+Release artifacts are built without `compat-ts`, so the pin is a local build:
 
 ```sh
-npm run ee:word-parser:download
+# in an rsWordParser checkout at the commit to pin (clean tree)
+RSWORD_COMMIT=$(git rev-parse --short=12 HEAD) \
+  cargo build -p rsword-js --target wasm32-unknown-unknown --profile wasm-release --locked --features compat-ts
+wasm-bindgen --target web --out-dir crates/rsword-js/pkg target/wasm32-unknown-unknown/wasm-release/rsword_js.wasm
+# (tools/build-js.sh --locked --features compat-ts does both)
+
+npm run ee:word-parser:build -- <rsWordParser checkout>
 npm run test:ee:word-parser
 npm run typecheck:ee:word-parser
 npm run dev:docs:rsword
 ```
 
-The download requires `gh` access to the pinned Actions artifact and `tar`.
-`vendor/` is gitignored. `engine.lock.json` tracks the source, run/artifact identity
-and hashes for the archive, JS, WASM and declarations. The archive is checked before
-extraction, then every extracted asset is checked. `npm run ee:word-parser:check`
-performs offline verification. Expired artifacts must be explicitly replaced and
-revalidated, never silently resolved to the latest run.
+`ee:word-parser:build` loads the built WASM, requires its embedded commit to equal the
+checkout's `HEAD` and its protocol to be `compat/1`, copies it into the gitignored
+`vendor/`, and rewrites `engine.lock.json` (commit, `source: local`, features, hashes).
+Enabled builds verify every hash; `ee:word-parser:check` does so offline. `download`
+applies only to a lock that pins an Actions run and refuses a local pin.
+wasm-bindgen must match the `wasm-bindgen` version in the upstream `Cargo.lock` (0.2.128).
 
-Source: [release run 34681564080](https://github.com/LilLeapo/rsWordParser/actions/runs/34681564080),
-artifact `rsword-jsbinding`, commit `e70bc13e139a016753987e94b17e0d879dac0bc5`,
-protocol `native/0`, wasm-bindgen `0.2.128`. Use this complete JS-binding artifact,
-which includes its companion WASM, rather than mixing it with the raw WASM artifact.
+`dev:docs:rsword` / `build:docs:rsword` default to `rsword`; set
+`GENOFFICE_WORD_PARSER=shadow` to keep the TS engine with the panel. For a shell
+session, set the variable on the root `npm run dev`.
 
-The default application build is unchanged. `GENOFFICE_WORD_PARSER=shadow` selects
-the EE panel for both standalone Docs and the renderer embedded in the shell.
-`npm run build:docs:rsword` produces a local Docs build with that option. Missing or
-modified assets fail the enabled build. Off builds do not require or bundle them.
-For a shell development session, set the environment variable on the root `npm run dev`.
+## Measuring parity
 
-Open a DOCX and click **Rust parser check**. It opens the loaded package in Rust,
-queries diagnostics, and verifies byte-identical unchanged saving in memory.
-The panel never writes a file. Model queries are budgeted and truncation is shown.
-Edits invalidate the check; save before checking the new loaded snapshot.
+```sh
+npm run ee:word-parser:diff -- <dir|file.docx>... [--json report.json]
+npm run test:docs:rsword
+```
+
+`ee:word-parser:diff` parses every document with both engines and lists each differing
+field path (indices and map keys collapsed) with the number of documents it affects:
+`missing` fields exist only in TS, `extra` only in Rust. `test:docs:rsword` runs the whole
+Docs suite with `@genoffice/docx-engine` swapped for `src/engine-shim.ts` (TS engine except
+`parseDocx` / `saveDocx` / `buildBlankDocx`), so open → edit → save-plan → save round trips
+run on Rust.
+
+Baseline at `a8d24eaa` (compat mirrors the TS engine of 2026-09-03):
+
+- 1,098 documents (upstream synthetic + real corpus, `fixtures`, Docs pagination corpus):
+  no parse failures on either side, 251 differing paths. Most are TS fields added after
+  that date (`noteNumbers`, `internal.bodyContentStart/End`, `styles.*.basedOn`,
+  `docDefaults`, `watermarkPicture`, chart axes/legend, text-box wrap, header/footer
+  borders and table rows); upstream `KNOWN_DIFFS.md` records the intentional ones
+  (source-byte `rawRPr`, raw metafile data URLs, `mc:Fallback` for undeclared prefixes).
+- Docs suite on Rust: 3,000 of 3,103 tests pass; 103 failures in 36 files, led by
+  numbering, Zotero fields, list continuation, SDT tables of contents and table edits.
 
 ## Replacement plan
 
-This artifact exports `SessionTable`; it has no standalone `parse()` compatibility
-function. Upstream's `compat-ts` feature is explicitly a test-only differential
-adapter, not a stable editor integration contract. Use `native/0` for this module.
-
-1. **Implemented:** ignored artifact acquisition, native session wrapper, Worker,
-   read/edit/save integration tests, and opt-in Docs inspection.
-2. **Read projection:** map native document/resolve/media output into the existing
-   editor view, auditing styles, numbering, images, fields, tables, notes, protection
-   and revisions. Preserve unsupported objects, and distinguish readable, editable,
-   round-trippable and displayable capabilities. Metafile conversion stays a host service.
-3. **Write migration:** translate editor transactions into native operations and
-   keep the Rust session as the package authority. Current `buildDocBytes` depends on
-   `internal.originalBytes`, XML ranges, `extras`, `docxIndex` and `SaveBlock[]`;
-   substituting the return type of `parseDocx()` alone cannot satisfy that contract.
-   Address multi-operation atomicity, undo/redo, IME, recovery and failed disk saves
-   before enabling editing. Do not assume the current WASM API provides an editor history API.
-4. **Backend rollout:** choose one authoritative read/write backend per document.
-   Compare on real fixtures first, then enable supported documents. Do not silently
-   switch an edited Rust session to the legacy writer using mismatched source indices.
-
-The eventual parser host interface should live near `file-actions.ts` and
-`doc-state.ts`, with a separate view adapter near `editor/convert.ts`.
-The existing parser/writer remains the default until both projection and editing
-coverage pass. Merely parsing successfully does not establish feature parity.
-
-For layout, native model/resolve output should feed its own `LayoutDocument`
-adapter directly. Do not route through a lossy legacy editor projection.
-The layout repository's proposed Rust adapter is not present in this binding;
-its API and remaining semantic gaps need a separate implementation.
-See [layout integration plan](../docx-layout/PLAN.md).
+1. **Done:** backend seam in Docs, compat backend, local pinning, parse diff, Docs suite
+   on Rust.
+2. **Parity (upstream `compat_ts`):** close the diff paths and the Docs-suite failures,
+   largest first; register only deliberate differences in upstream `KNOWN_DIFFS.md`.
+3. **Default:** when the Docs suite is green on Rust, build enterprise releases with
+   `rsword`, and publish a `compat-ts` JS binding from upstream's release job so the lock
+   can pin an Actions artifact again.
+4. **Native editing:** move save from `SaveBlock[]` to `native/0` operations with the
+   Rust session as package authority. Layout should consume native model output
+   directly, not the legacy projection; see [layout integration plan](../docx-layout/PLAN.md).
 
 ## Validation and licensing
 
-Tests exercise the downloaded WASM, including byte-identical saving, Unicode edits,
-reopening in both parsers, rejected edits, media, budgets, timeout and cancellation.
-These are integration checks, not a claim of complete Word or editor parity.
-The module is not enabled in enterprise release workflows yet.
+Tests run the pinned WASM: native sessions (byte-identical saving, Unicode edits,
+reopening in both parsers, rejected edits, media, budgets, timeout, cancellation) and the
+compat backend (Map revival, byte-identical unedited save, blank documents).
 
 EE integration code is covered by [the enterprise license](../LICENSE).
 [rsWordParser](https://github.com/LilLeapo/rsWordParser) remains
-`MIT OR Apache-2.0`; downloaded upstream assets retain their original license.
+`MIT OR Apache-2.0`; built upstream assets retain their original license.
 Include upstream and Rust dependency notices before enabling distribution.

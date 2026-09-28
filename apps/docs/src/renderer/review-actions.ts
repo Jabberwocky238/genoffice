@@ -6,7 +6,8 @@
  */
 import type { Editor } from '@tiptap/core'
 import { TextSelection } from '@tiptap/pm/state'
-import { nextNoteId, parseDocx, type CommentInfo, type NoteInfo } from '@genoffice/docx-engine'
+import { wordBackend } from '@genoffice/word-parser-extension'
+import { nextNoteId, type CommentInfo, type NoteInfo } from '@genoffice/docx-engine'
 import type { Dispatch, SetStateAction } from 'react'
 import { fetchDocBytes } from './doc-bytes'
 import type { DocState } from './doc-state'
@@ -350,7 +351,7 @@ export async function compareWithFile(ctx: ReviewContext): Promise<void> {
     return
   }
   try {
-    const otherParsed = await parseDocx(await fetchDocBytes(other.dataUrl))
+    const otherParsed = await wordBackend.parse(await fetchDocBytes(other.dataUrl))
     const entries = compareParagraphs(
       ctx.editor
         ? editorBlockTexts(ctx.editor.getJSON(), ctx.doc.parsed.blocks)

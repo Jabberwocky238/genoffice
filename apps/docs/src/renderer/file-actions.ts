@@ -14,18 +14,15 @@ import {
   applySectionStartType,
   BLANK_BULLET_NUM_ID,
   BLANK_ORDERED_NUM_ID,
-  buildBlankDocx,
   paperSizeForLocale,
   findChartWorkbookPath,
   parseChartPartXml,
-  parseDocx,
   patchChartPartXml,
   patchChartWorkbookXlsxBase64,
   readDocxPartBase64,
   readPageColor,
   readSections,
   readSectionSettings,
-  saveDocx,
   type Block,
   type CommentInfo,
   type DocProtection,
@@ -57,6 +54,7 @@ import {
 import { hfSaveOptions } from './hf-sections'
 import { fetchDocBytes } from './doc-bytes'
 import { parseDocxOffThread } from './parse-off-thread'
+import { wordBackend } from '@genoffice/word-parser-extension'
 import { PHASED_APPEND } from './editor/streaming-tail-guard'
 import { docTextLength, docWeight, openTierFor } from './large-document'
 import { blocksHaveRevisions } from './editor/revision-view'
@@ -551,11 +549,11 @@ export async function newFile(ctx: FileActionContext): Promise<boolean | undefin
   if (!ctx.editor) return
   const generation = ++openGeneration
   try {
-    const bytes = await buildBlankDocx({
+    const bytes = await wordBackend.blank({
       eastAsiaFont: defaultEastAsiaFontFor(getLang()),
       paperSize: paperSizeForLocale(await systemLocale()),
     })
-    const parsed = await parseDocx(bytes)
+    const parsed = await wordBackend.parse(bytes)
     if (generation !== openGeneration) return
     setLazyMediaHashes([])
     const adopted = await adoptEmbeddedFonts(parsed.embeddedFonts)
@@ -754,7 +752,7 @@ export async function buildDocBytes(ctx: FileActionContext): Promise<Uint8Array 
     edits: ctx.sectionHfEdits,
     links: ctx.hfLinks,
   })
-  const bytes = await saveDocx(doc.parsed, saveBlocks, {
+  const bytes = await wordBackend.save(doc.parsed, saveBlocks, {
     section: ctx.sectionDirty && ctx.section ? ctx.section : undefined,
     sectionStartType: ctx.trailingStartType ?? undefined,
     pgNumType: ctx.pgNumEdit ?? undefined,
