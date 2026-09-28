@@ -7,21 +7,28 @@ import { parseDocx } from '../../../packages/docx-engine/src/parse'
 import { loadRswordNode, wordBackend } from '../node'
 
 type Kind = 'missing' | 'extra' | 'differs'
+type Example = { doc: string; path: string; ts: string; rs: string }
+const EXAMPLES = 3
+
+// one-line JSON excerpt of a value for the report
+const show = (v: unknown) => (v === undefined ? '∅' : JSON.stringify(v).slice(0, 240))
 
 class Report {
-  readonly rows = new Map<string, { kind: Kind; docs: Set<string>; sample?: string }>()
+  readonly rows = new Map<string, { kind: Kind; docs: Set<string>; examples: Example[] }>()
   readonly failures: Array<{ doc: string; side: string; error: string }> = []
   total = 0
   identical = 0
 
-  hit(kind: Kind, path: string, doc: string, sample?: string) {
+  hit(kind: Kind, path: string, doc: string, ts: unknown, rs: unknown) {
     const key = `${kind} ${path
       .replace(/\[\d+\]/g, '[*]')
       .replace(
         /^(styles|numbering|hfParts|chartParts|noteNumbers|headingStyleIds)\.[^.]+/,
         '$1.*',
       )}`
-    const row = this.rows.get(key) ?? { kind, docs: new Set(), sample }
+    const row = this.rows.get(key) ?? { kind, docs: new Set<string>(), examples: [] }
+    if (!row.docs.has(doc) && row.examples.length < EXAMPLES)
+      row.examples.push({ doc, path, ts: show(ts), rs: show(rs) })
     row.docs.add(doc)
     this.rows.set(key, row)
   }
@@ -29,12 +36,12 @@ class Report {
   // TS is the reference: "missing" = rsword lacks it, "extra" = only rsword has it
   compare(ts: unknown, rs: unknown, path: string, doc: string): boolean {
     if (ts === rs) return true
-    if (ts === undefined) return (this.hit('extra', path, doc), false)
-    if (rs === undefined) return (this.hit('missing', path, doc), false)
+    if (ts === undefined) return (this.hit('extra', path, doc, ts, rs), false)
+    if (rs === undefined) return (this.hit('missing', path, doc, ts, rs), false)
     if (typeof ts === 'number' && typeof rs === 'number' && Math.abs(ts - rs) < 1e-6) return true
     if (Array.isArray(ts) && Array.isArray(rs)) {
       if (ts.length !== rs.length)
-        this.hit('differs', `${path}.length`, doc, `${ts.length}≠${rs.length}`)
+        this.hit('differs', `${path}.length`, doc, ts.length, rs.length)
       let same = ts.length === rs.length
       for (let i = 0; i < Math.min(ts.length, rs.length); i++)
         same = this.compare(ts[i], rs[i], `${path}[${i}]`, doc) && same
@@ -53,7 +60,7 @@ class Report {
           ) && same
       return same
     }
-    this.hit('differs', path, doc, `${String(ts).slice(0, 60)} ≠ ${String(rs).slice(0, 60)}`)
+    this.hit('differs', path, doc, ts, rs)
     return false
   }
 
@@ -81,7 +88,7 @@ class Report {
     for (const f of this.failures.slice(0, 20)) console.log(`FAIL ${f.side} ${f.doc}: ${f.error}`)
     for (const [key, row] of rows.slice(0, limit))
       console.log(
-        `${String(row.docs.size).padStart(5)}  ${key}${row.sample ? `   e.g. ${row.sample}` : ''}`,
+        `${String(row.docs.size).padStart(5)}  ${key}   e.g. ${row.examples[0].ts.slice(0, 50)} ≠ ${row.examples[0].rs.slice(0, 50)}`,
       )
     if (rows.length > limit) console.log(`… ${rows.length - limit} more paths`)
   }
@@ -91,7 +98,7 @@ class Report {
       total: this.total,
       identical: this.identical,
       failures: this.failures,
-      rows: [...this.rows].map(([key, r]) => ({ key, docs: [...r.docs], sample: r.sample })),
+      rows: [...this.rows].map(([key, r]) => ({ key, docs: [...r.docs], examples: r.examples })),
     }
   }
 }

@@ -94,26 +94,30 @@ session, set the variable on the root `npm run dev`.
 
 ```sh
 npm run ee:rsWordParser:diff -- <dir|file.docx>... [--json report.json]
+npm run ee:rsWordParser:save-probe -- [--json report.json]
 npm run test:docs:rsword
 ```
 
-`ee:rsWordParser:diff` parses every document with both engines and lists each differing
-field path (indices and map keys collapsed) with the number of documents it affects:
+`ee:rsWordParser:save-probe` saves one generated paragraph per run / paragraph / block
+property with both engines and lists the properties whose written `<w:p>` differs or that
+rsword rejects. `ee:rsWordParser:diff` parses every document with both engines and lists each differing
+field path (indices and map keys collapsed) with the number of documents it affects and up to
+three examples (document, TS value, Rust value):
 `missing` fields exist only in TS, `extra` only in Rust. `test:docs:rsword` runs the whole
 Docs suite with `@genoffice/docx-engine` swapped for `tests/engine-shim.ts` (TS engine except
 `parseDocx` / `saveDocx` / `buildBlankDocx`), so open → edit → save-plan → save round trips
 run on Rust.
 
-Baseline at `a8d24eaa` (compat mirrors the TS engine of 2026-09-03):
+Gap tracking: [LilLeapo/rsWordParser#35](https://github.com/LilLeapo/rsWordParser/issues/35)
+(22 issues, label `genoffice-parity`), measured on the corpus re-exported from this
+genoffice in [LilLeapo/rsWordParser#12](https://github.com/LilLeapo/rsWordParser/pull/12):
 
-- 1,098 documents (upstream synthetic + real corpus, `fixtures`, Docs pagination corpus):
-  no parse failures on either side, 251 differing paths. Most are TS fields added after
-  that date (`noteNumbers`, `internal.bodyContentStart/End`, `styles.*.basedOn`,
-  `docDefaults`, `watermarkPicture`, chart axes/legend, text-box wrap, header/footer
-  borders and table rows); upstream `KNOWN_DIFFS.md` records the intentional ones
-  (source-byte `rawRPr`, raw metafile data URLs, `mc:Fallback` for undeclared prefixes).
-- Docs suite on Rust: 3,000 of 3,103 tests pass; 103 failures in 36 files, led by
-  numbering, Zotero fields, list continuation, SDT tables of contents and table edits.
+- parse: 1,482 documents (upstream synthetic + real, including the 36 genoffice ships),
+  no parse failures on either side; upstream `diff-parse` finds 15,112 unknown differences
+  in synthetic and 8,401 in real, almost all TS fields added after compat's baseline.
+- save: 273 recorded TS saves, 218 identical, 22 rejected, 9 genuinely different; the save
+  probe finds 14 silently dropped and 5 miswritten properties.
+- Docs suite on Rust: 3,000 of 3,103 tests pass; each failure is listed under an issue.
 
 ## Replacement plan
 

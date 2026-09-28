@@ -20,6 +20,7 @@
     "test:ee:rsWordParser": "vitest run --config ee/rsWordParser/vitest.config.ts",
     "typecheck:ee:rsWordParser": "tsc --noEmit -p ee/rsWordParser/tsconfig.json",
     "ee:rsWordParser:diff": "tsx ee/rsWordParser/tools/diff.mts",
+    "ee:rsWordParser:save-probe": "tsx ee/rsWordParser/tools/save-probe.mts",
     "test:docs:rsword": "cross-env GENOFFICE_WORD_PARSER=rsword npm run test -w @genoffice/docs",
     "dev:docs:rsword": "node ee/rsWordParser/tools/run-docs.mjs dev",
     "build:docs:rsword": "node ee/rsWordParser/tools/run-docs.mjs build",

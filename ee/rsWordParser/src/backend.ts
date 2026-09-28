@@ -48,7 +48,10 @@ export const wordBackend: WordBackend = {
   },
   async save(parsed: ParsedDocFull, blocks: SaveBlock[], options: SaveOptions = {}) {
     await loadRsword()
-    return save(parsed.internal.originalBytes, JSON.stringify(blocks), JSON.stringify(options))
+    const source = parsed.internal.originalBytes
+    const out = save(source, JSON.stringify(blocks), JSON.stringify(options))
+    // like saveDocx: an unchanged save hands back the source buffer itself, not a copy
+    return out.length === source.length && out.every((b, i) => b === source[i]) ? source : out
   },
   async blank(options?: BlankDocxOptions) {
     await loadRsword()
