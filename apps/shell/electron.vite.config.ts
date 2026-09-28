@@ -25,6 +25,7 @@ export default defineConfig({
   },
   renderer: {
     plugins: [react()],
+    resolve: { alias: { '@EE': resolve(__dirname, '../../ee') } },
     build: {
       rollupOptions: {
         input: {

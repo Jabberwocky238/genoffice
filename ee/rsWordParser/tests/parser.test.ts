@@ -3,10 +3,9 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import initialize, { SessionTable } from '../vendor/rsword-jsbinding/rsword_js.js'
 import { buildBlankDocx } from '../../../packages/docx-engine/src/blank'
 import { parseDocx } from '../../../packages/docx-engine/src/parse'
-import { openWordDocument, type WordDocument } from '../src/index'
 import { ParserClient, type Request, type Transport } from '../src/client'
-import { wordParserBuild } from '../vite'
-import { loadRsword, wordBackend } from '../src/backend'
+import { rsWordParserBuild } from '../vite'
+import { loadRsword, openWordDocument, wordBackend, type WordDocument } from '..'
 
 // Only transport is in-process: all parsing/editing/saving uses the downloaded WASM.
 function transport(): Transport {
@@ -165,13 +164,13 @@ it('cancels initialization without leaking a worker', async () => {
 
 it('keeps the default build independent and enables verified assets explicitly', () => {
   vi.stubEnv('GENOFFICE_WORD_PARSER', 'off')
-  expect(wordParserBuild().plugins).toEqual([])
+  expect(rsWordParserBuild().plugins).toEqual([])
   vi.stubEnv('GENOFFICE_WORD_PARSER', 'shadow')
-  const build = wordParserBuild()
+  const build = rsWordParserBuild()
   expect(build.alias['@genoffice/word-parser-extension']).toContain('shadow.ts')
   expect(build.plugins[0].transformIndexHtml("script-src 'self';")).toContain("'wasm-unsafe-eval'")
   vi.stubEnv('GENOFFICE_WORD_PARSER', 'rsword')
-  expect(wordParserBuild().alias['@genoffice/word-parser-extension']).toContain('extension.ts')
+  expect(rsWordParserBuild().alias['@genoffice/word-parser-extension']).toMatch(/rsWordParser\/index\.ts$/)
 })
 
 describe('rsword backend', () => {

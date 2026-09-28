@@ -4,10 +4,28 @@ Enterprise modules live here, behind the enterprise license boundary.
 
 - [WJKJ](wjkj/README.md): custom API configuration dialog and home sidebar entry,
   integrated with upstream AI settings.
-- [Word parser](word-parser/README.md): rsWordParser WASM as the Docs package
+- [rsWordParser](rsWordParser/README.md): rsWordParser WASM as the Docs package
   reader/writer (`GENOFFICE_WORD_PARSER=rsword`), parity tools and inspection panel;
   built assets are gitignored.
 - [Word layout plan](docx-layout/PLAN.md): staged integration with docx-layout.
+
+## Imports
+
+`@EE/*` resolves to `ee/*` in the Docs and shell renderers, their tests and type checks.
+Each module exports its public surface from its root `index.ts`; import `@EE/<module>`,
+never a file inside it.
+
+## Upstream engines
+
+The Rust engines are git submodules at the repository root, pinned by commit:
+
+- `rsWordParser/` ([LilLeapo/rsWordParser](https://github.com/LilLeapo/rsWordParser)):
+  package reader/writer behind [rsWordParser](rsWordParser/README.md).
+- `rsWordLayout/` ([Jabberwocky238/rsWordLayout](https://github.com/Jabberwocky238/rsWordLayout)):
+  Word layout engine, not yet integrated.
+
+Clone with `git clone --recurse-submodules`, or run `git submodule update --init` in an
+existing checkout. Root lint and formatting skip both trees.
 
 ## License boundary
 

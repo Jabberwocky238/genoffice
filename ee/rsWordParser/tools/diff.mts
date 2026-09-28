@@ -1,10 +1,10 @@
 // Differential parse: TS parseDocx vs rsWordParser compat projection over a corpus.
-// Usage: npx tsx ee/word-parser/tools/diff.mts <dir|file.docx>... [--json out.json]
+// Usage: npx tsx ee/rsWordParser/tools/diff.mts <dir|file.docx>... [--json out.json]
 // Paths aggregate with indices collapsed to [*]; each row counts the documents it hits.
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { parseDocx } from '../../../packages/docx-engine/src/parse'
-import { loadRsword, wordBackend } from '../src/backend'
+import { loadRsword, wordBackend } from '..'
 
 type Kind = 'missing' | 'extra' | 'differs'
 

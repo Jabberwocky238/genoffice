@@ -1,0 +1,6 @@
+[submodule "rsWordParser"]
+	path = rsWordParser
+	url = https://github.com/LilLeapo/rsWordParser.git
+[submodule "rsWordLayout"]
+	path = rsWordLayout
+	url = https://github.com/Jabberwocky238/rsWordLayout.git

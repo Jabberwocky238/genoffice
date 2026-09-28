@@ -4,6 +4,13 @@ Replaces the Docs package reader/writer with rsWordParser's WASM binding. With
 `GENOFFICE_WORD_PARSER=rsword`, every Docs open, patch-save and blank document goes
 through Rust; the editor, pagination and save planning are unchanged.
 
+## Import
+
+Consumers import from the module root, `@EE/rsWordParser` (`index.ts`): `wordBackend`,
+`loadRsword`, `WordParserDiagnostics`, `openWordDocument`, `WordDocument`, `ParserError`,
+`NativeDocument`. `src/` is internal. Vite configs load `vite.ts` (`rsWordParserBuild`)
+by relative path because aliases do not apply while a config file is being loaded.
+
 ## Backend
 
 Docs reaches the package engine only through `wordBackend` from
@@ -14,7 +21,7 @@ to the TS `parseDocx` / `saveDocx` / `buildBlankDocx`; the build alias swaps the
 | ----------------------- | ----------------------------------------- | ------------ | ----------------- |
 | `off` (default)         | `apps/docs/.../extensions/word-parser.ts` | TS           | none              |
 | `shadow`                | `src/shadow.ts`                           | TS           | Rust parser check |
-| `rsword`                | `src/extension.ts`                        | rsWordParser | Rust parser check |
+| `rsword`                | `index.ts`                                | rsWordParser | Rust parser check |
 
 `src/backend.ts` drives upstream's `compat-ts` surface (`compat/1`): `parse(bytes)` is the
 `ParsedDoc` JSON (Maps and the caller-held source bytes are revived here), `save(bytes,
@@ -56,26 +63,27 @@ document's Worker. Source byte buffers are cloned, so the host retains ownership
 
 ## Build, pin and run
 
-Release artifacts are built without `compat-ts`, so the pin is a local build:
+The engine source is the `rsWordParser/` git submodule at the repository root; its
+pointer is the pin. Release artifacts are built without `compat-ts`, so the WASM is
+built from the submodule:
 
 ```sh
-# in an rsWordParser checkout at the commit to pin (clean tree)
-RSWORD_COMMIT=$(git rev-parse --short=12 HEAD) \
-  cargo build -p rsword-js --target wasm32-unknown-unknown --profile wasm-release --locked --features compat-ts
-wasm-bindgen --target web --out-dir crates/rsword-js/pkg target/wasm32-unknown-unknown/wasm-release/rsword_js.wasm
-# (tools/build-js.sh --locked --features compat-ts does both)
-
-npm run ee:word-parser:build -- <rsWordParser checkout>
-npm run test:ee:word-parser
-npm run typecheck:ee:word-parser
+git submodule update --init rsWordParser
+cd rsWordParser && tools/build-js.sh --locked --features compat-ts && cd ..
+npm run ee:rsWordParser:build
+npm run test:ee:rsWordParser
+npm run typecheck:ee:rsWordParser
 npm run dev:docs:rsword
 ```
 
-`ee:word-parser:build` loads the built WASM, requires its embedded commit to equal the
-checkout's `HEAD` and its protocol to be `compat/1`, copies it into the gitignored
-`vendor/`, and rewrites `engine.lock.json` (commit, `source: local`, features, hashes).
-Enabled builds verify every hash; `ee:word-parser:check` does so offline. `download`
-applies only to a lock that pins an Actions run and refuses a local pin.
+`ee:rsWordParser:build [checkout]` (default: the submodule) loads the built WASM,
+requires a clean tree, its embedded commit to equal the checkout's `HEAD` and its protocol
+to be `compat/1`, copies it into the gitignored `vendor/`, and rewrites `engine.lock.json`
+(commit, `source`, features, hashes). `ee:rsWordParser:check` verifies every hash offline
+and that the submodule pointer equals the pinned commit; enabled builds verify the hashes.
+To move the engine, check out the new commit in the submodule, rebuild, pin, and commit
+the pointer together with the lock. `download` applies only to a lock that pins an
+Actions run.
 wasm-bindgen must match the `wasm-bindgen` version in the upstream `Cargo.lock` (0.2.128).
 
 `dev:docs:rsword` / `build:docs:rsword` default to `rsword`; set
@@ -85,14 +93,14 @@ session, set the variable on the root `npm run dev`.
 ## Measuring parity
 
 ```sh
-npm run ee:word-parser:diff -- <dir|file.docx>... [--json report.json]
+npm run ee:rsWordParser:diff -- <dir|file.docx>... [--json report.json]
 npm run test:docs:rsword
 ```
 
-`ee:word-parser:diff` parses every document with both engines and lists each differing
+`ee:rsWordParser:diff` parses every document with both engines and lists each differing
 field path (indices and map keys collapsed) with the number of documents it affects:
 `missing` fields exist only in TS, `extra` only in Rust. `test:docs:rsword` runs the whole
-Docs suite with `@genoffice/docx-engine` swapped for `src/engine-shim.ts` (TS engine except
+Docs suite with `@genoffice/docx-engine` swapped for `tests/engine-shim.ts` (TS engine except
 `parseDocx` / `saveDocx` / `buildBlankDocx`), so open → edit → save-plan → save round trips
 run on Rust.
 

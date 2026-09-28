@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { WordParserDiagnosticsProps } from '../../../apps/docs/src/renderer/extensions/word-parser'
-import { openWordDocument, type WordDocument } from './index'
+import { openWordDocument, type WordDocument } from './session'
 import './styles.css'
 
 type Report = {

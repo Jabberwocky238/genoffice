@@ -1,14 +1,15 @@
 import { resolve } from 'node:path'
 import react from '@vitejs/plugin-react'
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
-import { wordParserBuild } from '../../ee/word-parser/vite'
+import { rsWordParserBuild } from '../../ee/rsWordParser/vite'
 
-const wordParser = wordParserBuild()
+const wordParser = rsWordParserBuild()
 
 // Resolve workspace packages from this checkout's sources: in a git worktree
 // node_modules is a symlink into the main checkout, so bare specifiers would
 // silently bundle the other checkout's (possibly stale) code.
 const localAlias = {
+  '@EE': resolve(__dirname, '../../ee'),
   '@genoffice/docx-engine/lazy-media': resolve(
     __dirname,
     '../../packages/docx-engine/src/lazy-media.ts',

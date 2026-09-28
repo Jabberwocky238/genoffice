@@ -16,7 +16,11 @@ scripts/drivers/driver.*.mjs
 
 # Vendored third-party sources stay byte-identical to upstream.
 packages/*/src/vendor/
-ee/word-parser/vendor/
+ee/rsWordParser/vendor/
+
+# Upstream Rust engines (git submodules) follow their own repositories' style.
+rsWordParser/
+rsWordLayout/
 
 # LLM prompt text: prettier rewrites *_* markers and list indentation, changing what the model reads.
 apps/slides/src/renderer/ai/prompts/*.md

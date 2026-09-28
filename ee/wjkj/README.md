@@ -17,8 +17,8 @@ It does not patch Docs, Sheets, Slides or the shared AI provider package.
 Model suggestions, CLI providers and settings migrations follow upstream.
 The existing upstream settings dialog and its connection tests remain available.
 
-The only application integration is the component import and sidebar mount in
-`apps/shell/src/renderer/src/Home.tsx`. The `wjkj` branch enables it directly.
+The only application integration is the `@EE/wjkj` import (`index.ts`) and sidebar
+mount in `apps/shell/src/renderer/src/Home.tsx`. The `wjkj` branch enables it directly.
 When syncing upstream, keep this small integration and the `ee/wjkj` directory;
 do not restore the old editor overrides that forced a provider selection.
 

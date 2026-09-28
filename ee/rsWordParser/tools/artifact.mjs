@@ -16,6 +16,8 @@ import { fileURLToPath } from 'node:url'
 const root = fileURLToPath(new URL('..', import.meta.url))
 const lock = JSON.parse(readFileSync(join(root, 'engine.lock.json'), 'utf8'))
 const destination = join(root, 'vendor', lock.artifact)
+const submodule = join(root, '../../rsWordParser')
+const git = (dir, ...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8' }).trim()
 const verify = (dir, files = lock.files) => {
   for (const [name, expected] of Object.entries(files)) {
     const actual = createHash('sha256')
@@ -56,16 +58,13 @@ if (process.argv[2] === 'download') {
     rmSync(staging, { recursive: true, force: true })
   }
 } else if (process.argv[2] === 'build') {
-  // Pin a local build from an rsWordParser checkout: `tools/build-js.sh --locked --features
-  // compat-ts` there first (release steps plus the TS-compatible parse/save surface Docs runs on).
-  const checkout = process.argv[3]
-  if (!checkout)
-    throw new Error('Usage: node ee/word-parser/tools/artifact.mjs build <rsWordParser>')
-  const git = (...args) =>
-    execFileSync('git', ['-C', checkout, ...args], { encoding: 'utf8' }).trim()
-  if (git('status', '--porcelain', '--untracked-files=no'))
+  // Pin a local build of the rsWordParser submodule (or another checkout): run
+  // `tools/build-js.sh --locked --features compat-ts` there first (release steps plus the
+  // TS-compatible parse/save surface Docs runs on).
+  const checkout = process.argv[3] ?? submodule
+  if (git(checkout, 'status', '--porcelain', '--untracked-files=no'))
     throw new Error('rsWordParser checkout has uncommitted changes')
-  const head = git('rev-parse', 'HEAD')
+  const head = git(checkout, 'rev-parse', 'HEAD')
   const { default: init, version } = await import(
     join(checkout, 'crates/rsword-js/pkg/rsword_js.js')
   )
@@ -94,7 +93,7 @@ if (process.argv[2] === 'download') {
   const pinned = {
     ...lock,
     commit: head,
-    source: 'local',
+    source: checkout === submodule ? 'submodule' : 'local',
     runId: null,
     artifactId: null,
     artifactDigest: null,
@@ -105,8 +104,12 @@ if (process.argv[2] === 'download') {
   lock.files = files
 } else if (process.argv[2] !== 'check') {
   throw new Error(
-    'Usage: node ee/word-parser/tools/artifact.mjs download|check|build <rsWordParser>',
+    'Usage: node ee/rsWordParser/tools/artifact.mjs download|check|build [rsWordParser]',
   )
 }
+// the submodule pointer and the pinned build must name the same commit
+const pointer = git(submodule, 'rev-parse', 'HEAD')
+if (lock.source === 'submodule' && pointer !== lock.commit)
+  throw new Error(`rsWordParser submodule is ${pointer}; engine.lock.json pins ${lock.commit}`)
 verify(destination)
 console.log(`rsWordParser ${lock.commit.slice(0, 12)}: all artifact hashes verified`)
