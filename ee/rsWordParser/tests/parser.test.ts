@@ -1,11 +1,11 @@
-import { readFileSync } from 'node:fs'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
-import initialize, { SessionTable } from '../vendor/rsword-jsbinding/rsword_js.js'
+import { SessionTable } from '@lilleapo/rs-word-parser'
 import { buildBlankDocx } from '../../../packages/docx-engine/src/blank'
 import { parseDocx } from '../../../packages/docx-engine/src/parse'
 import { ParserClient, type Request, type Transport } from '../src/client'
 import { rsWordParserBuild } from '../vite'
-import { loadRsword, openWordDocument, wordBackend, type WordDocument } from '..'
+import { openWordDocument, wordBackend, type WordDocument } from '..'
+import { loadRswordNode } from '../node'
 
 // Only transport is in-process: all parsing/editing/saving uses the downloaded WASM.
 function transport(): Transport {
@@ -47,17 +47,8 @@ function transport(): Transport {
 let bytes: Uint8Array
 const documents: WordDocument[] = []
 beforeAll(async () => {
-  await initialize({
-    module_or_path: new Uint8Array(
-      readFileSync(new URL('../vendor/rsword-jsbinding/rsword_js_bg.wasm', import.meta.url)),
-    ),
-  })
+  await loadRswordNode()
   bytes = await buildBlankDocx()
-  await loadRsword(() => ({
-    module_or_path: readFileSync(
-      new URL('../vendor/rsword-jsbinding/rsword_js_bg.wasm', import.meta.url),
-    ),
-  }))
 })
 afterEach(() => {
   documents.splice(0).forEach((doc) => doc.close())
@@ -73,7 +64,7 @@ async function open() {
 describe('downloaded native/0 binding', () => {
   it('opens, queries, saves identical bytes and closes idempotently', async () => {
     const doc = await open()
-    expect(doc.version.git).toBe('a8d24eaa4c65')
+    expect(doc.version.git).toMatch(/^[0-9a-f]{12,40}$/)
     expect(doc.version.protocol).toBe('native/0')
     expect((await doc.document()).truncated).toBe(false)
     expect(await doc.save()).toEqual(bytes)

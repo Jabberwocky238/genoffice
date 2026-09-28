@@ -4,7 +4,7 @@
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { parseDocx } from '../../../packages/docx-engine/src/parse'
-import { loadRsword, wordBackend } from '..'
+import { loadRswordNode, wordBackend } from '../node'
 
 type Kind = 'missing' | 'extra' | 'differs'
 
@@ -118,8 +118,7 @@ function docxFiles(path: string): string[] {
 const args = process.argv.slice(2)
 const jsonAt = args.indexOf('--json')
 const jsonOut = jsonAt >= 0 ? args.splice(jsonAt, 2)[1] : undefined
-const wasm = new URL('../vendor/rsword-jsbinding/rsword_js_bg.wasm', import.meta.url)
-await loadRsword(() => ({ module_or_path: readFileSync(wasm) }))
+await loadRswordNode()
 const report = new Report()
 for (const file of args.flatMap(docxFiles)) await report.run(file)
 report.print()

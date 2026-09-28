@@ -1,4 +1,5 @@
-import lock from '../engine.lock.json'
+/** Native protocol this wrapper is written against. */
+export const NATIVE_PROTOCOL = 'native/0'
 import { ParserClient, ParserError, type Transport } from './client'
 
 export { ParserError } from './client'
@@ -116,15 +117,14 @@ export async function openWordDocument(
   try {
     const version = object(await client.call('version'))
     if (
-      version.protocol !== lock.protocol ||
+      version.protocol !== NATIVE_PROTOCOL ||
       typeof version.version !== 'string' ||
       typeof version.git !== 'string' ||
-      !/^[a-f0-9]{12,40}$/.test(version.git) ||
-      !lock.commit.startsWith(version.git)
+      !/^[a-f0-9]{12,40}$/.test(version.git)
     ) {
-      throw new ParserError('RSWORD_VERSION_MISMATCH', 'Parser does not match engine.lock.json')
+      throw new ParserError('RSWORD_VERSION_MISMATCH', `Parser does not speak ${NATIVE_PROTOCOL}`)
     }
-    const id = await client.call('open', bytes, JSON.stringify({ expectProtocol: lock.protocol }))
+    const id = await client.call('open', bytes, JSON.stringify({ expectProtocol: NATIVE_PROTOCOL }))
     return new WordDocument(client, id, version as WordDocument['version'])
   } catch (error) {
     client.close()

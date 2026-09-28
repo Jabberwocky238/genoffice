@@ -42,6 +42,7 @@ export default defineConfig({
   },
   renderer: {
     plugins: [react(), ...wordParser.plugins],
+    optimizeDeps: wordParser.optimizeDeps,
     resolve: { alias: { ...localAlias, ...wordParser.alias } },
     server: {
       // Overridable so multiple genoffice dev instances can coexist (default 5173).

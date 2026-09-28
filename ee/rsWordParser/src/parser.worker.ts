@@ -1,12 +1,10 @@
-import initialize, { SessionTable } from '../vendor/rsword-jsbinding/rsword_js.js'
+import initialize, { SessionTable } from '@lilleapo/rs-word-parser'
 import type { Request, Response } from './client'
 
 let table: SessionTable | undefined
 async function getTable(): Promise<SessionTable> {
   if (!table) {
-    await initialize({
-      module_or_path: new URL('../vendor/rsword-jsbinding/rsword_js_bg.wasm', import.meta.url),
-    })
+    await initialize()
     table = new SessionTable()
   }
   return table

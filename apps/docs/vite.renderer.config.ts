@@ -9,6 +9,7 @@ const wordParser = rsWordParserBuild()
 export default defineConfig({
   root: 'src/renderer',
   plugins: [react(), ...wordParser.plugins],
+  optimizeDeps: wordParser.optimizeDeps,
   resolve: {
     alias: { '@EE': fileURLToPath(new URL('../../ee', import.meta.url)), ...wordParser.alias },
   },

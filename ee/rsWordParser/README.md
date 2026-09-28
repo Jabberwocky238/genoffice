@@ -8,8 +8,10 @@ through Rust; the editor, pagination and save planning are unchanged.
 
 Consumers import from the module root, `@EE/rsWordParser` (`index.ts`): `wordBackend`,
 `loadRsword`, `WordParserDiagnostics`, `openWordDocument`, `WordDocument`, `ParserError`,
-`NativeDocument`. `src/` is internal. Vite configs load `vite.ts` (`rsWordParserBuild`)
-by relative path because aliases do not apply while a config file is being loaded.
+`NativeDocument`. `src/` is internal. Node-side code (tests, tools) loads the WASM with
+`loadRswordNode()` from `@EE/rsWordParser/node`. Vite configs load `vite.ts`
+(`rsWordParserBuild`) by relative path because aliases do not apply while a config file
+is being loaded.
 
 ## Backend
 
@@ -27,8 +29,9 @@ to the TS `parseDocx` / `saveDocx` / `buildBlankDocx`; the build alias swaps the
 `ParsedDoc` JSON (Maps and the caller-held source bytes are revived here), `save(bytes,
 blocks, options)` takes the same `SaveBlock[]` / `SaveOptions` as `saveDocx`, and
 `blank(options)` mirrors `buildBlankDocx`. The WASM loads once per realm, so the parse
-Worker and the UI thread each hold an instance. A version other than the pinned commit
-and protocol refuses to load.
+Worker and the UI thread each hold an instance; in the browser the glue fetches
+`rsword_js_bg.wasm` next to itself, so Vite must not pre-bundle the package
+(`rsWordParserBuild().optimizeDeps`). A WASM that does not speak `compat/1` refuses to load.
 
 Upstream classifies `compat-ts` as a test-only differential adapter, so it tracks the TS
 engine's shape rather than promising it. The two tools below measure that gap.
@@ -61,30 +64,27 @@ try {
 to one session and part. Errors preserve the native `code`; a timeout closes the
 document's Worker. Source byte buffers are cloned, so the host retains ownership.
 
-## Build, pin and run
+## Install and run
 
-The engine source is the `rsWordParser/` git submodule at the repository root; its
-pointer is the pin. Release artifacts are built without `compat-ts`, so the WASM is
-built from the submodule:
+The WASM comes from the package `@lilleapo/rs-word-parser`, which upstream publishes to
+GitHub Packages from `crates/rsword-js` (the `rsWordParser/` submodule is its source; the
+package version follows that crate's `Cargo.toml`). It is an `optionalDependencies` entry
+pinned by `package-lock.json`, so the version is the pin.
+
+GitHub Packages needs a token with `read:packages` even for public packages. The root
+`.npmrc` maps the `@lilleapo` / `@jabberwocky238` scopes there and reads `GITHUB_TOKEN`:
 
 ```sh
-git submodule update --init rsWordParser
-cd rsWordParser && tools/build-js.sh --locked --features compat-ts && cd ..
-npm run ee:rsWordParser:build
+export GITHUB_TOKEN=$(gh auth token)   # after: gh auth refresh -s read:packages
+npm install
 npm run test:ee:rsWordParser
 npm run typecheck:ee:rsWordParser
 npm run dev:docs:rsword
 ```
 
-`ee:rsWordParser:build [checkout]` (default: the submodule) loads the built WASM,
-requires a clean tree, its embedded commit to equal the checkout's `HEAD` and its protocol
-to be `compat/1`, copies it into the gitignored `vendor/`, and rewrites `engine.lock.json`
-(commit, `source`, features, hashes). `ee:rsWordParser:check` verifies every hash offline
-and that the submodule pointer equals the pinned commit; enabled builds verify the hashes.
-To move the engine, check out the new commit in the submodule, rebuild, pin, and commit
-the pointer together with the lock. `download` applies only to a lock that pins an
-Actions run.
-wasm-bindgen must match the `wasm-bindgen` version in the upstream `Cargo.lock` (0.2.128).
+Without a token npm skips the optional package and everything but the enabled modes
+works; `GENOFFICE_WORD_PARSER=shadow|rsword` then fails early naming the missing package.
+To move the engine, publish a new crate version upstream and bump the dependency.
 
 `dev:docs:rsword` / `build:docs:rsword` default to `rsword`; set
 `GENOFFICE_WORD_PARSER=shadow` to keep the TS engine with the panel. For a shell
@@ -117,13 +117,12 @@ Baseline at `a8d24eaa` (compat mirrors the TS engine of 2026-09-03):
 
 ## Replacement plan
 
-1. **Done:** backend seam in Docs, compat backend, local pinning, parse diff, Docs suite
-   on Rust.
+1. **Done:** backend seam in Docs, compat backend, GitHub Packages package, parse diff,
+   Docs suite on Rust.
 2. **Parity (upstream `compat_ts`):** close the diff paths and the Docs-suite failures,
    largest first; register only deliberate differences in upstream `KNOWN_DIFFS.md`.
 3. **Default:** when the Docs suite is green on Rust, build enterprise releases with
-   `rsword`, and publish a `compat-ts` JS binding from upstream's release job so the lock
-   can pin an Actions artifact again.
+   `rsword` (CI then needs a `read:packages` token for `npm ci`).
 4. **Native editing:** move save from `SaveBlock[]` to `native/0` operations with the
    Rust session as package authority. Layout should consume native model output
    directly, not the legacy projection; see [layout integration plan](../docx-layout/PLAN.md).

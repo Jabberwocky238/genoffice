@@ -1,4 +1,4 @@
-import type { SessionTable } from '../vendor/rsword-jsbinding/rsword_js'
+import type { SessionTable } from '@lilleapo/rs-word-parser'
 
 // Reuse the artifact's declarations instead of maintaining a second binding API.
 type Method = Exclude<keyof SessionTable, 'free' | symbol>

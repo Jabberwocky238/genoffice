@@ -18,7 +18,6 @@ export default tseslint.config(
       'scripts/drivers/**',
       'apps/*/build/**',
       'packages/*/src/vendor/**',
-      'ee/rsWordParser/vendor/**',
       // upstream Rust engines (git submodules), linted in their own repositories
       'rsWordParser/**',
       'rsWordLayout/**',

@@ -5,23 +5,22 @@ import type {
   SaveOptions,
 } from '@genoffice/docx-engine'
 import type { WordBackend } from '../../../apps/docs/src/renderer/extensions/word-parser'
-import initialize, { blank, parse, save, version } from '../vendor/rsword-jsbinding/rsword_js.js'
-import lock from '../engine.lock.json'
+import initialize, { blank, parse, save, version } from '@lilleapo/rs-word-parser'
 
 type WasmSource = Parameters<typeof initialize>[0]
 
 let loading: Promise<void> | undefined
 
-/** Load the compat WASM once per realm (UI thread and parse worker each own one). */
-export function loadRsword(
-  source: () => WasmSource = () => ({
-    module_or_path: new URL('../vendor/rsword-jsbinding/rsword_js_bg.wasm', import.meta.url),
-  }),
-): Promise<void> {
+/** Surface this backend is written against; the package version itself is pinned by npm. */
+export const COMPAT_PROTOCOL = 'compat/1'
+
+/** Load the compat WASM once per realm (UI thread and parse worker each own one). Without a
+ *  source the glue fetches rsword_js_bg.wasm next to itself (import.meta.url). */
+export function loadRsword(source: () => WasmSource = () => undefined): Promise<void> {
   loading ??= initialize(source()).then(() => {
     const v = JSON.parse(version()) as { git: string; protocol: string }
-    if (v.protocol !== lock.compatProtocol || !lock.commit.startsWith(v.git))
-      throw new Error(`rsWordParser ${v.git}/${v.protocol} does not match engine.lock.json`)
+    if (v.protocol !== COMPAT_PROTOCOL)
+      throw new Error(`rsWordParser ${v.git} speaks ${v.protocol}, expected ${COMPAT_PROTOCOL}`)
   })
   return loading
 }

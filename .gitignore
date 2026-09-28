@@ -38,8 +38,6 @@ __pycache__/
 # Never committable — a stray `git add -A` would push user files public.
 /working_dir/
 
-# Downloaded rsWordParser WASM artifacts (provenance is tracked separately).
-/ee/rsWordParser/vendor/
 
 # One-off verification tests kept while chasing a fix; promote to a real test
 # file (or delete) instead of committing them under this name.
