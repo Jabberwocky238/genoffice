@@ -32,6 +32,9 @@ export interface GenerateImageInput {
   aspectRatio?: string | undefined
   /** images to edit / draw from */
   references?: MediaBlob[] | undefined
+  /** ask for real PNG alpha where the API has a control for it (gpt-image background=transparent);
+   * vendors without one ignore the flag */
+  transparent?: boolean | undefined
 }
 
 export interface AnalyzeMediaInput {
@@ -130,7 +133,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 }
 
 async function failFrom(label: string, resp: Response): Promise<never> {
-  const body = await resp.text().catch(() => '')
+  const body = await readCappedErrorText(resp)
   throw new Error(`${label} ${resp.status}: ${httpBodyDetail(body)}`)
 }
 
@@ -143,11 +146,80 @@ function withTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal {
   return signal ? AbortSignal.any([signal, timeout]) : timeout
 }
 
+const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
+
+/** An error body is only ever read for a short diagnostic (httpBodyDetail keeps 500
+ * characters), so it is capped hard: a vendor answering an error with a multi-megabyte
+ * HTML page must not be buffered whole just to be truncated afterwards. */
+const MAX_ERROR_BODY_BYTES = 64 * 1024
+
+/**
+ * Reads at most the first MAX_ERROR_BODY_BYTES of a failed response. A partial body still
+ * yields whatever arrived, and reading never throws: the caller is already on its way to
+ * reporting the status, and a body that cannot be read is not worth a second error.
+ */
+async function readCappedErrorText(resp: Response): Promise<string> {
+  if (!resp.body) return ''
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder()
+  let text = ''
+  let bytes = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      const room = MAX_ERROR_BODY_BYTES - bytes
+      if (value.byteLength >= room) {
+        text += decoder.decode(value.subarray(0, room), { stream: true })
+        break
+      }
+      bytes += value.byteLength
+      text += decoder.decode(value, { stream: true })
+    }
+    text += decoder.decode()
+  } catch {
+    /* truncated or aborted: report what arrived */
+  } finally {
+    await reader.cancel().catch(() => undefined)
+  }
+  return text
+}
+
+/** the body counted as it streams and dropped past the cap; a missing Content-Length is unknown, not zero */
+async function readCapped(resp: Response, label: string): Promise<Uint8Array> {
+  const declared = Number(resp.headers.get('content-length') ?? NaN)
+  if (declared > MAX_DOWNLOAD_BYTES) {
+    await resp.body?.cancel().catch(() => {})
+    throw new Error(`${label} download too large`)
+  }
+  if (!resp.body) return new Uint8Array(await resp.arrayBuffer())
+  const reader = resp.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    total += value.byteLength
+    if (total > MAX_DOWNLOAD_BYTES) {
+      await reader.cancel().catch(() => {})
+      throw new Error(`${label} download too large`)
+    }
+    chunks.push(value)
+  }
+  const out = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    out.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return out
+}
+
 /** vendors that return a URL instead of bytes: download it (the links are short-lived, so right away) */
 async function downloadImage(label: string, url: string, signal: AbortSignal): Promise<MediaBlob> {
   const img = await aiFetch(url, { signal })
   if (!img.ok) return failFrom(`${label} download`, img)
-  const bytes = new Uint8Array(await img.arrayBuffer())
+  const bytes = await readCapped(img, label)
   return { bytes, mime: sniffImageMime(bytes, img.headers.get('content-type') ?? 'image/png') }
 }
 
@@ -233,6 +305,8 @@ async function generateImageOpenAi(
   const style = openAiImagesStyle(provider)
   const size = style.size(input.aspectRatio)
   const refs = input.references ?? []
+  // `background` exists only on the gpt-image family; dall-e-3 and lookalike vendors 400 on it
+  const transparent = input.transparent && /gpt-image/i.test(model)
   if (refs.length && style.edits === 'none') {
     throw new Error(
       `${metaOf(provider).label} cannot edit or reference images here; generate from the prompt alone or pick another image provider.`,
@@ -247,6 +321,7 @@ async function generateImageOpenAi(
         prompt: input.prompt,
         n: 1,
         ...(size ? { size } : {}),
+        ...(transparent ? { background: 'transparent' } : {}),
         ...style.bodyExtras,
         ...(refs.length ? { image: refs.map(dataUrl) } : {}),
       }),
@@ -259,6 +334,7 @@ async function generateImageOpenAi(
   form.set('model', model)
   form.set('prompt', input.prompt)
   if (size) form.set('size', size)
+  if (transparent) form.set('background', 'transparent')
   refs.forEach((ref, i) => {
     const ext = ref.mime.split('/')[1]?.replace('jpeg', 'jpg') ?? 'png'
     form.append(
@@ -377,7 +453,8 @@ async function generateImageMinimax(
 
 // ── OpenAI-compatible chat understanding ───────────────────────────
 
-function openAiContentText(content: unknown): string {
+/** Flatten an OpenAI `content` field to text: gateways may answer with a string or an array of parts. */
+export function openAiContentText(content: unknown): string {
   if (typeof content === 'string') return content
   if (Array.isArray(content)) {
     return content
@@ -677,9 +754,12 @@ export async function analyzeMediaWithProvider(
 }
 
 /**
- * Cheap credential check — the settings-UI connection test; no image is
- * billed. A model listing is the closest thing every vendor has; vendors
- * without one answer 404/405 to a valid key, so only 401/403 count as failure.
+ * Cheap credential check for the settings-UI connection test; no image is
+ * billed. A model listing is the closest thing every vendor has. Vendors
+ * without a model-listing endpoint answer 404/405 even for a valid key, so
+ * only those two statuses count as a pass when the response is not ok.
+ * Every other non-ok status (auth failures, rate limits, server errors)
+ * is surfaced as a failure with the status code included.
  */
 export async function testMediaProvider(
   provider: ByokMediaProviderId,
@@ -701,11 +781,24 @@ export async function testMediaProvider(
             signal: guard,
           })
     if (resp.ok) return { ok: true }
-    const body = await resp.text().catch(() => '')
-    if (resp.status === 401 || resp.status === 403 || provider === 'gemini') {
-      return { ok: false, error: `HTTP ${resp.status}: ${httpBodyDetail(body)}` }
+    // Vendors without a model-listing endpoint answer 404/405 to a valid
+    // key, so those statuses still mean the credentials are usable.
+    if (resp.status === 404 || resp.status === 405) return { ok: true }
+    const body = await readCappedErrorText(resp)
+    const detail = httpBodyDetail(body)
+    if (resp.status === 429) {
+      return {
+        ok: false,
+        error: `HTTP 429: rate limit exceeded, retry later${detail ? ` (${detail})` : ''}`,
+      }
     }
-    return { ok: true }
+    if (resp.status >= 500) {
+      return {
+        ok: false,
+        error: `HTTP ${resp.status}: server error, retry later${detail ? ` (${detail})` : ''}`,
+      }
+    }
+    return { ok: false, error: `HTTP ${resp.status}: ${detail}` }
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) }
   }

@@ -8,7 +8,6 @@ import { app, ipcMain, nativeImage, net, shell } from 'electron'
 import {
   appendFileSync,
   existsSync,
-  mkdirSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -35,7 +34,12 @@ import {
   type LegacyAiSettings,
 } from '@genoffice/ai-provider'
 import { shutdownCodexAppServers } from '@genoffice/ai-provider/codex-app-server'
-import { fetchRemoteImage } from '@genoffice/electron-utils'
+import {
+  MAX_REMOTE_IMAGE_BYTES,
+  fetchRemoteImage,
+  readBodyCapped,
+  writeJsonAtomic,
+} from '@genoffice/electron-utils'
 import {
   webSearchTool,
   imageSearchTool,
@@ -48,7 +52,7 @@ import {
 } from '@genoffice/ai-search'
 import { addPicture, editPictureSrcRect, replacePictureBytes } from '@genoffice/pptx-engine'
 import { matchesElementRef } from '@genoffice/pptx-engine/identity'
-import { coverCropFractions } from '../shared/cover-crop'
+import { coverCropFractions } from '@genoffice/pipelines/slides'
 import type { AiRunFailure } from '../shared/ipc'
 import { EMU_PER_PX_96 } from '@genoffice/pptx-render'
 import { tm } from './i18n-main'
@@ -65,11 +69,6 @@ function readJson<T>(path: string, fallback: T): T {
     /* Corrupted state file: fall back to defaults */
   }
   return fallback
-}
-
-function writeJson(path: string, value: unknown): void {
-  mkdirSync(join(path, '..'), { recursive: true })
-  writeFileSync(path, JSON.stringify(value, null, 2))
 }
 
 const activeAiStreams = new Map<string, AbortController>()
@@ -131,7 +130,7 @@ export function registerAiIpc(): void {
   })
 
   ipcMain.handle('ai:set-settings', (_event, settings: AiSettings) => {
-    writeJson(AI_SETTINGS_PATH(), settings)
+    writeJsonAtomic(AI_SETTINGS_PATH(), settings)
   })
 
   ipcMain.handle('ai:log-run-failure', (_event, entry: AiRunFailure) => {
@@ -264,6 +263,7 @@ export function registerSlidesOnlyAiIpc(): void {
         referenceImageUrls?: string[]
         aspectRatio?: string
         imageSize?: string
+        transparentBackground?: boolean
       },
     ) => {
       return generateImageTool(
@@ -276,6 +276,7 @@ export function registerSlidesOnlyAiIpc(): void {
             : undefined,
           aspectRatio: op.aspectRatio ? String(op.aspectRatio) : undefined,
           imageSize: op.imageSize ? String(op.imageSize) : undefined,
+          transparentBackground: op.transparentBackground === true,
         },
         { notLoggedInError: tm('errGskCli') },
       )
@@ -296,6 +297,23 @@ export function registerSlidesOnlyAiIpc(): void {
     },
   )
 
+  /** Bytes of a user attachment the renderer resolved (attachment://): keep
+   *  pptx-native formats as-is, convert anything else (webp/bmp/…) to PNG. */
+  const attachmentImageBytes = (
+    base64: string,
+    ext: string,
+  ): { buf: Buffer; ext: string } | null => {
+    const buf = Buffer.from(String(base64), 'base64')
+    if (!buf.length) return null
+    const norm = String(ext)
+      .toLowerCase()
+      .replace(/^jpeg$/, 'jpg')
+    if (norm === 'png' || norm === 'gif' || norm === 'jpg') return { buf, ext: norm }
+    const img = nativeImage.createFromBuffer(buf)
+    if (img.isEmpty()) return null
+    return { buf: img.toPNG(), ext: 'png' }
+  }
+
   // Download an image from a URL and insert it into the given page (image search -> insert in one step; download in the main process avoids CORS)
   ipcMain.handle(
     'ai:insert-image-url',
@@ -303,7 +321,10 @@ export function registerSlidesOnlyAiIpc(): void {
       e,
       op: {
         slideIndex: number
-        url: string
+        url?: string
+        /** raw base64 of a user attachment (attachment:// reference) — no network fetch */
+        base64?: string
+        ext?: string
         xPx: number
         yPx: number
         wPx: number
@@ -316,15 +337,23 @@ export function registerSlidesOnlyAiIpc(): void {
       const slide = session.opened.deck.slides[op.slideIndex]
       if (!slide) return null
       try {
-        // the URL originates from AI tool calls (prompt-injectable via image
-        // search results), so refuse non-http schemes and private/link-local
-        // targets; redirects are followed manually so every hop is validated.
-        // fetchRemoteImage adds CDN-friendly headers and transient-error retries.
-        const resp = await fetchRemoteImage(String(op.url))
-        if (!resp || !resp.ok) return null
-        const buf = Buffer.from(await resp.arrayBuffer())
-        const ct = resp.headers.get('content-type') ?? ''
-        const ext = ct.includes('png') ? 'png' : ct.includes('gif') ? 'gif' : 'jpg'
+        let buf: Buffer
+        let ext: string
+        if (op.base64 != null) {
+          const decoded = attachmentImageBytes(op.base64, op.ext ?? '')
+          if (!decoded) return null
+          ;({ buf, ext } = decoded)
+        } else {
+          // the URL originates from AI tool calls (prompt-injectable via image
+          // search results), so refuse non-http schemes and private/link-local
+          // targets; redirects are followed manually so every hop is validated.
+          // fetchRemoteImage adds CDN-friendly headers and transient-error retries.
+          const resp = await fetchRemoteImage(String(op.url))
+          if (!resp || !resp.ok) return null
+          buf = Buffer.from(await readBodyCapped(resp, MAX_REMOTE_IMAGE_BYTES))
+          const ct = resp.headers.get('content-type') ?? ''
+          ext = ct.includes('png') ? 'png' : ct.includes('gif') ? 'gif' : 'jpg'
+        }
         const baseWidthPx = session.opened.deck.size.cx / EMU_PER_PX_96
         const scale = op.fitWidthPx / baseWidthPx
         const toEmu = (px: number) => Math.round((px / scale) * EMU_PER_PX_96)
@@ -363,7 +392,18 @@ export function registerSlidesOnlyAiIpc(): void {
   // (frame/z-order/effects survive). Same URL hardening as ai:insert-image-url.
   ipcMain.handle(
     'ai:replace-picture-url',
-    async (e, op: { slideIndex: number; sourceId: string; url: string; keepSrcRect?: boolean }) => {
+    async (
+      e,
+      op: {
+        slideIndex: number
+        sourceId: string
+        url?: string
+        /** raw base64 of a user attachment (attachment:// reference) — no network fetch */
+        base64?: string
+        ext?: string
+        keepSrcRect?: boolean
+      },
+    ) => {
       const session = sessions.get(e.sender.id)
       if (!session) return null
       const slide = session.opened.deck.slides[op.slideIndex]
@@ -374,11 +414,19 @@ export function registerSlidesOnlyAiIpc(): void {
         slide.elements.find((el) => matchesElementRef(el, String(op.sourceId)))?.id ??
         String(op.sourceId)
       try {
-        const resp = await fetchRemoteImage(String(op.url))
-        if (!resp || !resp.ok) return null
-        const buf = Buffer.from(await resp.arrayBuffer())
-        const ct = resp.headers.get('content-type') ?? ''
-        const ext = ct.includes('png') ? 'png' : ct.includes('gif') ? 'gif' : 'jpg'
+        let buf: Buffer
+        let ext: string
+        if (op.base64 != null) {
+          const decoded = attachmentImageBytes(op.base64, op.ext ?? '')
+          if (!decoded) return null
+          ;({ buf, ext } = decoded)
+        } else {
+          const resp = await fetchRemoteImage(String(op.url))
+          if (!resp || !resp.ok) return null
+          buf = Buffer.from(await readBodyCapped(resp, MAX_REMOTE_IMAGE_BYTES))
+          const ct = resp.headers.get('content-type') ?? ''
+          ext = ct.includes('png') ? 'png' : ct.includes('gif') ? 'gif' : 'jpg'
+        }
         pushHistory(session)
         const ok = replacePictureBytes(
           session.opened,
@@ -436,18 +484,17 @@ export function registerSlidesOnlyAiIpc(): void {
 
   ipcMain.handle(
     'ai:save-style-template',
-    (
+    async (
       _event,
       name: string,
       data: { topic: string; styleSkill: string; createdAt: string },
-    ): { ok: boolean; error?: string } => {
+    ): Promise<{ ok: boolean; error?: string }> => {
       try {
         const dir = STYLE_TEMPLATES_DIR()
-        mkdirSync(dir, { recursive: true })
         // Filename: replace illegal characters in the name with _ then truncate to 64 chars
         const safeName = name.replace(/[/\\:*?"<>|]/g, '_').slice(0, 64)
         if (!safeName) return { ok: false, error: tm('errTplNameInvalid') }
-        writeJson(join(dir, `${safeName}.json`), { ...data, name: safeName })
+        writeJsonAtomic(join(dir, `${safeName}.json`), { ...data, name: safeName })
         return { ok: true }
       } catch (err) {
         return { ok: false, error: err instanceof Error ? err.message : String(err) }

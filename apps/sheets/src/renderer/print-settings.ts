@@ -4,7 +4,7 @@
  * pageMargins / printOptions / headerFooter plus the workbook-level
  * _xlnm.Print_Area / _xlnm.Print_Titles defined names).
  */
-import { columnLabel, parseRange } from '../domain/cell-address'
+import { columnLabel, parseRange } from '@genoffice/xlsx-gateway/domain/cell-address'
 import type { WorkbookPagePrintSettings } from '../shared/desktop-api'
 import type { HeaderFooterParts, PageSetupJournalState, StructuralJournalOp } from './edit-journal'
 import { fileRangeToScreenRange, fileToScreen } from './view-transform'
@@ -236,13 +236,15 @@ function plainReference(part: string): string {
     .trim()
 }
 
-/// `'S 1'!$A$1:$K$84,'S 1'!$M$1:$N$9` → ['A1:K84', 'M1:N9']. Anything the
-/// print layout cannot crop to (full-column spans, 3-D refs, #REF!) yields
-/// [] so the export falls back to the used range instead of dropping content.
+/// `'S 1'!$A$1:$K$84,'S 1'!$M$1:$N$9` → ['A1:K84', 'M1:N9']. Stale `#REF!`
+/// parts are skipped (Excel prints the rest); a part the print layout cannot
+/// crop to (full-column spans, 3-D refs) yields [] so the export falls back
+/// to the used range instead of dropping the columns Excel would print.
 export function printAreasFromFormula(formula: string | undefined): string[] {
   if (formula === undefined || formula === '') return []
   const areas: string[] = []
   for (const part of splitAreas(formula)) {
+    if (/#REF!/i.test(part)) continue
     const reference = plainReference(part).toUpperCase()
     if (/^[A-Z]{1,3}[0-9]{1,7}$/.test(reference)) {
       areas.push(`${reference}:${reference}`)
@@ -269,6 +271,20 @@ export function printTitleRowsFromFormula(formula: string | undefined): string |
     if (start <= end && end - start <= 20) return `${start}:${end}`
   }
   return null
+}
+
+/// Print-title rows repeat atop every page: the layout caps the span at 21 rows.
+export const MAX_PRINT_TITLE_ROWS = 21
+
+/**
+ * Clamp a 1-based title-row span to the layout cap, anchoring at the start
+ * so a tall selection still repeats its top rows instead of being dropped
+ * downstream as an over-cap span.
+ */
+export function clampTitleRows(start: number, end: number): string {
+  const safeStart = Number.isFinite(start) ? Math.max(1, Math.floor(start)) : 1
+  const safeEnd = Number.isFinite(end) ? Math.floor(end) : safeStart
+  return `${safeStart}:${Math.min(Math.max(safeEnd, safeStart), safeStart + MAX_PRINT_TITLE_ROWS - 1)}`
 }
 
 /// Excel's encoded header/footer → left/center/right parts. Field codes the

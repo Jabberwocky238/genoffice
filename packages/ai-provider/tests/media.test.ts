@@ -92,10 +92,22 @@ describe('media settings', () => {
     expect(media.providers.openai.imageModel).toBe('gpt-image-2')
   })
 
+  it('tolerates non-string values in a hand-edited settings file', () => {
+    const media = resolveAiMediaSettings({
+      providers: {
+        openai: { apiKey: 123, baseUrl: null, imageModel: 42, analysisModel: {} },
+      },
+    } as never)
+    expect(media.providers.openai.apiKey).toBe('')
+    expect(media.providers.openai.baseUrl).toBe('')
+    expect(media.providers.openai.imageModel).toBe('gpt-image-2')
+  })
+
   it('activates a BYOK media provider per capability, only when usable and capable', () => {
     expect(activeMediaProvider(openaiSettings(), 'image')).toBe('openai')
     expect(activeMediaProvider(openaiSettings(), 'analysis')).toBe('openai')
     expect(activeMediaProvider(openaiSettings(''), 'image')).toBe('genspark')
+    expect(activeMediaProvider(openaiSettings('   '), 'image')).toBe('genspark')
     const custom = defaultAiMediaSettings()
     custom.imageProvider = 'custom'
     expect(activeMediaProvider(withMedia(custom), 'image')).toBe('genspark')
@@ -108,6 +120,13 @@ describe('media settings', () => {
     mm.analysisProvider = 'minimax'
     mm.providers.minimax.apiKey = 'k'
     expect(activeMediaProvider(withMedia(mm), 'analysis')).toBe('genspark')
+    // DeepSeek reads images (V4.1 Flash vision) but takes no video
+    const ds = defaultAiMediaSettings()
+    ds.analysisProvider = 'deepseek'
+    ds.providers.deepseek.apiKey = 'sk-ds'
+    expect(activeMediaProvider(withMedia(ds), 'analysis')).toBe('deepseek')
+    ds.videoAnalysisProvider = 'deepseek'
+    expect(activeMediaProvider(withMedia(ds), 'video')).toBe('genspark')
     // OpenAI reads images but not video: as the video provider it falls back
     const oa = openaiSettings()
     oa.media!.videoAnalysisProvider = 'openai'
@@ -204,6 +223,48 @@ describe('generateImageWithProvider', () => {
     expect(form.get('model')).toBe('flux')
     expect(form.get('image')).toBeInstanceOf(Blob)
     expect((init.headers as Record<string, string>).Authorization).toBeUndefined()
+  })
+
+  it('passes background=transparent only to gpt-image models', async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ data: [{ b64_json: PNG_B64 }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    await generateImageWithProvider(
+      'openai',
+      { apiKey: 'sk-1', imageModel: 'gpt-image-1', analysisModel: '' },
+      { prompt: 'a red icon', transparent: true },
+    )
+    let body = JSON.parse(
+      (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body as string,
+    )
+    expect(body.background).toBe('transparent')
+    // dall-e-3 and lookalike vendors reject the field — it must stay off their requests
+    fetchMock.mockClear()
+    await generateImageWithProvider(
+      'openai',
+      { apiKey: 'sk-1', imageModel: 'dall-e-3', analysisModel: '' },
+      { prompt: 'a red icon', transparent: true },
+    )
+    body = JSON.parse(
+      (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body as string,
+    )
+    expect(body.background).toBeUndefined()
+  })
+
+  it('passes background=transparent on gpt-image multipart edits', async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ data: [{ b64_json: PNG_B64 }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    await generateImageWithProvider(
+      'openai',
+      { apiKey: 'sk-1', imageModel: 'gpt-image-1', analysisModel: '' },
+      {
+        prompt: 'isolate the icon',
+        references: [{ bytes: PNG, mime: 'image/png' }],
+        transparent: true,
+      },
+    )
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(url).toBe('https://api.openai.com/v1/images/edits')
+    expect((init.body as FormData).get('background')).toBe('transparent')
   })
 
   it('calls Gemini generateContent with IMAGE modality and reads inlineData back', async () => {
@@ -460,6 +521,32 @@ describe('analyzeMediaWithProvider', () => {
     expect(body.contents[0].parts[0].inline_data.mime_type).toBe('video/mp4')
     expect(body.contents[0].parts[1].text).toBe('summarize')
   })
+
+  it('posts DeepSeek V4.1 Flash images to the direct API and rejects video', async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({ choices: [{ message: { content: 'a logo' } }] }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const config = { apiKey: 'sk-ds', imageModel: '', analysisModel: 'deepseek-flash' }
+    const text = await analyzeMediaWithProvider('deepseek', config, {
+      media: [{ bytes: PNG, mime: 'image/png' }],
+      requirements: 'what is this',
+    })
+    expect(text).toBe('a logo')
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(url).toBe('https://api.deepseek.com/v1/chat/completions')
+    expect((init.headers as Record<string, string>).Authorization).toBe('Bearer sk-ds')
+    const body = JSON.parse(init.body as string)
+    expect(body.model).toBe('deepseek-flash')
+    expect(body.messages[0].content[1].image_url.url).toBe(`data:image/png;base64,${PNG_B64}`)
+    await expect(
+      analyzeMediaWithProvider('deepseek', config, {
+        media: [{ bytes: PNG, mime: 'video/mp4', name: 'clip.mp4' }],
+        requirements: 'summarize',
+      }),
+    ).rejects.toThrow(/video and audio analysis needs/)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('testMediaProvider', () => {
@@ -483,5 +570,58 @@ describe('testMediaProvider', () => {
     })
     expect(failed.ok).toBe(false)
     expect(failed.error).toMatch(/403/)
+  })
+})
+
+describe('a failed media request does not buffer the whole error body', () => {
+  /** an error body far larger than any diagnostic needs; counts what the reader pulls */
+  function hugeErrorBody(): { response: Response; pulled: () => number } {
+    const chunk = new TextEncoder().encode('x'.repeat(64 * 1024))
+    const chunks = 64
+    let sent = 0
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent >= chunks) return controller.close()
+        sent += 1
+        controller.enqueue(chunk)
+      },
+    })
+    return {
+      response: new Response(body, { status: 500 }),
+      pulled: () => sent * chunk.byteLength,
+    }
+  }
+
+  it('reads only the diagnostic prefix of an analysis failure', async () => {
+    const { response, pulled } = hugeErrorBody()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => response),
+    )
+    await expect(
+      analyzeMediaWithProvider(
+        'openai',
+        { apiKey: 'sk', imageModel: '', analysisModel: 'gpt-5.6-luna' },
+        { media: [{ bytes: PNG, mime: 'image/png', name: 'logo.png' }], requirements: 'describe' },
+      ),
+    ).rejects.toThrow(/Media analysis failed: 500/)
+    // httpBodyDetail keeps 500 characters; the rest of the 4 MB body is never buffered
+    expect(pulled()).toBeLessThanOrEqual(128 * 1024)
+  })
+
+  it('reads only the diagnostic prefix of a credential-test failure', async () => {
+    const { response, pulled } = hugeErrorBody()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => response),
+    )
+    const failed = await testMediaProvider('openai', {
+      apiKey: 'sk',
+      imageModel: '',
+      analysisModel: '',
+    })
+    expect(failed.ok).toBe(false)
+    expect(failed.error).toMatch(/500/)
+    expect(pulled()).toBeLessThanOrEqual(128 * 1024)
   })
 })

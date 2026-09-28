@@ -376,6 +376,46 @@ describe('empty paragraph line size (emptyRunSize attr)', () => {
     expect(cjk.style.getPropertyValue('--doc-line-factor')).toBe('var(--doc-line-factor-cjk,1.7)')
     editor.destroy()
   })
+
+  it('a space plus page-break paragraph is mark-sized like a break-only one', () => {
+    const editor = new Editor({
+      element: document.createElement('div'),
+      extensions: editorExtensions,
+      content: {
+        type: 'doc',
+        content: [
+          {
+            type: 'docParagraph',
+            attrs: { emptyRunFont: 'Times New Roman', emptyRunSize: 22 },
+            content: [
+              { type: 'text', text: ' ' },
+              { type: 'hardBreak', attrs: { pageBreak: true } },
+            ],
+          },
+          {
+            type: 'docParagraph',
+            attrs: { emptyRunFont: 'Times New Roman' },
+            content: [{ type: 'hardBreak', attrs: { pageBreak: true } }],
+          },
+          {
+            type: 'docParagraph',
+            attrs: { emptyRunFont: 'Times New Roman' },
+            content: [{ type: 'text', text: ' ' }, { type: 'hardBreak' }],
+          },
+        ],
+      } as never,
+    })
+    const [spaced, bare, softBreak] = Array.from(
+      editor.view.dom.querySelectorAll('p'),
+    ) as HTMLElement[]
+    expect(spaced.style.getPropertyValue('--doc-line-factor')).toBe('1.15')
+    expect(spaced.style.fontFamily).toContain('Times New Roman')
+    expect(spaced.style.fontSize).toBe('11pt')
+    expect(bare.style.getPropertyValue('--doc-line-factor')).toBe('1.15')
+    // a soft line break is content: the paragraph keeps the content path
+    expect(softBreak.style.fontFamily).not.toContain('Times New Roman')
+    editor.destroy()
+  })
 })
 
 describe('per-line factors in mixed-script paragraphs', () => {
@@ -410,7 +450,8 @@ describe('per-line factors in mixed-script paragraphs', () => {
       `max(var(--doc-line-factor-latin,1.2), ${lineHeightFactor('Arial')})`,
     )
     const lifted = stretches(editor)
-    expect(lifted.map((s) => s.textContent)).toEqual(['수소는 결정', '결함', '결합해'])
+    // Script-font decorations may split a stretch without changing its line metrics.
+    expect(lifted.map((s) => s.textContent).join('')).toBe('수소는 결정결함결합해')
     for (const s of lifted) {
       expect(s.style.getPropertyValue('--doc-line-factor')).toBe('var(--doc-line-factor-kr,1.3029)')
       expect(s.style.getPropertyValue('line-height')).toBe('')

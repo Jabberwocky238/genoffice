@@ -41,7 +41,7 @@ use worksheet::*;
 use xml_util::*;
 
 pub use visuals::{CellStyle, MediaResult, ThemeFonts, VisualObject};
-use visuals::{ColorContext, SheetVisualSource};
+use visuals::{ColorContext, SheetVisualSource, SourceFormats};
 
 const CHUNK_ROW_COUNT: usize = 256;
 const MAX_RANGE_CELLS: usize = 100_000;
@@ -143,10 +143,12 @@ impl WorkbookSessions {
         )?;
         let custom_table_styles = read_custom_table_styles(&mut archive, &dxf_styles);
         let rich_value_images = richdata::read_rich_value_images(&mut archive);
+        let wps_cell_images = read_wps_cell_images(&mut archive);
         let mut cell_image_count = 0usize;
         let mut sheets = Vec::with_capacity(declarations.len());
         let mut runtimes = Vec::with_capacity(declarations.len());
         let mut visual_sources = Vec::with_capacity(declarations.len());
+        let mut sheet_names = Vec::with_capacity(declarations.len());
 
         for declaration in declarations {
             let target = relationships
@@ -184,6 +186,7 @@ impl WorkbookSessions {
                 &mut archive,
                 &worksheet_path,
                 &rich_value_images,
+                &wps_cell_images,
                 &mut cell_image_count,
             )?;
             let pivot_infos = visuals::read_pivot_tables(&mut archive, &worksheet_path)?;
@@ -229,6 +232,7 @@ impl WorkbookSessions {
                 row_count = row_count.max(table.range.end_row + 1);
                 column_count = column_count.max(table.range.end_column + 1);
             }
+            sheet_names.push((declaration.name.clone(), worksheet_path.clone()));
             sheets.push(SheetMetadata {
                 id: id.clone(),
                 name: declaration.name,
@@ -279,8 +283,13 @@ impl WorkbookSessions {
                 .map(|style| style.styles_blank_cell(&default_style))
                 .collect(),
         );
-        let visual_objects =
-            visuals::read_visual_objects(&mut archive, &visual_sources, &color_context)?;
+        let mut source_formats = SourceFormats::new(sheet_names, &styles);
+        let visual_objects = visuals::read_visual_objects(
+            &mut archive,
+            &visual_sources,
+            &color_context,
+            &mut source_formats,
+        )?;
         let (defined_names, print_names, scoped_sheets) = read_defined_names(&mut archive)?;
         for (sheet_index, sheet) in sheets.iter_mut().enumerate() {
             if let Some(names) = print_names.get(&sheet_index) {

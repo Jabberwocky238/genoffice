@@ -25,18 +25,44 @@ export function gensparkAttributionHeaders(baseUrl?: string): Record<string, str
     : {}
 }
 
+/**
+ * OpenCode Zen / Go route and cache per conversation and answer 400
+ * MissingSessionID without this header (genoffice#331). The renderer's
+ * transport id is stable for a chat; a one-shot call is its own conversation.
+ */
+export function opencodeSessionHeaders(
+  baseUrl: string | undefined,
+  sessionId?: string,
+): Record<string, string> {
+  return baseUrl?.startsWith('https://opencode.ai/')
+    ? { 'x-opencode-session': sessionId || crypto.randomUUID() }
+    : {}
+}
+
+/** DeepSeek V4.1 Flash under the Genspark pool spelling, shared by the direct provider so the two lists read alike */
+export const DEEPSEEK_V41_FLASH = 'deep-seek-v4.1-flash'
+
 export const AI_PROVIDERS: AiProviderMeta[] = [
   {
     id: 'genspark',
     label: 'Genspark',
     // must stay within the proxy's served set (GET /api/llm_proxy/v1/models);
-    // bare gpt-5.6 and the gemini family dropped off it (verified 2026-08-31)
+    // bare gpt-5.6 and the gemini family dropped off it (verified 2026-08-31).
+    // DeepSeek goes by the proxy's hyphenated pool id; V4.1 Flash takes images
+    // (live-verified 2026-09-15). gpt-6-astra: chat, tool call and image
+    // input all live-verified through the proxy 2026-09-17; claude-opus-5-5,
+    // gpt-6-sol and gpt-6-luna the same way 2026-09-24
     models: [
+      'claude-opus-5-5',
       'claude-opus-4-7',
       'claude-opus-4-8',
       'claude-sonnet-4-6',
+      'gpt-6-astra',
+      'gpt-6-sol',
+      'gpt-6-luna',
       'gpt-5.6-terra',
       'gpt-5.6-luna',
+      DEEPSEEK_V41_FLASH,
     ],
     defaultModel: 'claude-opus-4-7',
     keyPlaceholder: 'Not required - sign in to Genspark',
@@ -54,10 +80,14 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
   {
     id: 'anthropic',
     label: 'Claude',
-    // current-generation ids per platform.claude.com models overview (2026-08)
+    // current-generation ids per platform.claude.com models overview (2026-09-24).
+    // Fable needs data retention enabled on the org, otherwise the API answers
+    // model_not_available; every other id is served to any key.
     models: [
-      'claude-opus-5',
+      'claude-opus-5-5',
       'claude-sonnet-5',
+      'claude-fable-5-1',
+      'claude-opus-5',
       'claude-fable-5',
       'claude-opus-4-8',
       'claude-opus-4-7',
@@ -70,24 +100,28 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
   {
     id: 'gemini',
     label: 'Gemini',
-    // 3.x lineup per ai.google.dev/gemini-api/docs/models (2026-08). 3.7 Flash is
-    // the current stable Flash; 3.1 Pro is still preview-only.
+    // 3.x lineup per ai.google.dev/gemini-api/docs/models (2026-09-23). 3.8 Flash
+    // is the current stable Flash Google recommends; 3.1 Pro is still preview-only.
     models: [
+      'gemini-3.8-flash',
       'gemini-3.7-flash',
       'gemini-3.1-pro-preview',
       'gemini-3.6-flash',
       'gemini-3.5-flash-lite',
+      'gemini-3.1-flash-lite',
     ],
-    defaultModel: 'gemini-3.7-flash',
+    defaultModel: 'gemini-3.8-flash',
     keyPlaceholder: 'AIza...',
   },
   {
     id: 'deepseek',
     label: 'DeepSeek',
-    // V4 ids per api-docs.deepseek.com (2026-08). Vision Exp is available
-    // through the normal DeepSeek API key; indirect-route aliases such as
-    // `-openrouter` do not belong in this direct-provider list.
-    models: ['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp'],
+    // GET api.deepseek.com/v1/models serves `deepseek-v4-pro` and
+    // `deepseek-flash` (verified 2026-09-21); the latter is V4.1 Flash with
+    // native vision. We list it under the Genspark pool spelling so both
+    // providers show the same versioned name; the adapter maps it back to
+    // the unversioned wire id (see DEEPSEEK_WIRE_IDS in registry.ts).
+    models: ['deepseek-v4-pro', DEEPSEEK_V41_FLASH],
     defaultModel: 'deepseek-v4-pro',
     keyPlaceholder: 'sk-...',
   },
@@ -96,7 +130,10 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     label: 'OpenAI',
     // GPT-5.6 naming: sol is the flagship (the bare `gpt-5.6` alias resolves to
     // it, but spell it out so the picker says which tier it is), terra balances
-    // cost/intelligence, luna is the high-volume tier (2026-08)
+    // cost/intelligence, luna is the high-volume tier (2026-08). The GPT-6
+    // family (astra, sol, luna) is deliberately absent: Chat Completions
+    // supports its function calling only with reasoning_effort none, full
+    // tool use needs the Responses API, which has no protocol here (2026-09-24)
     models: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
     defaultModel: 'gpt-5.6-terra',
     keyPlaceholder: 'sk-...',
@@ -166,7 +203,11 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     // there is no `openai/gpt-5.6` alias there, only the per-tier ids
     models: [
       'openrouter/auto',
+      'anthropic/claude-opus-5.5',
       'anthropic/claude-sonnet-5',
+      'openai/gpt-6-astra',
+      'openai/gpt-6-sol',
+      'openai/gpt-6-luna',
       'openai/gpt-5.6-sol',
       'moonshotai/kimi-k3',
     ],
@@ -177,13 +218,16 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     id: 'requesty',
     label: 'Requesty',
     // Managed policy ids exactly as GET router.requesty.ai/v1/models/managed
-    // lists them (2026-09-11): short stable names Requesty routes across
+    // lists them (2026-09-24): short stable names Requesty routes across
     // providers, used as-is in the model field. The full vendor-prefixed
     // catalog (GET /v1/models, e.g. openai/gpt-4o-mini) works too when typed
     // in. Ids ending "@eu" route through EU providers only.
     models: [
       'claude-sonnet-5',
+      'claude-opus-5-5',
       'claude-opus-4-8',
+      'gpt-6-sol',
+      'gpt-6-luna',
       'gpt-5.6-sol',
       'gpt-5.6-terra',
       'gemini-3.7-flash',
@@ -194,14 +238,36 @@ export const AI_PROVIDERS: AiProviderMeta[] = [
     keyPlaceholder: 'sk-...',
   },
   {
+    id: 'opper',
+    label: 'Opper',
+    // Pool ids exactly as GET api.opper.ai/v3/models lists them (2026-09-14):
+    // a bare name is an Opper pool, and Opper picks the serving provider and
+    // region per request. The vendor-prefixed catalog (anthropic/claude-sonnet-4-6,
+    // azure/gpt-5, …) pins one provider and works as-is when typed in.
+    // Full list at opper.ai/models.
+    models: [
+      'claude-sonnet-4-6',
+      'claude-opus-5',
+      'gpt-5.5',
+      'gpt-5.4-mini',
+      'gemini-3.8-flash',
+      'deepseek-v4-pro',
+      'kimi-k3',
+      'mistral-large-2512',
+    ],
+    defaultModel: 'claude-sonnet-4-6',
+    keyPlaceholder: 'API Key',
+  },
+  {
     id: 'opencode-zen',
     label: 'OpenCode Zen',
     // Pay-as-you-go gateway (opencode.ai/docs/zen); ids exactly as GET
-    // /zen/v1/models lists them (2026-09-03). GPT-5.x, Grok and Muse Spark
+    // /zen/v1/models lists them (2026-09-24). GPT-5.x/6, Grok and Muse Spark
     // are served only through the Responses API, which has no protocol here,
     // so they stay out until one exists.
     models: [
       'claude-sonnet-5',
+      'claude-opus-5-5',
       'claude-opus-5',
       'claude-fable-5-1',
       'claude-haiku-4-5',
@@ -298,14 +364,16 @@ export function activeProvider(settings: AiSettings): AiProviderId {
   const config = settings.providers?.[provider]
   if (!meta || !config) return 'genspark'
   if (meta.needsCliPath) return provider
-  if (!config.model) return 'genspark'
+  // Trim-aware: in-memory settings bypass the trimConfigs applied to
+  // persisted files, and a whitespace-only key/URL/model is a 401, not a config.
+  if (!config.model?.trim()) return 'genspark'
   if (meta.needsBaseUrl) {
     // Custom OpenAI-compatible endpoints (Ollama, LM Studio, vLLM) accept
     // anonymous requests: base URL + model suffice, the key stays optional.
-    if (!config.baseUrl) return 'genspark'
+    if (!config.baseUrl?.trim()) return 'genspark'
     return provider
   }
-  if (!config.apiKey) return 'genspark'
+  if (!config.apiKey?.trim()) return 'genspark'
   return provider
 }
 
@@ -315,11 +383,16 @@ export function activeProvider(settings: AiSettings): AiProviderId {
  * settings file keeps sending an id the API now rejects.
  */
 const RETIRED_MODELS: Partial<Record<AiProviderId, Record<string, string>>> = {
-  // aliases retired 2026-07-24; DeepSeek pointed both at the V4-Flash line,
-  // where thinking mode is a request parameter rather than a separate id
+  // chat/reasoner retired 2026-07-24 (thinking became a request parameter);
+  // V4 Flash and V4 Flash Vision Exp retired 2026-09-10 in favour of V4.1
+  // Flash, which carries vision natively. The vendor's own `deepseek-flash`
+  // id is folded in as well so the stored value matches the listed one.
   deepseek: {
-    'deepseek-chat': 'deepseek-v4-flash',
-    'deepseek-reasoner': 'deepseek-v4-flash',
+    'deepseek-chat': DEEPSEEK_V41_FLASH,
+    'deepseek-reasoner': DEEPSEEK_V41_FLASH,
+    'deepseek-v4-flash': DEEPSEEK_V41_FLASH,
+    'deepseek-v4-flash-vision-exp': DEEPSEEK_V41_FLASH,
+    'deepseek-flash': DEEPSEEK_V41_FLASH,
   },
   // proxy stopped serving bare gpt-5.6 (400) and removed the gemini route
   // entirely (405), verified 2026-08-31; gemini selections fall back to the
@@ -360,19 +433,37 @@ export function maxOutputTokensOf(
     : clampMaxOutputTokens(settings.maxOutputTokens)
 }
 
+const str = (v: unknown): string => (typeof v === 'string' ? v.trim() : '')
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function mergeProviderConfigs(
+  defaults: AiSettings['providers'],
+  stored: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...defaults }
+  for (const [id, config] of Object.entries(stored)) {
+    if (isRecord(config)) merged[id] = config
+  }
+  return merged
+}
+
 /** pasted keys/URLs/model ids often carry stray whitespace, which turns into a 401 with a valid key */
-function trimConfigs(providers: AiSettings['providers']): AiSettings['providers'] {
-  const trimmed = { ...providers }
-  for (const [id, config] of Object.entries(trimmed)) {
-    trimmed[id as AiProviderId] = {
+function trimConfigs(providers: Record<string, unknown>): AiSettings['providers'] {
+  const trimmed: Record<string, unknown> = {}
+  for (const [id, config] of Object.entries(providers)) {
+    if (!isRecord(config)) continue
+    trimmed[id] = {
       ...config,
-      apiKey: config.apiKey?.trim() ?? '',
-      model: config.model?.trim() ?? '',
-      ...(config.baseUrl !== undefined ? { baseUrl: config.baseUrl.trim() } : {}),
-      ...(config.cliPath !== undefined ? { cliPath: config.cliPath.trim() } : {}),
+      apiKey: str(config.apiKey),
+      model: str(config.model),
+      ...(config.baseUrl !== undefined ? { baseUrl: str(config.baseUrl) } : {}),
+      ...(config.cliPath !== undefined ? { cliPath: str(config.cliPath) } : {}),
     }
   }
-  return trimmed
+  return trimmed as AiSettings['providers']
 }
 
 function migrateRetiredModels(providers: AiSettings['providers']): AiSettings['providers'] {
@@ -391,33 +482,36 @@ function migrateRetiredModels(providers: AiSettings['providers']): AiSettings['p
  * "custom" provider slot. `stored` is whatever the caller read from its
  * settings file (already JSON-parsed); this function does no file I/O.
  */
-export function resolveAiSettings(
-  stored: Partial<AiSettings> & LegacyAiSettings,
-  defaults: AiSettings,
-): AiSettings {
-  if (!stored.providers) {
-    if (stored.apiKey) {
+export function resolveAiSettings(stored: unknown, defaults: AiSettings): AiSettings {
+  const settings = (isRecord(stored) ? stored : {}) as Partial<AiSettings> & LegacyAiSettings
+  const storedProviders = isRecord(settings.providers) ? settings.providers : undefined
+  if (!storedProviders) {
+    if (settings.apiKey) {
       defaults.providers.custom = {
-        apiKey: stored.apiKey.trim(),
-        model: stored.model?.trim() ?? '',
-        baseUrl: (stored.baseUrl ?? 'https://api.openai.com/v1').trim(),
+        apiKey: str(settings.apiKey),
+        model: str(settings.model),
+        baseUrl: str(settings.baseUrl) || 'https://api.openai.com/v1',
       }
     }
     return defaults
   }
   return {
-    provider: stored.provider ?? defaults.provider,
+    provider: settings.provider ?? defaults.provider,
     // Trim before migrating: a pasted " deepseek-reasoner " must still hit
     // the retired-id remap instead of being sent to the API verbatim.
-    providers: migrateRetiredModels(trimConfigs({ ...defaults.providers, ...stored.providers })),
-    gskToolsEnabled: stored.gskToolsEnabled ?? defaults.gskToolsEnabled ?? true,
-    media: resolveAiMediaSettings(stored.media ?? defaults.media),
-    search: resolveAiSearchSettings(stored.search ?? defaults.search),
+    providers: migrateRetiredModels(
+      trimConfigs(mergeProviderConfigs(defaults.providers, storedProviders)),
+    ),
+    gskToolsEnabled: settings.gskToolsEnabled ?? defaults.gskToolsEnabled ?? true,
+    media: resolveAiMediaSettings(settings.media ?? defaults.media),
+    search: resolveAiSearchSettings(settings.search ?? defaults.search),
     // clamped on read: a hand-edited settings file with an absurd cap must not be
     // forwarded to the endpoint verbatim
-    ...(stored.maxOutputTokens !== undefined || defaults.maxOutputTokens !== undefined
+    ...(settings.maxOutputTokens !== undefined || defaults.maxOutputTokens !== undefined
       ? {
-          maxOutputTokens: clampMaxOutputTokens(stored.maxOutputTokens ?? defaults.maxOutputTokens),
+          maxOutputTokens: clampMaxOutputTokens(
+            settings.maxOutputTokens ?? defaults.maxOutputTokens,
+          ),
         }
       : {}),
   }

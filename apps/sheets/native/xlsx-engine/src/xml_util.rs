@@ -5,6 +5,43 @@ use std::borrow::Cow;
 
 use super::*;
 
+pub(crate) fn decode_uri_path(value: &str) -> Result<String, SidecarError> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return Err(SidecarError::Workbook(
+                "OOXML relationship target is malformed.".into(),
+            ));
+        }
+        let high = hex_value(bytes[index + 1]).ok_or_else(|| {
+            SidecarError::Workbook("OOXML relationship target is malformed.".into())
+        })?;
+        let low = hex_value(bytes[index + 2]).ok_or_else(|| {
+            SidecarError::Workbook("OOXML relationship target is malformed.".into())
+        })?;
+        decoded.push(high << 4 | low);
+        index += 3;
+    }
+    String::from_utf8(decoded)
+        .map_err(|_| SidecarError::Workbook("OOXML relationship target is not valid UTF-8.".into()))
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Entry lookup tolerant of non-conformant producers: '\' separators,
 /// leading '/', and case drift in entry names. Excel opens such packages
 /// (tdf131575: .NET-written `xl\workbook.xml` with `sharedstrings.xml`).
@@ -18,11 +55,19 @@ pub(crate) fn zip_entry<'a>(
         let normalize = |value: &str| {
             crate::archive::canonical_entry_name(value).map(|name| name.to_ascii_lowercase())
         };
-        let wanted = normalize(name);
-        archive
-            .file_names()
-            .find(|candidate| normalize(candidate) == wanted)
-            .map(ToOwned::to_owned)
+        let decoded = decode_uri_path(name).ok();
+        let mut resolved = None;
+        for candidate in [Some(name), decoded.as_deref()].into_iter().flatten() {
+            let wanted = normalize(candidate);
+            if let Some(found) = archive
+                .file_names()
+                .find(|candidate| normalize(candidate) == wanted)
+            {
+                resolved = Some(found.to_owned());
+                break;
+            }
+        }
+        resolved
     };
     archive.by_name(resolved.as_deref().unwrap_or(name))
 }
@@ -137,6 +182,28 @@ pub(crate) fn normalize_cell_text(text: &mut String) {
         *text = decoded;
         normalize_line_endings(text);
     }
+}
+
+/// Text of one `<t>` node as Excel reads it: without `xml:space="preserve"`
+/// leading/trailing XML whitespace is dropped, so `<t> </t>` is an empty
+/// string (a CF rule comparing it with a blank cell matches).
+pub(crate) fn text_node_content(text: String, preserve: bool) -> String {
+    if preserve {
+        return text;
+    }
+    let trimmed = text.trim_matches([' ', '\t', '\r', '\n']);
+    if trimmed.len() == text.len() {
+        text
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+pub(crate) fn preserves_space<R: std::io::BufRead>(
+    reader: &Reader<R>,
+    element: &BytesStart<'_>,
+) -> Result<bool, SidecarError> {
+    Ok(attribute_value(reader, element, b"space")?.as_deref() == Some("preserve"))
 }
 
 pub(crate) fn decode_text(text: &quick_xml::events::BytesText<'_>) -> Result<String, SidecarError> {

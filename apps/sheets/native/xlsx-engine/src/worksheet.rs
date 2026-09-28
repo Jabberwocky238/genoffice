@@ -33,6 +33,8 @@ pub(crate) fn index_worksheet(
     let mut in_formula = false;
     let mut in_value = false;
     let mut in_text = false;
+    let mut text_preserve = false;
+    let mut text_node = String::new();
     let mut in_phonetic = false;
     // Shared-formula groups: the master's text expands into every follower (#165).
     let mut shared_formulas = shared_formulas::SharedFormulas::default();
@@ -174,6 +176,8 @@ pub(crate) fn index_worksheet(
             }
             Event::Start(element) if element.local_name().as_ref() == b"t" => {
                 in_text = !in_phonetic;
+                text_preserve = preserves_space(&reader, &element)?;
+                text_node.clear();
             }
             Event::Start(element)
                 if element.local_name().as_ref() == b"r" && cell_builder.is_some() =>
@@ -215,10 +219,7 @@ pub(crate) fn index_worksheet(
                     } else if in_value {
                         builder.raw_value.push_str(&decoded);
                     } else if in_text {
-                        builder.inline_text.push_str(&decoded);
-                        if let Some(run) = &mut builder.current_run {
-                            run.text.push_str(&decoded);
-                        }
+                        text_node.push_str(&decoded);
                     }
                 } else if let Some(section) = header_footer_section {
                     section
@@ -251,10 +252,7 @@ pub(crate) fn index_worksheet(
                     } else if in_value {
                         builder.raw_value.push_str(&decoded);
                     } else if in_text {
-                        builder.inline_text.push_str(&decoded);
-                        if let Some(run) = &mut builder.current_run {
-                            run.text.push_str(&decoded);
-                        }
+                        text_node.push_str(&decoded);
                     }
                 } else if let Some(section) = header_footer_section {
                     section
@@ -291,7 +289,18 @@ pub(crate) fn index_worksheet(
                 }
             }
             Event::End(element) if element.local_name().as_ref() == b"v" => in_value = false,
-            Event::End(element) if element.local_name().as_ref() == b"t" => in_text = false,
+            Event::End(element) if element.local_name().as_ref() == b"t" => {
+                if in_text {
+                    let text = text_node_content(std::mem::take(&mut text_node), text_preserve);
+                    if let Some(builder) = &mut cell_builder {
+                        builder.inline_text.push_str(&text);
+                        if let Some(run) = &mut builder.current_run {
+                            run.text.push_str(&text);
+                        }
+                    }
+                }
+                in_text = false;
+            }
             Event::End(element) if element.local_name().as_ref() == b"c" => {
                 if let Some(builder) = cell_builder.take() {
                     latest_row = latest_row.max(builder.row);
@@ -1270,13 +1279,17 @@ impl CellBuilder {
         styled_xfs: &[bool],
         rich_image_cells: &HashSet<(usize, usize)>,
     ) -> Result<Option<CellRecord>, SidecarError> {
-        let formula = if self.formula.is_empty() {
+        let picture = rich_image_cells.contains(&(self.row, self.column));
+        let formula = if picture || self.formula.is_empty() {
             None
         } else {
             Some(format!("={}", strip_future_function_markers(&self.formula)))
         };
         let mut rich = None;
         let value = match self.cell_type.as_deref() {
+            // Resolved pictures replace cached text/errors and the renderer's
+            // unsupported DISPIMG formula; the source XML remains untouched.
+            _ if picture => None,
             // Empty <v/> or a stale index degrades to a valueless styled cell;
             // erroring here used to blank the whole sheet.
             Some("s") => match self
@@ -1301,9 +1314,6 @@ impl CellBuilder {
                 normalize_cell_text(&mut inline_text);
                 Some(CellValue::String(inline_text))
             }
-            // An error cell hosting an in-cell picture record renders as the
-            // picture, not as its cached #VALUE! placeholder.
-            Some("e") if rich_image_cells.contains(&(self.row, self.column)) => None,
             Some("str") | Some("e") => {
                 let mut raw_value = self.raw_value;
                 normalize_cell_text(&mut raw_value);
@@ -1358,18 +1368,87 @@ pub(crate) fn strip_future_function_markers(formula: &str) -> String {
     if !formula.contains("_xlfn.") && !formula.contains("_xlws.") {
         return formula.to_owned();
     }
-    formula
-        .split('"')
-        .enumerate()
-        .map(|(index, segment)| {
-            if index % 2 == 1 {
-                segment.to_owned()
-            } else {
-                segment.replace("_xlfn.", "").replace("_xlws.", "")
+    let bytes = formula.as_bytes();
+    let mut out = String::with_capacity(formula.len());
+    let mut copied_from = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'"' || bytes[index] == b'\'' {
+            let quote = bytes[index];
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == quote {
+                    if bytes.get(index + 1) == Some(&quote) {
+                        index += 2;
+                    } else {
+                        index += 1;
+                        break;
+                    }
+                } else {
+                    index += 1;
+                }
             }
-        })
-        .collect::<Vec<_>>()
-        .join("\"")
+            continue;
+        }
+        let start = index;
+        let end = formula_name_end(formula, start);
+        if end > start {
+            let token = &formula[start..end];
+            let marker_len = if token
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("_xlfn."))
+            {
+                6
+            } else if token
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("_xlws."))
+            {
+                6
+            } else {
+                0
+            };
+            let marker_len = if token
+                .get(..12)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("_xlfn._xlws."))
+            {
+                12
+            } else {
+                marker_len
+            };
+            let valid_name = marker_len > 0
+                && !token[marker_len..].is_empty()
+                && token[marker_len..].chars().all(|character| {
+                    character.is_alphanumeric() || matches!(character, '_' | '.' | '\\' | '$')
+                });
+            let after = formula[end..].trim_start();
+            if valid_name && after.starts_with('(') {
+                out.push_str(&formula[copied_from..start]);
+                out.push_str(&token[marker_len..]);
+                copied_from = end;
+                index = end;
+                continue;
+            }
+            index = end;
+            continue;
+        }
+        let Some(character) = formula[index..].chars().next() else {
+            break;
+        };
+        index += character.len_utf8();
+    }
+    out.push_str(&formula[copied_from..]);
+    out
+}
+
+fn formula_name_end(formula: &str, start: usize) -> usize {
+    let mut end = start;
+    for (offset, character) in formula[start..].char_indices() {
+        if !character.is_alphanumeric() && !matches!(character, '_' | '.' | '\\' | '$') {
+            break;
+        }
+        end = start + offset + character.len_utf8();
+    }
+    end
 }
 
 /// `ref` of a `<f t="array">` element; None for ordinary formulas.

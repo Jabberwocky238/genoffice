@@ -1,16 +1,21 @@
 import type { AgentMessage, AgentToolCall, AgentToolDef } from '@genoffice/agent-core'
 import { aiFetch } from '../fetch'
 import { httpBodyDetail } from '../http-error'
-import { gensparkAttributionHeaders } from '../providers'
+import { openAiContentText } from '../media-protocols'
+import { gensparkAttributionHeaders, opencodeSessionHeaders } from '../providers'
 import { modelEchoesReasoning } from '../registry'
 import type { AiChatResponse, AiProviderConfig } from '../types'
 import { createStreamWatchdog, type StreamWatchdog } from '../watchdog'
 import {
+  endpointUrl,
   jsonBodyInsteadOfSse,
   parseToolInput,
+  readCappedResponseText,
   sseErrorText,
   sseLines,
   throwIfCreditsNotice,
+  throwIfToolCountOverBudget,
+  throwIfToolJsonOverBudget,
   type StreamCallbacks,
 } from './shared'
 
@@ -68,7 +73,7 @@ function emitOpenAiJsonMessage(bodyText: string, cb: StreamCallbacks): void {
   let msg: {
     choices?: Array<{
       message?: {
-        content?: string | null
+        content?: unknown
         reasoning_content?: string
         tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }>
       }
@@ -84,14 +89,25 @@ function emitOpenAiJsonMessage(bodyText: string, cb: StreamCallbacks): void {
   if (msg.error) throw new Error(sseErrorText(msg.error, 'Model error'))
   const choice = msg.choices?.[0]
   let emitted = false
-  if (choice?.message?.reasoning_content) cb.onReasoningDelta?.(choice.message.reasoning_content)
-  if (choice?.message?.content) {
+  if (choice?.message?.reasoning_content) {
     emitted = true
-    cb.onDelta(choice.message.content)
+    cb.onReasoningDelta?.(choice.message.reasoning_content)
+  }
+  if (choice?.message?.content) {
+    // A gateway may answer with `content` as an array of parts; concatenated raw it
+    // reaches the loop as "[object Object]", so flatten it first.
+    const text = openAiContentText(choice.message.content)
+    if (text) {
+      emitted = true
+      cb.onDelta(text)
+    }
   }
   const toolCalls: AgentToolCall[] = []
   for (const tc of choice?.message?.tool_calls ?? []) {
     if (!tc.function?.name) continue
+    // A complete JSON body carries the whole turn at once, so the per-turn tool
+    // budget of the streamed path has to be applied here as well
+    throwIfToolCountOverBudget(toolCalls.length + 1, 'openai-compatible')
     emitted = true
     const { input, error } = parseToolInput(tc.function.arguments ?? '')
     toolCalls.push({
@@ -149,13 +165,14 @@ async function openAiCompatibleTurn(
     wd.touch()
     cb.onActivity?.()
   }
-  const response = await aiFetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
+  const response = await aiFetch(endpointUrl(baseUrl, 'chat/completions'), {
     method: 'POST',
     signal: wd.signal,
     headers: {
       'Content-Type': 'application/json',
       ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}),
       ...gensparkAttributionHeaders(baseUrl),
+      ...opencodeSessionHeaders(baseUrl, cb.sessionId),
     },
     body: JSON.stringify({
       model: config.model,
@@ -179,9 +196,11 @@ async function openAiCompatibleTurn(
   // headers arrived: ping the renderer watchdog too, or a slow first chunk could trip it
   onBytes()
   if (!response.ok || !response.body) {
-    throw new Error(`HTTP ${response.status}: ${httpBodyDetail(await response.text())}`)
+    throw new Error(
+      `HTTP ${response.status}: ${httpBodyDetail(await readCappedResponseText(response, onBytes))}`,
+    )
   }
-  const jsonBody = await jsonBodyInsteadOfSse(response)
+  const jsonBody = await jsonBodyInsteadOfSse(response, onBytes)
   if (jsonBody !== null) {
     throwIfCreditsNotice(jsonBody)
     return emitOpenAiJsonMessage(jsonBody, cb)
@@ -227,7 +246,7 @@ async function openAiCompatibleTurn(
       event = JSON.parse(payload) as {
         choices?: Array<{
           delta?: {
-            content?: string
+            content?: unknown
             /** DeepSeek/MiniMax native and LiteLLM-normalized thinking stream; OpenRouter uses `reasoning` */
             reasoning_content?: string
             reasoning?: string
@@ -248,12 +267,22 @@ async function openAiCompatibleTurn(
     const choice = event.choices?.[0]
     if (!choice) continue
     const reasoning = choice.delta?.reasoning_content ?? choice.delta?.reasoning
-    if (typeof reasoning === 'string' && reasoning) cb.onReasoningDelta?.(reasoning)
-    if (choice.delta?.content) {
+    if (typeof reasoning === 'string' && reasoning) {
       emitted = true
-      cb.onDelta(choice.delta.content)
+      cb.onReasoningDelta?.(reasoning)
+    }
+    if (choice.delta?.content) {
+      // Same array-of-parts shape as the JSON body path above.
+      const text = openAiContentText(choice.delta.content)
+      if (text) {
+        emitted = true
+        cb.onDelta(text)
+      }
     }
     for (const tc of choice.delta?.tool_calls ?? []) {
+      if (!pendingTools.has(tc.index)) {
+        throwIfToolCountOverBudget(pendingTools.size + 1, 'openai-compatible')
+      }
       const pending = pendingTools.get(tc.index) ?? {
         id: tc.id ?? crypto.randomUUID(),
         name: '',
@@ -270,7 +299,10 @@ async function openAiCompatibleTurn(
           ? tc.function.name
           : pending.name + tc.function.name
       }
-      if (tc.function?.arguments) pending.json += tc.function.arguments
+      if (tc.function?.arguments) {
+        pending.json += tc.function.arguments
+        throwIfToolJsonOverBudget(pending.json.length, 'openai-compatible')
+      }
       pendingTools.set(tc.index, pending)
     }
     if (choice.finish_reason) {
@@ -288,11 +320,15 @@ async function openAiCompatibleTurn(
     if (broken.length > 0) {
       const received = broken.reduce((n, p) => n + p.json.length, 0)
       throw new Error(
-        `The model stream closed while sending tool arguments (${received} chars received); the connection was dropped`,
+        `The model stream closed while sending tool arguments (${received} chars received); the connection was dropped. ` +
+          'If this recurs on a large request (e.g. generating a whole document), ask for the output in several smaller parts.',
       )
     }
   }
   flushTools()
+  if (!sawFinish && !sawDone && emitted) {
+    throw new Error('The model stream ended before a finish_reason or [DONE] marker')
+  }
   // e.g. finish_reason=content_filter with no output, or a stream with no
   // message framing at all (gateway soft-failure) — surface both instead of an
   // empty success; a genuine empty turn still carries finish_reason=stop
@@ -313,13 +349,14 @@ export async function chatOpenAiCompatible(
   user: string,
   options: OpenAiRequestOptions = {},
 ): Promise<AiChatResponse> {
-  const response = await aiFetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
+  const response = await aiFetch(endpointUrl(baseUrl, 'chat/completions'), {
     method: 'POST',
     signal: wd.signal,
     headers: {
       'Content-Type': 'application/json',
       ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}),
       ...gensparkAttributionHeaders(baseUrl),
+      ...opencodeSessionHeaders(baseUrl),
     },
     body: JSON.stringify({
       model: config.model,
@@ -333,12 +370,15 @@ export async function chatOpenAiCompatible(
   })
   wd.touch()
   if (!response.ok) {
-    return { ok: false, error: `HTTP ${response.status}: ${httpBodyDetail(await response.text())}` }
+    return {
+      ok: false,
+      error: `HTTP ${response.status}: ${httpBodyDetail(await readCappedResponseText(response, () => wd.touch()))}`,
+    }
   }
   // A 200 with an HTML shell / empty / truncated body (gateway soft-failure)
   // would make response.json() throw; return ok:false instead of leaking a
   // raw SyntaxError to the caller.
-  const bodyText = await response.text()
+  const bodyText = await readCappedResponseText(response, () => wd.touch())
   let json: { choices?: Array<{ message?: { content?: string } }> }
   try {
     json = JSON.parse(bodyText) as { choices?: Array<{ message?: { content?: string } }> }

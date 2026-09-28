@@ -126,7 +126,6 @@ export const cs = {
   appMoreItems: '+{count} dalších…',
   appTruncationNote: 'Prvních {shown} z {total}',
   appGoToButtonTitle: 'Přejít na (⌘G)',
-  appNameBoxTitle: 'Pole názvů — zadejte adresu nebo název a stiskněte Enter',
   appPivotChartHintIn: 'Vytvořit kontingenční graf z aktuální kontingenční tabulky',
   appPivotChartHintOut:
     'Nejprve vyberte buňku ve výstupu kontingenční tabulky a pak zvolte typ grafu',
@@ -321,8 +320,6 @@ export const cs = {
     'Automatické vyplnění do oblasti, která se stále načítá, zatím není povoleno.',
   appDvNeedsIndexed:
     'Úprava ověření dat vyžaduje nejprve úplné indexování tohoto listu — zkuste to za chvíli znovu.',
-  appDuplicateNeedsFullLoad:
-    'Duplikování listu vyžaduje režim úplného načtení — tento sešit je příliš velký a načítá se po částech.',
   appPivotSheetNoDuplicate:
     'Tento list obsahuje kontingenční tabulku — jeho duplikování zatím není podporováno.',
   appDuplicateScopedNames:
@@ -495,6 +492,7 @@ export const cs = {
   appBridgeUnavailable:
     'Souborové rozhraní počítače není k dispozici. Restartujte aplikaci Electron.',
   appOpenCanceled: 'Výběr sešitu zrušen.',
+  appOpeningWorkbook: 'Otevírání sešitu…',
   appOpened: 'Otevřeno {name} — úpravy buněk se uloží zpět pomocí ⌘S.',
   appOpenFailed: 'Sešit nelze otevřít.',
   appPageSetupNeedsFile: 'Nejprve otevřete soubor XLSX — vzhled stránky se ukládá do souboru.',
@@ -530,6 +528,11 @@ export const cs = {
   appPdfCanceled: 'Export do PDF zrušen.',
   appPdfExported: 'Exportováno {path}.',
   appPdfExportFailed: 'PDF nelze exportovat.',
+  appPrintPreparing: 'Připravuje se tisk…',
+  appPrintSent: 'Odesláno na tiskárnu.',
+  appPrintCanceled: 'Tisk zrušen.',
+  appPrintFailed: 'Nelze tisknout.',
+  appPrintNeedsFullLoad: 'Tisk vyžaduje úplné načtení sešitu – počkejte na dokončení načítání.',
   appCsvExportNeedsFullLoad:
     'Export do CSV vyžaduje plně načtený sešit — počkejte na dokončení načítání.',
   appCsvExportTooLarge: 'List je příliš velký na export do CSV.',
@@ -622,6 +625,9 @@ export const cs = {
   appFullyLoaded: 'Sešit plně načten — vzorce se přepočítávají živě, řádky/sloupce lze upravovat.',
   appRangeMustBeVector: '{range} musí být jediný řádek nebo jediný sloupec buněk.',
   appRangeTooManyCells: '{range} pokrývá více než {max} buněk.',
+  appCopyLoadingRange: 'Načítání {range} pro kopírování…',
+  appCopyValuesOnly:
+    '{range} zkopírováno pouze jako hodnoty ({cells} buněk): styly se zachovávají jen do {max} buněk.',
   appSheetStillIndexing: 'List se stále indexuje — zkuste to za chvíli znovu.',
   appPrintNothing: 'Na listu není co tisknout.',
   appPrintTooLarge:
@@ -656,7 +662,7 @@ export const cs = {
   appTabData: 'Data',
   appTabReview: 'Revize',
   appRibbonCollapse: 'Sbalit pás karet',
-  appRibbonPin: 'Připnout pás karet',
+  appRibbonExpand: 'Rozbalit pás karet',
   appTabView: 'Zobrazení',
   appTabAi: 'AI',
   appTabChartDesign: 'Návrh grafu',
@@ -1316,6 +1322,8 @@ export const cs = {
   appFormatMenu: 'Formát',
   appRowHeight: 'Výška řádku',
   appColWidth: 'Šířka sloupce',
+  appAutoFitRowHeight: 'Přizpůsobit výšku řádku',
+  appAutoFitColWidth: 'Přizpůsobit šířku sloupce',
   appRowHeightLabel: 'Výška řádku (body)',
   appColWidthLabel: 'Šířka sloupce (znaky)',
   appDeleteRow: 'Odstranit řádek',

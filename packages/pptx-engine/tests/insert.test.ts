@@ -2,7 +2,15 @@ import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { openPptx, savePptx, addElement, addTable, deleteElement } from '../src/index'
+import {
+  openPptx,
+  savePptx,
+  addElement,
+  addTable,
+  deleteElement,
+  createBlankPptx,
+} from '../src/index'
+import { nextCNvPrId } from '../src/insert'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const fx = (name: string) => readFileSync(join(here, 'fixtures', name))
@@ -71,6 +79,31 @@ describe('add/delete element', () => {
     const b = addElement(slide, { kind: 'rect', offset: { ...OFF } })
     const idOf = (xml: string) => /<p:cNvPr\s[^>]*\bid="(\d+)"/.exec(xml)![1]
     expect(idOf(a.anchor.originalXml)).not.toBe(idOf(b.anchor.originalXml))
+  })
+
+  /**
+   * nextCNvPrId counted only double-quoted ids, so in a deck that single-quotes
+   * its attributes it saw none of them, returned a low id and minted a shape id
+   * that collided with an existing one.
+   */
+  it('counts single-quoted cNvPr ids so an insert cannot reuse one', async () => {
+    const opened = await openPptx(fx('01_standard_business.pptx'))
+    const slide = opened.deck.slides[0]!
+    const singleQuote = (xml: string) => xml.replace(/\bid="(\d+)"/g, "id='$1'")
+    slide.originalXml = singleQuote(slide.originalXml)
+    for (const el of slide.elements) el.anchor.originalXml = singleQuote(el.anchor.originalXml)
+    const maxId = Math.max(
+      ...[...slide.elements.map((e) => e.anchor.originalXml)].flatMap((xml) =>
+        [...xml.matchAll(/<p:cNvPr\s[^>]*\bid=["'](\d+)["']/g)].map((m) => Number(m[1])),
+      ),
+    )
+    expect(maxId).toBeGreaterThan(2)
+
+    expect(nextCNvPrId(slide)).toBe(maxId + 1)
+    const added = addElement(slide, { kind: 'rect', offset: { ...OFF } })
+    const newId = Number(/<p:cNvPr\s[^>]*\bid=["'](\d+)["']/.exec(added.anchor.originalXml)![1])
+    expect(newId).toBe(maxId + 1)
+    expect(newId).toBeGreaterThan(maxId)
   })
 
   it('delete element persists through save → reopen', async () => {
@@ -147,6 +180,31 @@ describe('insert-time shape options (genpptx parity)', () => {
     expect(grow.anchor.originalXml).toContain('anchor="ctr"><a:spAutoFit/></a:bodyPr>')
     expect(grow.text!.autofit).toBe('resize')
   })
+
+  it('click-to-type text box: wrap="none" + spAutoFit round-trips at the PowerPoint 14.5x29pt size', async () => {
+    const opened = await openPptx(fx('01_standard_business.pptx'))
+    const slide = opened.deck.slides[0]!
+    // PowerPoint for Mac drops a 14.5 x 29 pt empty box on click (1 pt = 12700 EMU)
+    const offset = { x: 914400, y: 914400, cx: 14.5 * 12700, cy: 29 * 12700 }
+    const el = addElement(slide, {
+      kind: 'textbox',
+      offset: { ...offset },
+      bodyPr: { wrap: 'none', autoFit: 'resize' },
+    })
+    expect(el.anchor.originalXml).toContain(
+      '<a:bodyPr wrap="none" rtlCol="0"><a:spAutoFit/></a:bodyPr>',
+    )
+    expect(el.text!.wrap).toBe(false)
+    expect(el.text!.autofit).toBe('resize')
+
+    const reopened = await openPptx(await savePptx(opened))
+    const slide2 = reopened.deck.slides[0]!
+    const el2: any = slide2.elements[slide2.elements.length - 1]
+    expect(el2.type).toBe('text')
+    expect(el2.transform.offset).toEqual(offset)
+    expect(el2.text.wrap).toBe(false)
+    expect(el2.text.autofit).toBe('resize')
+  })
 })
 
 describe('addTable explicit grid options (genpptx parity)', () => {
@@ -197,5 +255,56 @@ describe('addTable explicit grid options (genpptx parity)', () => {
     })!
     const el: any = opened.deck.slides[0]!.elements.find((e) => e.id === r.elementId)
     expect(el.anchor.originalXml).toContain('<a:gridCol w="1000000"/>'.repeat(3))
+  })
+
+  it('clamps hostile dims and spans instead of throwing or emitting NaN', async () => {
+    const opened = await openPptx(fx('01_standard_business.pptx'))
+    const start = Date.now()
+    const r = addTable(opened, 0, {
+      rows: NaN,
+      cols: Infinity,
+      offset: { x: 0, y: 0, cx: 3000000, cy: 1000000 },
+      cellProps: [[{ gridSpan: Infinity }]],
+    })!
+    expect(Date.now() - start).toBeLessThan(10000)
+    const xml = (opened.deck.slides[0]!.elements.find((e) => e.id === r.elementId) as any).anchor
+      .originalXml as string
+    expect(xml).not.toContain('NaN')
+    expect(xml).not.toContain('Infinity')
+    expect(xml.match(/<a:tr /g)?.length).toBeLessThanOrEqual(75)
+  })
+
+  it('clamps spans to the cells remaining right of / below the cell', async () => {
+    const opened = await openPptx(fx('01_standard_business.pptx'))
+    const r = addTable(opened, 0, {
+      rows: 2,
+      cols: 3,
+      offset: { x: 0, y: 0, cx: 3000000, cy: 1000000 },
+      cellProps: [[undefined, { gridSpan: 5 }, { gridSpan: 3, rowSpan: 4 }], [{ rowSpan: 2 }]],
+    })!
+    const xml = (opened.deck.slides[0]!.elements.find((e) => e.id === r.elementId) as any).anchor
+      .originalXml as string
+    expect(xml.match(/gridSpan="\d+"/g)).toEqual(['gridSpan="2"'])
+    expect(xml.match(/rowSpan="\d+"/g)).toEqual(['rowSpan="2"'])
+  })
+})
+
+describe('shape outline color', () => {
+  it('keeps an #RRGGBBAA stroke translucent like the fill', async () => {
+    const opened = await openPptx(await createBlankPptx())
+    const slide = opened.deck.slides[0]!
+    const el = addElement(slide, {
+      kind: 'rect',
+      offset: { x: 0, y: 0, cx: 914400, cy: 914400 },
+      fillColor: '#11223380',
+      stroke: { color: '#ff000080', widthEmu: 12700 },
+    })
+    const xml = el.anchor.originalXml
+    expect(xml).toContain(
+      '<a:solidFill><a:srgbClr val="112233"><a:alpha val="50196"/></a:srgbClr></a:solidFill>',
+    )
+    expect(xml).toContain(
+      '<a:ln w="12700"><a:solidFill><a:srgbClr val="FF0000"><a:alpha val="50196"/></a:srgbClr></a:solidFill></a:ln>',
+    )
   })
 })

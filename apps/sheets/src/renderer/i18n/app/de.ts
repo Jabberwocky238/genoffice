@@ -133,7 +133,6 @@ export const de = {
   appMoreItems: '+{count} weitere…',
   appTruncationNote: 'Erste {shown} von {total}',
   appGoToButtonTitle: 'Gehe zu (⌘G)',
-  appNameBoxTitle: 'Namenfeld — Adresse oder Namen eingeben, dann Eingabetaste drücken',
   appPivotChartHintIn: 'PivotChart aus der aktuellen PivotTable erstellen',
   appPivotChartHintOut:
     'Wählen Sie zuerst eine Zelle im PivotTable-Ausgabebereich aus, dann einen Diagrammtyp',
@@ -340,8 +339,6 @@ export const de = {
     'Automatisches Ausfüllen in einen noch per Streaming geladenen Bereich ist noch nicht erlaubt.',
   appDvNeedsIndexed:
     'Das Bearbeiten der Datenüberprüfung erfordert, dass dieses Blatt zuerst vollständig indiziert ist — versuchen Sie es gleich noch einmal.',
-  appDuplicateNeedsFullLoad:
-    'Das Duplizieren eines Blatts erfordert den Volllademodus — diese Arbeitsmappe ist zu groß und wird teilweise per Streaming geladen.',
   appPivotSheetNoDuplicate:
     'Dieses Blatt enthält eine PivotTable — sein Duplizieren wird noch nicht unterstützt.',
   appDuplicateScopedNames:
@@ -530,6 +527,7 @@ export const de = {
   appBridgeUnavailable:
     'Die Desktop-Dateibrücke ist nicht verfügbar. Starten Sie die Electron-App neu.',
   appOpenCanceled: 'Arbeitsmappenauswahl abgebrochen.',
+  appOpeningWorkbook: 'Arbeitsmappe wird geöffnet…',
   appOpened: '{name} geöffnet — Zellbearbeitungen werden mit ⌘S zurückgespeichert.',
   appOpenFailed: 'Die Arbeitsmappe kann nicht geöffnet werden.',
   appPageSetupNeedsFile:
@@ -567,6 +565,12 @@ export const de = {
   appPdfCanceled: 'PDF-Export abgebrochen.',
   appPdfExported: '{path} exportiert.',
   appPdfExportFailed: 'PDF kann nicht exportiert werden.',
+  appPrintPreparing: 'Druck wird vorbereitet…',
+  appPrintSent: 'An den Drucker gesendet.',
+  appPrintCanceled: 'Drucken abgebrochen.',
+  appPrintFailed: 'Drucken nicht möglich.',
+  appPrintNeedsFullLoad:
+    'Zum Drucken muss die Arbeitsmappe vollständig geladen sein – bitte warten Sie, bis der Ladevorgang abgeschlossen ist.',
   appCsvExportNeedsFullLoad:
     'Der CSV-Export erfordert die vollständig geladene Arbeitsmappe — warten Sie, bis das Laden abgeschlossen ist.',
   appCsvExportTooLarge: 'Das Blatt ist zu groß für den CSV-Export.',
@@ -666,6 +670,9 @@ export const de = {
   appRangeMustBeVector:
     '{range} muss eine einzelne Zeile oder eine einzelne Spalte von Zellen sein.',
   appRangeTooManyCells: '{range} umfasst mehr als {max} Zellen.',
+  appCopyLoadingRange: '{range} wird zum Kopieren geladen…',
+  appCopyValuesOnly:
+    '{range} nur als Werte kopiert ({cells} Zellen): Formate bleiben nur bis {max} Zellen erhalten.',
   appSheetStillIndexing: 'Das Blatt wird noch indiziert — versuchen Sie es gleich noch einmal.',
   appPrintNothing: 'Das Blatt enthält nichts zu drucken.',
   appPrintTooLarge:
@@ -701,7 +708,7 @@ export const de = {
   appTabData: 'Daten',
   appTabReview: 'Überprüfen',
   appRibbonCollapse: 'Menüband reduzieren',
-  appRibbonPin: 'Menüband anheften',
+  appRibbonExpand: 'Menüband erweitern',
   appTabView: 'Ansicht',
   appTabAi: 'KI',
   appTabChartDesign: 'Diagrammentwurf',
@@ -1362,6 +1369,8 @@ export const de = {
   appFormatMenu: 'Format',
   appRowHeight: 'Zeilenhöhe',
   appColWidth: 'Spaltenbreite',
+  appAutoFitRowHeight: 'Zeilenhöhe automatisch anpassen',
+  appAutoFitColWidth: 'Spaltenbreite automatisch anpassen',
   appRowHeightLabel: 'Zeilenhöhe (Punkt)',
   appColWidthLabel: 'Spaltenbreite (Zeichen)',
   appDeleteRow: 'Zeile löschen',

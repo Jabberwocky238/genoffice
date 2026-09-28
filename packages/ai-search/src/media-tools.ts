@@ -20,12 +20,14 @@ import {
   type LegacyAiSettings,
   type MediaBlob,
 } from '@genoffice/ai-provider'
+// deep imports: the package root re-exports Electron-bound modules, and this file also runs in the genoffice CLI
+import { readGeneratedImage, storeGeneratedImage } from '@genoffice/electron-utils/generated-images'
 import {
+  ResponseTooLargeError,
   fetchRemoteImage,
-  fetchWithSsrfGuard,
-  readGeneratedImage,
-  storeGeneratedImage,
-} from '@genoffice/electron-utils'
+  readBodyCapped,
+} from '@genoffice/electron-utils/remote-image'
+import { fetchWithSsrfGuard } from '@genoffice/electron-utils/safe-remote-url'
 import { gskAnalyzeMedia, gskGenerateImage, hasGskAuth, type GskGenerateImageOptions } from './gsk'
 
 export const GSK_NOT_LOGGED_IN_ERROR =
@@ -36,8 +38,39 @@ export const GSK_TOOLS_OFF_ERROR =
 /** 200 MB: enough for a long clip through the Gemini Files API, small enough to hold in memory */
 const MAX_MEDIA_BYTES = 200 * 1024 * 1024
 
+/** Per-request ceiling across every reference of one tool call: MAX_MEDIA_BYTES bounds a single
+ *  item, and without a total the same cap could be multiplied by the item count. */
+const MAX_MEDIA_TOTAL_BYTES = 200 * 1024 * 1024
+
+/** Per-request item ceiling: a media tool call is a handful of references, never a data dump. */
+const MAX_MEDIA_ITEMS = 12
+
+/** How many references are decoded at once, so peak memory is a small multiple of the total cap
+ *  rather than the whole request. */
+const MEDIA_LOAD_CONCURRENCY = 3
+
+/** The production budget, exported so callers and tests can reason about the ceilings. */
+export const MEDIA_BUDGET = {
+  maxItems: MAX_MEDIA_ITEMS,
+  maxItemBytes: MAX_MEDIA_BYTES,
+  maxTotalBytes: MAX_MEDIA_TOTAL_BYTES,
+  concurrency: MEDIA_LOAD_CONCURRENCY,
+} as const
+
 /** the only load failure that may hand the request back to Genspark; validation failures never do */
 export class MediaTooLargeError extends Error {}
+
+/** Subclasses MediaTooLargeError so the existing "too big, try Genspark" fallback applies. */
+export class MediaBudgetExceededError extends MediaTooLargeError {}
+
+/** The item ceiling in one place, so the Genspark route rejects like the BYOK one. */
+function assertMediaItemCount(count: number, maxItems: number): void {
+  if (count > maxItems) {
+    throw new MediaBudgetExceededError(
+      `Too many media items in one request (${count}, limit ${maxItems}); analyze them in smaller batches`,
+    )
+  }
+}
 
 const MIME_BY_EXT: Record<string, string> = {
   '.png': 'image/png',
@@ -58,6 +91,18 @@ const MIME_BY_EXT: Record<string, string> = {
   '.aac': 'audio/aac',
   '.ogg': 'audio/ogg',
   '.flac': 'audio/flac',
+}
+
+const DATA_URL_RE = /^data:([^;,]+);base64,([\s\S]*)$/
+
+/** Decoded size a data URL will produce, computed from the base64 length alone so the check runs
+ *  before anything is allocated. Whitespace inside the payload only inflates the estimate. */
+function dataUrlDecodedSize(ref: string): number {
+  if (!ref.startsWith('data:')) return 0
+  const match = DATA_URL_RE.exec(ref)
+  if (!match) return 0
+  const b64 = match[2] ?? ''
+  return Math.floor((b64.length * 3) / 4)
 }
 
 export function readAiSettingsFile(path: string): AiSettings {
@@ -95,18 +140,33 @@ export async function loadMediaReference(ref: string): Promise<MediaBlob> {
       ? fetchRemoteImage(ref)
       : fetchWithSsrfGuard(ref, { headers: { 'User-Agent': 'Mozilla/5.0' } }))
     if (!resp || !resp.ok) throw new Error(`Could not download ${ref}`)
-    const declared = Number(resp.headers.get('content-length') ?? 0)
-    if (declared > MAX_MEDIA_BYTES) throw new MediaTooLargeError(`${ref} is too large to analyze`)
-    const bytes = new Uint8Array(await resp.arrayBuffer())
-    if (bytes.byteLength > MAX_MEDIA_BYTES) {
-      throw new MediaTooLargeError(`${ref} is too large to analyze`)
+    let bytes: Uint8Array
+    try {
+      bytes = await readBodyCapped(resp, MAX_MEDIA_BYTES)
+    } catch (err) {
+      if (err instanceof ResponseTooLargeError) {
+        throw new MediaTooLargeError(`${ref} is too large to analyze`)
+      }
+      throw err
     }
-    const ct = resp.headers.get('content-type')?.split(';')[0]?.trim()
+    const rawCt = resp.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase()
+    const ct = rawCt && rawCt !== 'application/octet-stream' ? rawCt : undefined
     const name = basename(new URL(ref).pathname) || undefined
     const mime =
       ct && ct !== 'application/octet-stream' ? ct : MIME_BY_EXT[extname(name ?? '').toLowerCase()]
     if (!mime) throw new Error(`Could not tell the media type of ${ref}`)
     return { bytes, mime, ...(name ? { name } : {}) }
+  }
+  // data URLs (pictures embedded in a document) carry their own bytes and type
+  if (ref.startsWith('data:')) {
+    const m = DATA_URL_RE.exec(ref)
+    if (!m) throw new Error('Unsupported data URL: only base64-encoded media can be analyzed')
+    const [, mime = '', b64 = ''] = m
+    const bytes = new Uint8Array(Buffer.from(b64.replace(/\s+/g, ''), 'base64'))
+    if (bytes.byteLength > MAX_MEDIA_BYTES) {
+      throw new MediaTooLargeError('data URL is too large to analyze')
+    }
+    return { bytes, mime: mime.toLowerCase() }
   }
   if (ref.startsWith('file:')) {
     const local = readGeneratedImage(ref)
@@ -127,9 +187,73 @@ export interface MediaToolOptions {
   notLoggedInError?: string
 }
 
+export interface MediaBudget {
+  maxItems?: number
+  maxItemBytes?: number
+  maxTotalBytes?: number
+  concurrency?: number
+}
+
+/**
+ * Load a tool call's references under a total byte budget and an item cap. Encoded data URLs are
+ * measured before they are decoded, the references are loaded with bounded concurrency, and the
+ * running total is re-checked as each one lands, so a request can no longer hold N times the
+ * per-file cap in memory at once.
+ */
+export async function loadMediaReferences(
+  refs: readonly string[],
+  budget: MediaBudget = MEDIA_BUDGET,
+): Promise<MediaBlob[]> {
+  const maxItems = budget.maxItems ?? MAX_MEDIA_ITEMS
+  const maxItemBytes = budget.maxItemBytes ?? MAX_MEDIA_BYTES
+  const maxTotalBytes = budget.maxTotalBytes ?? MAX_MEDIA_TOTAL_BYTES
+  const concurrency = Math.max(1, budget.concurrency ?? MEDIA_LOAD_CONCURRENCY)
+  assertMediaItemCount(refs.length, maxItems)
+  const declared = refs.map(dataUrlDecodedSize)
+  for (const bytes of declared) {
+    if (bytes > maxItemBytes) {
+      throw new MediaTooLargeError(`data URL is too large to analyze (limit ${maxItemBytes} bytes)`)
+    }
+  }
+  const declaredTotal = declared.reduce((n, bytes) => n + bytes, 0)
+  if (declaredTotal > maxTotalBytes) {
+    throw new MediaBudgetExceededError(
+      `Media in one request is too large to analyze (${declaredTotal} bytes, limit ${maxTotalBytes}); analyze it in smaller batches`,
+    )
+  }
+  const blobs: MediaBlob[] = new Array(refs.length)
+  let next = 0
+  let landed = 0
+  const worker = async (): Promise<void> => {
+    while (next < refs.length) {
+      const index = next++
+      const blob = await loadMediaReference(refs[index]!)
+      landed += blob.bytes.byteLength
+      if (landed > maxTotalBytes) {
+        throw new MediaBudgetExceededError(
+          `Media in one request is too large to analyze (over ${maxTotalBytes} bytes); analyze it in smaller batches`,
+        )
+      }
+      blobs[index] = blob
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, refs.length) }, () => worker()))
+  return blobs
+}
+
+/** Genspark background-removal model — chained after generation for transparentBackground */
+export const GSK_RMBG_MODEL = 'fal-bria-rmbg'
+
+export type GenerateImageToolOp = GskGenerateImageOptions & {
+  /** The result must have real PNG alpha (icons/logos/cutouts). Generation models cannot
+   * produce transparency from the prompt alone — they paint a fake gray checkerboard into
+   * the pixels — so the tool strips the background in a second pass instead. */
+  transparentBackground?: boolean
+}
+
 export async function generateImageTool(
   settingsPath: string,
-  op: GskGenerateImageOptions,
+  op: GenerateImageToolOp,
   options: MediaToolOptions = {},
 ): Promise<{ url?: string; error?: string }> {
   const prompt = String(op.prompt ?? '').trim()
@@ -140,14 +264,29 @@ export async function generateImageTool(
     if (!byok) {
       const gate = gskGate(settings, options.notLoggedInError ?? GSK_NOT_LOGGED_IN_ERROR)
       if (gate) return gate
-      return { url: (await gskGenerateImage({ ...op, prompt })).url }
+      // gskGenerateImage hands the references straight to the CLI argv, so this route
+      // enforces the same item ceiling as the BYOK one instead of passing them on
+      assertMediaItemCount(op.referenceImageUrls?.length ?? 0, MEDIA_BUDGET.maxItems)
+      const gen = await gskGenerateImage({ ...op, prompt })
+      if (!op.transparentBackground || op.model === GSK_RMBG_MODEL) return { url: gen.url }
+      try {
+        const cut = await gskGenerateImage({
+          prompt: 'remove the background completely, keep only the subject',
+          model: GSK_RMBG_MODEL,
+          referenceImageUrls: [gen.url],
+        })
+        return { url: cut.url }
+      } catch {
+        return { url: gen.url } // strip failed: the opaque image is still usable
+      }
     }
     // `model` names Genspark-only special models (fal-*); BYOK uses the configured image model
-    const references = await Promise.all((op.referenceImageUrls ?? []).map(loadMediaReference))
+    const references = await loadMediaReferences(op.referenceImageUrls ?? [])
     const image = await generateImageWithProvider(byok.provider, byok.config, {
       prompt,
       aspectRatio: op.aspectRatio,
       references,
+      transparent: op.transparentBackground === true,
     })
     return { url: storeGeneratedImage(image.bytes, image.mime) }
   } catch (err) {
@@ -178,7 +317,7 @@ export async function analyzeMediaTool(
     // image-analysis provider, anything with video/audio to the video one
     let media: MediaBlob[]
     try {
-      media = await Promise.all(mediaUrls.map(loadMediaReference))
+      media = await loadMediaReferences(mediaUrls)
     } catch (err) {
       // only the size cap hands the request back to Genspark (the CLI streams large
       // files itself); scheme / path / SSRF rejections stay rejections

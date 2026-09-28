@@ -135,6 +135,7 @@ export const ru = {
   aiClarifyOther: 'Другое (впишите свой вариант)',
   aiClarifySkip: 'Пропустить опрос',
   aiClarifyNext: 'Далее',
+  aiClarifyPrev: 'Назад',
   aiClarifySubmit: 'Сгенерировать',
   aiSumReadAttachment: 'Чтение вложения',
   aiSumReadAttachmentName: 'Чтение вложения {name}',
@@ -223,4 +224,5 @@ export const ru = {
   aiSumSaveTemplate: 'Сохранён шаблон стиля «{name}»',
   aiSumTemplatesEmpty: 'Шаблоны стиля (пусто)',
   aiSumListTemplates: 'Показано шаблонов стиля: {count}',
+  aiPageCloudToLocal: 'Облако недоступно — создано локально',
 } satisfies Record<keyof typeof zh, string>

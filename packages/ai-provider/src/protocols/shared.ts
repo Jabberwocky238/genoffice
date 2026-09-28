@@ -1,6 +1,74 @@
 import type { AgentToolCall } from '@genoffice/agent-core'
 
+// ---- endpoint URL composition ----
+
+/**
+ * Append a provider endpoint path to a base URL without string concatenation.
+ *
+ * A custom base URL may carry a query string (Azure-style `?api-version=…`,
+ * gateways that pin a version) and a fragment. Concatenating would push the
+ * path into the query component, so the request 404s or lands on the wrong
+ * route. Setting `pathname` keeps the query in place and the fragment is
+ * dropped — it is never sent to the server anyway.
+ */
+export function endpointUrl(baseUrl: string, path: string, search?: string): string {
+  const url = new URL(baseUrl)
+  const base = url.pathname.replace(/\/+$/, '')
+  const suffix = path.replace(/^\/+/, '')
+  url.pathname = suffix ? `${base}/${suffix}` : base
+  url.hash = ''
+  if (search !== undefined) url.search = search
+  return url.toString()
+}
+
 // ---- streaming (SSE line splitting shared by all providers) ----
+
+/** Max buffered SSE line: a gateway sending GB without newline would OOM main. */
+export const MAX_SSE_LINE_BYTES = 4 * 1024 * 1024
+export const MAX_RESPONSE_BODY_BYTES = MAX_SSE_LINE_BYTES
+
+export class ResponseBodyTooLargeError extends Error {
+  constructor(
+    readonly receivedBytes: number,
+    readonly capBytes: number,
+  ) {
+    super(`Response body exceeded the ${capBytes}-byte limit (${receivedBytes} bytes)`)
+    this.name = 'ResponseBodyTooLargeError'
+  }
+}
+
+export async function readCappedResponseText(
+  response: Response,
+  onBytes?: () => void,
+): Promise<string> {
+  const declaredBytes = Number(response.headers.get('content-length'))
+  if (Number.isFinite(declaredBytes) && declaredBytes > MAX_RESPONSE_BODY_BYTES) {
+    if (response.body) await response.body.cancel().catch(() => undefined)
+    throw new ResponseBodyTooLargeError(declaredBytes, MAX_RESPONSE_BODY_BYTES)
+  }
+  if (!response.body) return ''
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let text = ''
+  let bytes = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      onBytes?.()
+      bytes += value.byteLength
+      if (bytes > MAX_RESPONSE_BODY_BYTES) {
+        throw new ResponseBodyTooLargeError(bytes, MAX_RESPONSE_BODY_BYTES)
+      }
+      text += decoder.decode(value, { stream: true })
+    }
+    return text + decoder.decode()
+  } finally {
+    await reader.cancel().catch(() => undefined)
+    reader.releaseLock()
+  }
+}
 
 export async function* sseLines(
   body: NodeJS.ReadableStream | ReadableStream<Uint8Array>,
@@ -8,6 +76,7 @@ export async function* sseLines(
 ): AsyncGenerator<string> {
   const decoder = new TextDecoder()
   let buffer = ''
+  let lineBytes = 0
   const stream = body as ReadableStream<Uint8Array>
   const reader = stream.getReader()
   try {
@@ -15,11 +84,28 @@ export async function* sseLines(
       const { done, value } = await reader.read()
       if (done) break
       onBytes?.()
+      for (const byte of value) {
+        if (byte === 0x0a) {
+          lineBytes = 0
+          continue
+        }
+        lineBytes++
+        if (lineBytes > MAX_SSE_LINE_BYTES) {
+          throw new Error(
+            `SSE line exceeded buffer limit (${lineBytes} bytes, cap ${MAX_SSE_LINE_BYTES}); the gateway sent a line without newline.`,
+          )
+        }
+      }
       buffer += decoder.decode(value, { stream: true })
       const lines = buffer.split('\n')
       buffer = lines.pop() ?? ''
       for (const line of lines) yield line
     }
+    // Flush the decoder: bytes of a multibyte char still buffered inside
+    // TextDecoder under { stream: true } are discarded without a final
+    // decode() — a stream cut mid-char (dropped connection) would lose its
+    // tail silently instead of surfacing the standard replacement mark.
+    buffer += decoder.decode()
     if (buffer) yield buffer
   } finally {
     // The consumer may abandon this generator mid-stream (an in-band gateway
@@ -28,6 +114,39 @@ export async function* sseLines(
     // returned to the pool until GC nondeterministically finalizes it.
     await reader.cancel().catch(() => undefined)
     reader.releaseLock()
+  }
+}
+
+/**
+ * Per-tool streamed argument buffer cap: a provider streaming argument
+ * fragments forever (never finishing) would otherwise grow the pending
+ * tool-call buffer without bound. Throwing aborts the turn; sseLines
+ * cancels the underlying stream on the way out.
+ */
+export const MAX_TOOL_JSON_CHARS = 512_000
+
+export function throwIfToolJsonOverBudget(jsonLength: number, provider: string): void {
+  if (jsonLength > MAX_TOOL_JSON_CHARS) {
+    throw new Error(
+      `Tool call arguments exceeded the ${provider} buffer limit (${jsonLength} chars, cap ${MAX_TOOL_JSON_CHARS}); ` +
+        'the provider kept streaming argument fragments without finishing. Ask for the output in several smaller parts.',
+    )
+  }
+}
+
+/**
+ * Max tool calls started per streamed turn: per-argument bytes are capped
+ * above, but a gateway could still stream 100k near-empty tool_use blocks
+ * and grow the completed-call list without bound.
+ */
+export const MAX_STREAM_TOOL_CALLS = 100
+
+export function throwIfToolCountOverBudget(count: number, provider: string): void {
+  if (count > MAX_STREAM_TOOL_CALLS) {
+    throw new Error(
+      `Too many streamed tool calls (${count}, cap ${MAX_STREAM_TOOL_CALLS}) for ${provider}; ` +
+        'the provider kept starting tool calls without finishing the turn.',
+    )
   }
 }
 
@@ -107,9 +226,14 @@ export function sseErrorText(error: unknown, fallback: string): string {
  * parser would find no `data:` lines in such a body and dissolve it into an empty
  * "successful" turn. Returns the body text when that happens, else null.
  */
-export async function jsonBodyInsteadOfSse(response: Response): Promise<string | null> {
+export async function jsonBodyInsteadOfSse(
+  response: Response,
+  onBytes?: () => void,
+): Promise<string | null> {
   const contentType = response.headers.get('content-type') ?? ''
-  return contentType.toLowerCase().includes('application/json') ? await response.text() : null
+  return contentType.toLowerCase().includes('application/json')
+    ? readCappedResponseText(response, onBytes)
+    : null
 }
 
 /**
@@ -156,14 +280,23 @@ export function throwIfCreditsNotice(bodyText: string): void {
 /** Don't throw on parse failure (it would kill the whole stream); return error so the loop feeds it back for retry */
 export function parseToolInput(json: string): { input: Record<string, unknown>; error?: string } {
   if (!json.trim()) return { input: {} }
+  let parsed: unknown
   try {
-    return { input: JSON.parse(json) as Record<string, unknown> }
+    parsed = JSON.parse(json)
   } catch (e) {
     try {
-      return { input: JSON.parse(repairUnescapedQuotes(json)) as Record<string, unknown> }
+      parsed = JSON.parse(repairUnescapedQuotes(json))
     } catch {
       const msg = e instanceof Error ? e.message : String(e)
       return { input: {}, error: `${msg}; raw: ${json.slice(0, 500)}` }
     }
   }
+  if (!isPlainObject(parsed)) {
+    return { input: {}, error: `tool input must be a JSON object; raw: ${json.slice(0, 500)}` }
+  }
+  return { input: parsed }
+}
+
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import {
   gskChildEnv,
   setGskProxyUrl,
@@ -9,7 +9,11 @@ import {
   parseGskPastProjects,
   extractGskText,
   parseToolCliNdjson,
+  gskSlideGenerate,
+  MAX_SLIDE_ARTIFACT_BYTES,
+  MAX_TOOL_CLI_NDJSON_BYTES,
 } from '../src/gsk'
+import { ResponseTooLargeError } from '@genoffice/electron-utils/remote-image'
 
 describe('parseGskOutput', () => {
   it('parses clean JSON', () => {
@@ -24,6 +28,22 @@ describe('parseGskOutput', () => {
   it('parses multi-line JSON after noise', () => {
     const out = '[INFO] x\n{\n "a": 1\n}'
     expect(parseGskOutput(out)).toEqual({ a: 1 })
+  })
+
+  it('skips trailing log lines after JSON', () => {
+    const out = '{"status":"ok","data":[1,2]}\n[INFO] done in 120ms'
+    expect(parseGskOutput(out)).toEqual({ status: 'ok', data: [1, 2] })
+  })
+
+  it('parses multi-line JSON surrounded by leading and trailing noise', () => {
+    const out =
+      '[INFO] Calling /tools...\n{\n "a": 1,\n "b": [1, 2]\n}\n[INFO] cache hit\n[INFO] done'
+    expect(parseGskOutput(out)).toEqual({ a: 1, b: [1, 2] })
+  })
+
+  it('returns the root of a pretty-printed array followed by logs', () => {
+    const out = '{\n  "items": [\n    { "id": 1 },\n    { "id": 2 }\n  ]\n}\n[INFO] done'
+    expect(parseGskOutput(out)).toEqual({ items: [{ id: 1 }, { id: 2 }] })
   })
 
   it('throws when no JSON present', () => {
@@ -105,6 +125,17 @@ describe('parseGskWebSearch', () => {
   it('tolerates missing data', () => {
     expect(parseGskWebSearch({ status: 'ok' }, 5).results).toEqual([])
   })
+
+  it('clamps maxResults and truncates long fields', () => {
+    const big = 'x'.repeat(5000)
+    const raw = {
+      data: { organic_results: [{ title: big, link: 'https://a.com', snippet: big }] },
+    }
+    const r = parseGskWebSearch(raw, 1e9)
+    expect(r.results).toHaveLength(1)
+    expect(r.results[0]!.snippet.length).toBeLessThanOrEqual(2000)
+    expect(parseGskWebSearch(raw, NaN).results).toHaveLength(1)
+  })
 })
 
 describe('parseGskImageSearch', () => {
@@ -145,6 +176,18 @@ describe('parseGskImageSearch', () => {
     }
     const images = parseGskImageSearch(raw, 8)
     expect(images.map((i) => i.title)).toEqual(['ok'])
+  })
+
+  it('keeps benign images whose path or query merely mentions a stock host', () => {
+    const raw = {
+      data: [
+        { image_url: 'https://cdn.example.com/shutterstock-review.png', title: 'review' },
+        { image_url: 'https://img.example.com/a.jpg?ref=shutterstock', title: 'query' },
+        { image_url: 'https://media.gettyimages.com/x.jpg', title: 'blocked' },
+      ],
+    }
+    const images = parseGskImageSearch(raw, 8)
+    expect(images.map((i) => i.title)).toEqual(['review', 'query'])
   })
 })
 
@@ -266,6 +309,117 @@ describe('extractGskText', () => {
 
   it('stringifies unknown shapes', () => {
     expect(extractGskText({ data: { foo: 1 } })).toBe('{"foo":1}')
+  })
+})
+
+describe('gskSlideGenerate response caps', () => {
+  const originalApiKey = process.env.GSK_API_KEY
+  const slideResult = JSON.stringify({
+    status: 'ok',
+    data: { pptx_url: 'https://www.genspark.ai/api/files/deck.pptx', model: 'claude-opus-4-7' },
+  })
+  const downloadResult = JSON.stringify({
+    status: 'ok',
+    data: { download_url: 'https://cdn.example/deck.pptx' },
+  })
+
+  function stubSlideGenerate(artifact: () => Response) {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(ndjsonResponse(slideResult))
+      .mockResolvedValueOnce(ndjsonResponse(downloadResult))
+      .mockImplementationOnce(() => Promise.resolve(artifact()))
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
+
+  function ndjsonResponse(payload: string, contentLength?: number): Response {
+    return new Response(payload, {
+      status: 200,
+      headers: {
+        'content-type': 'application/x-ndjson',
+        ...(contentLength === undefined ? {} : { 'content-length': String(contentLength) }),
+      },
+    })
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    if (originalApiKey === undefined) delete process.env.GSK_API_KEY
+    else process.env.GSK_API_KEY = originalApiKey
+  })
+
+  it('returns the downloaded slide bytes within both caps', async () => {
+    process.env.GSK_API_KEY = 'test-key'
+    stubSlideGenerate(() => new Response(new Uint8Array([1, 2, 3, 4])))
+    await expect(gskSlideGenerate({ brief: 'a title slide' })).resolves.toEqual({
+      bytes: new Uint8Array([1, 2, 3, 4]),
+      model: 'claude-opus-4-7',
+    })
+  })
+
+  it('refuses a tool_cli NDJSON body that declares more than the NDJSON cap', async () => {
+    process.env.GSK_API_KEY = 'test-key'
+    let cancelled = false
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelled = true
+      },
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(body, {
+          status: 200,
+          headers: {
+            'content-type': 'application/x-ndjson',
+            'content-length': String(MAX_TOOL_CLI_NDJSON_BYTES + 1),
+          },
+        }),
+      ),
+    )
+    await expect(gskSlideGenerate({ brief: 'a title slide' })).rejects.toBeInstanceOf(
+      ResponseTooLargeError,
+    )
+    expect(cancelled).toBe(true)
+  })
+
+  it('refuses a chunked tool_cli NDJSON body that streams past the NDJSON cap', async () => {
+    process.env.GSK_API_KEY = 'test-key'
+    const chunk = new Uint8Array(1024 * 1024)
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let i = 0; i <= MAX_TOOL_CLI_NDJSON_BYTES / chunk.byteLength; i++) {
+          controller.enqueue(chunk)
+        }
+        controller.close()
+      },
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(body, { status: 200, headers: { 'content-type': 'application/x-ndjson' } }),
+        ),
+    )
+    await expect(gskSlideGenerate({ brief: 'a title slide' })).rejects.toThrow(
+      /response larger than 8 MB/,
+    )
+  })
+
+  it('refuses a slide artifact download larger than the artifact cap', async () => {
+    process.env.GSK_API_KEY = 'test-key'
+    stubSlideGenerate(
+      () =>
+        new Response(new Uint8Array([1, 2, 3]), {
+          status: 200,
+          headers: { 'content-length': String(MAX_SLIDE_ARTIFACT_BYTES + 1) },
+        }),
+    )
+    await expect(gskSlideGenerate({ brief: 'a title slide' })).rejects.toBeInstanceOf(
+      ResponseTooLargeError,
+    )
   })
 })
 

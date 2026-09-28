@@ -10,8 +10,16 @@ export default defineConfig({
   resolve: {
     alias: {
       '@genoffice/word-parser-extension': local('./src/renderer/extensions/word-parser.ts'),
+      '@genoffice/docx-engine/lazy-media': local('../../packages/docx-engine/src/lazy-media.ts'),
       '@genoffice/docx-engine': local('../../packages/docx-engine/src/index.ts'),
       '@genoffice/font-metrics': local('../../packages/font-metrics/src/index.ts'),
+      // subpath before the bare name: string aliases are prefix replacements
+      '@genoffice/electron-utils/headless-export': local(
+        '../../packages/electron-utils/src/headless-export.ts',
+      ),
+      '@genoffice/electron-utils/atomic-write': local(
+        '../../packages/electron-utils/src/atomic-write.ts',
+      ),
       '@genoffice/electron-utils': local('../../packages/electron-utils/src/index.ts'),
       '@genoffice/ai-provider/browser': local('../../packages/ai-provider/src/browser.ts'),
       '@genoffice/ai-provider': local('../../packages/ai-provider/src/index.ts'),

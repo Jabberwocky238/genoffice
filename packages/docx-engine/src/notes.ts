@@ -1,5 +1,6 @@
+import { decodeEntities } from './parse-xml-text'
 import { patchParagraphTexts } from './text-patch'
-import type { NoteInfo, NoteRun } from './types'
+import type { NoteInfo, NoteRun, TextOutline } from './types'
 import { escapeXmlAttr, escapeXmlText } from './xml-utils'
 
 /**
@@ -82,7 +83,8 @@ export function parseNotesXml(xml: string, kind: NoteKind): NoteInfo[] {
           r.color ||
           r.sizeHalfPoints ||
           r.caps ||
-          r.fontAscii,
+          r.fontAscii ||
+          r.textOutline,
       ),
     )
     const styleId = /<w:pStyle w:val="([^"]+)"/.exec(entryXml)?.[1]
@@ -95,6 +97,7 @@ export function parseNotesXml(xml: string, kind: NoteKind): NoteInfo[] {
       text,
       ...(hasFormat ? { richParas } : {}),
       ...(styleId ? { styleId } : {}),
+      ...(/ADDIN\s+(?:ZOTERO_|CSL_)/.test(entryXml) ? { zoteroField: true as const } : {}),
       ...(spacing ? { spacing } : {}),
       ...(noRefMark ? { noRefMark: true as const } : {}),
     }
@@ -126,10 +129,14 @@ function noteDirectSpacing(entryXml: string): NoteInfo['spacing'] {
 /** Display runs per paragraph (bold/italic/underline/strike, color, size); the footnote self-reference mark run is skipped */
 function noteRichParas(entryXml: string): NoteRun[][] {
   const out: NoteRun[][] = []
-  const pRe = /<w:p[\s>][\s\S]*?<\/w:p>|<w:p\/>/g
+  // the self-closing form first: the open-to-close alternative would swallow it
+  const pRe = /<w:p(?:\s[^>]*)?\/>|<w:p[\s>][\s\S]*?<\/w:p>/g
   let p: RegExpExecArray | null
   const flag = (rPr: string, tag: string) =>
-    new RegExp(`<w:${tag}(?:\\s*/>|\\s(?![^>]*w:val="(?:0|false|none)")[^>]*/>)`).test(rPr)
+    new RegExp(
+      `<w:${tag}(?:\\s*/>|\\s(?![^>]*w:val=(?:"(?:0|false|none|off)"|'(?:0|false|none|off)'))[^>]*/>)`,
+      'i',
+    ).test(rPr)
   while ((p = pRe.exec(entryXml)) !== null) {
     const runs: NoteRun[] = []
     const rRe = /<w:r(?:\s[^>]*)?>([\s\S]*?)<\/w:r>/g
@@ -157,6 +164,8 @@ function noteRichParas(entryXml: string): NoteRun[][] {
       if (fontAscii) run.fontAscii = fontAscii
       if (flag(rPr, 'caps')) run.caps = 'all'
       else if (flag(rPr, 'smallCaps')) run.caps = 'small'
+      const outline = noteTextOutline(rPr)
+      if (outline) run.textOutline = outline
       runs.push(run)
     }
     out.push(runs)
@@ -170,6 +179,22 @@ function noteRichParas(entryXml: string): NoteRun[][] {
   return out
 }
 
+/** w14:textOutline with a solid srgb fill (theme colours need the full parser) */
+function noteTextOutline(rPr: string): TextOutline | undefined {
+  const m = /<w14:textOutline\b([^>]*)>([\s\S]*?)<\/w14:textOutline>/.exec(rPr)
+  if (!m) return undefined
+  const widthEmu = parseInt(/\bw14:w="(\d+)"/.exec(m[1])?.[1] ?? '', 10)
+  const solid = /<w14:solidFill>([\s\S]*?)<\/w14:solidFill>/.exec(m[2])?.[1]
+  const color = solid && /<w14:srgbClr w14:val="([0-9A-Fa-f]{6})"/.exec(solid)?.[1]
+  if (!(widthEmu > 0) || !color) return undefined
+  const alphaRaw = parseInt(/<w14:alpha w14:val="(\d+)"/.exec(solid)?.[1] ?? '', 10)
+  return {
+    color: color.toUpperCase(),
+    widthPt: Math.round((widthEmu / 12700) * 100) / 100,
+    ...(alphaRaw >= 0 && alphaRaw < 100000 ? { alpha: alphaRaw / 100000 } : {}),
+  }
+}
+
 /** typeless (real) note entries with their exact XML slice + plain text */
 function noteEntriesOf(
   xml: string,
@@ -177,15 +202,18 @@ function noteEntriesOf(
 ): Array<{ id: string; text: string; xml: string }> {
   const out: Array<{ id: string; text: string; xml: string }> = []
   const entry = ENTRY[kind]
-  const re = new RegExp(`<${entry}(\\s[^>]*)?>([\\s\\S]*?)</${entry}>`, 'g')
+  // the attribute run must not end in "/" so a self-closing empty entry
+  // ("<w:footnote w:id="1"/>") is not read as an open tag over the next entry
+  const re = new RegExp(`<${entry}(\\s[^>]*[^/>])?>([\\s\\S]*?)</${entry}>`, 'g')
   let m: RegExpExecArray | null
   while ((m = re.exec(xml)) !== null) {
     const attrs = m[1] ?? ''
-    if (/w:type="/.test(attrs)) continue // separator / continuation entries
-    const id = /w:id="([^"]+)"/.exec(attrs)?.[1]
+    if (/w:type=(?:"[^"]*"|'[^']*')/.test(attrs)) continue // separator / continuation entries
+    const id = /w:id=(?:"([^"]+)"|'([^']+)')/.exec(attrs)?.slice(1, 3).find(Boolean)
     if (!id) continue
     const paras: string[] = []
-    const pRe = /<w:p[\s>][\s\S]*?<\/w:p>|<w:p\/>/g
+    // the self-closing form first: the open-to-close alternative would swallow it
+    const pRe = /<w:p(?:\s[^>]*)?\/>|<w:p[\s>][\s\S]*?<\/w:p>/g
     let p: RegExpExecArray | null
     while ((p = pRe.exec(m[2])) !== null) paras.push(notePlainText(p[0]))
     // the first paragraph starts with the self-reference mark + a spacer
@@ -200,13 +228,7 @@ function notePlainText(xml: string): string {
   const re = /<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g
   let m: RegExpExecArray | null
   while ((m = re.exec(xml)) !== null) texts.push(m[1])
-  return texts
-    .join('')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&amp;/g, '&')
+  return decodeEntities(texts.join(''))
 }
 
 /** default separator entries required by Word when the part is created fresh */
@@ -295,7 +317,10 @@ export function buildNotesXml(
   let structural = ''
   const originals = new Map<string, { text: string; xml: string }>()
   if (originalXml) {
-    const re = new RegExp(`<${entry}\\s[^>]*w:type="[^"]*"[^>]*>[\\s\\S]*?</${entry}>`, 'g')
+    const re = new RegExp(
+      `<${entry}\\s[^>]*w:type=(?:"[^"]*"|'[^']*')[^>]*>[\\s\\S]*?</${entry}>`,
+      'g',
+    )
     structural = (originalXml.match(re) ?? []).join('')
     for (const e of noteEntriesOf(originalXml, kind)) originals.set(e.id, e)
   }

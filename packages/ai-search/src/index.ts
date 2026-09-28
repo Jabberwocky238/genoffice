@@ -1,19 +1,20 @@
 /**
  * Search utilities (main process) — gsk (Genspark CLI) first, then Serper Google API,
- * then Tavily, with DuckDuckGo as the keyless last resort. Runs in the main process
+ * then Serply, Tavily and Parallel, whose free Search MCP answers keyless before the DuckDuckGo last resort. Runs in the main process
  * (Node fetch / child process) to avoid renderer CORS; the Serper key reuses SERPER_API_KEY,
- * the Tavily key reuses TAVILY_API_KEY.
+ * the Serply key reuses SERPLY_API_KEY, the Tavily key reuses TAVILY_API_KEY and Parallel uses PARALLEL_API_KEY.
  * For gsk auth see ./gsk.ts (`gsk login` or GSK_API_KEY).
  */
 
 import {
-  COPYRIGHT_HOSTS,
   asRecord,
+  isCopyrightHost,
   safeHost,
   type ImageSearchResult,
   type WebSearchResult,
 } from './shared'
 import { gskImageSearch, gskWebSearch, hasGskAuth } from './gsk'
+import { parallelMcpSearch } from './parallel-mcp'
 
 export type { ImageSearchResult, WebSearchResult } from './shared'
 export * from './gsk'
@@ -22,20 +23,24 @@ export * from './media-tools'
 export * from './search-tools'
 
 const SERPER_KEY = () => process.env.SERPER_API_KEY ?? ''
+const SERPLY_KEY = () => process.env.SERPLY_API_KEY ?? ''
 const TAVILY_KEY = () => process.env.TAVILY_API_KEY ?? ''
+const PARALLEL_KEY = () => process.env.PARALLEL_API_KEY ?? ''
 
 /**
  * Backend selection for one search. Keys default to the SERPER_API_KEY /
- * TAVILY_API_KEY env vars; settings-driven callers (search-tools.ts) pass the
+ * SERPLY_API_KEY / TAVILY_API_KEY / PARALLEL_API_KEY env vars; settings-driven callers (search-tools.ts) pass the
  * user's key and turn gsk off so the chosen backend runs first.
  */
 export interface SearchOptions {
   /** false = skip the Genspark backend (cloud tools off, or a BYOK search provider is active) */
   useGsk?: boolean
   serperKey?: string
+  serplyKey?: string
   tavilyKey?: string
-  /** which keyed backend to try first (default serper) */
-  prefer?: 'serper' | 'tavily'
+  parallelKey?: string
+  /** which backend to try first (default serper) */
+  prefer?: 'serper' | 'serply' | 'tavily' | 'parallel'
 }
 
 function normalizeOptions(opts: boolean | SearchOptions | undefined): Required<SearchOptions> {
@@ -43,7 +48,9 @@ function normalizeOptions(opts: boolean | SearchOptions | undefined): Required<S
   return {
     useGsk: o.useGsk ?? true,
     serperKey: o.serperKey ?? SERPER_KEY(),
+    serplyKey: o.serplyKey ?? SERPLY_KEY(),
     tavilyKey: o.tavilyKey ?? TAVILY_KEY(),
+    parallelKey: o.parallelKey ?? PARALLEL_KEY(),
     prefer: o.prefer ?? 'serper',
   }
 }
@@ -63,30 +70,73 @@ async function serperWebSearch(
 ): Promise<WebSearchResponse | null> {
   if (!key) return null
   try {
-    const resp = await fetchWithTimeout('https://google.serper.dev/search', {
-      method: 'POST',
-      headers: { 'X-API-KEY': key, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ q: query, num: maxResults, gl: 'us', hl: 'en' }),
-    })
-    if (!resp.ok) return null
-    const data = asRecord(await resp.json())
-    const organic: unknown[] = Array.isArray(data.organic) ? data.organic : []
-    const results: WebSearchResult[] = organic.slice(0, maxResults).map((item) => {
-      const o = asRecord(item)
-      return {
-        title: String(o.title ?? ''),
-        url: String(o.link ?? ''),
-        snippet: String(o.snippet ?? ''),
-      }
-    })
-    const answerBox = asRecord(data.answerBox)
-    const answerRaw =
-      answerBox.answer || answerBox.snippet || asRecord(data.knowledgeGraph).description
-    const answer = typeof answerRaw === 'string' && answerRaw ? answerRaw : undefined
-    if (!results.length) return null
-    return answer !== undefined
-      ? { results, answer, method: 'serper' }
-      : { results, method: 'serper' }
+    return await fetchWithTimeout(
+      'https://google.serper.dev/search',
+      {
+        method: 'POST',
+        headers: { 'X-API-KEY': key, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ q: query, num: maxResults, gl: 'us', hl: 'en' }),
+      },
+      async (resp) => {
+        if (!resp.ok) return null
+        const data = asRecord(await resp.json())
+        const organic: unknown[] = Array.isArray(data.organic) ? data.organic : []
+        const results: WebSearchResult[] = organic.slice(0, maxResults).map((item) => {
+          const o = asRecord(item)
+          return {
+            title: String(o.title ?? ''),
+            url: String(o.link ?? ''),
+            snippet: String(o.snippet ?? ''),
+          }
+        })
+        const answerBox = asRecord(data.answerBox)
+        const answerRaw =
+          answerBox.answer || answerBox.snippet || asRecord(data.knowledgeGraph).description
+        const answer = typeof answerRaw === 'string' && answerRaw ? answerRaw : undefined
+        if (!results.length) return null
+        return answer !== undefined
+          ? { results, answer, method: 'serper' }
+          : { results, method: 'serper' }
+      },
+    )
+  } catch {
+    return null
+  }
+}
+
+/** Serply's Google results API authenticates with X-Api-Key on a GET query string. */
+const SERPLY_HEADERS = (key: string) => ({ 'X-Api-Key': key, 'User-Agent': 'genoffice' })
+
+/** Serply Google web search; null when the key is empty, the call fails, or nothing comes back */
+async function serplyWebSearch(
+  key: string,
+  query: string,
+  maxResults: number,
+): Promise<WebSearchResponse | null> {
+  if (!key) return null
+  try {
+    const params = new URLSearchParams({ q: query, num: String(maxResults) })
+    return await fetchWithTimeout(
+      `https://api.serply.io/v1/search?${params}`,
+      { headers: SERPLY_HEADERS(key) },
+      async (resp) => {
+        if (!resp.ok) return null
+        const data = asRecord(await resp.json())
+        const raw: unknown[] = Array.isArray(data.results) ? data.results : []
+        const results: WebSearchResult[] = []
+        for (const item of raw) {
+          const o = asRecord(item)
+          if (typeof o.link !== 'string' || !/^https?:\/\//i.test(o.link)) continue
+          results.push({
+            title: String(o.title ?? ''),
+            url: o.link,
+            snippet: String(o.description ?? ''),
+          })
+          if (results.length >= maxResults) break
+        }
+        return results.length ? { results, method: 'serply' } : null
+      },
+    )
   } catch {
     return null
   }
@@ -99,33 +149,92 @@ async function tavilyWebSearch(
 ): Promise<WebSearchResponse | null> {
   if (!key) return null
   try {
-    const resp = await fetchWithTimeout('https://api.tavily.com/search', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        api_key: key,
-        query,
-        max_results: maxResults,
-        include_answer: true,
-      }),
-    })
-    if (!resp.ok) return null
-    const data = asRecord(await resp.json())
+    return await fetchWithTimeout(
+      'https://api.tavily.com/search',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          api_key: key,
+          query,
+          max_results: maxResults,
+          include_answer: true,
+        }),
+      },
+      async (resp) => {
+        if (!resp.ok) return null
+        const data = asRecord(await resp.json())
+        const raw: unknown[] = Array.isArray(data.results) ? data.results : []
+        const results: WebSearchResult[] = raw.slice(0, maxResults).map((item) => {
+          const o = asRecord(item)
+          return {
+            title: String(o.title ?? ''),
+            url: String(o.url ?? ''),
+            snippet: String(o.content ?? ''),
+          }
+        })
+        const answerRaw = data.answer
+        const answer = typeof answerRaw === 'string' && answerRaw ? answerRaw : undefined
+        if (!results.length) return null
+        return answer !== undefined
+          ? { results, answer, method: 'tavily' }
+          : { results, method: 'tavily' }
+      },
+    )
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Parallel's API and free Search MCP return source excerpts, not a synthesized answer.
+ * Without a key the anonymous MCP runs, so an unconfigured install still gets real
+ * results before the DuckDuckGo scrape.
+ */
+async function parallelWebSearch(
+  key: string,
+  query: string,
+  maxResults: number,
+): Promise<WebSearchResponse | null> {
+  key = key.trim()
+  try {
+    let data: Record<string, unknown>
+    if (key) {
+      const responseData = await fetchWithTimeout(
+        'https://api.parallel.ai/v1/search',
+        {
+          method: 'POST',
+          headers: { 'x-api-key': key, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ search_queries: [query], mode: 'fast' }),
+        },
+        async (resp) => (resp.ok ? asRecord(await resp.json()) : null),
+      )
+      if (!responseData) return null
+      data = responseData
+    } else {
+      data = asRecord(await parallelMcpSearch(query))
+    }
     const raw: unknown[] = Array.isArray(data.results) ? data.results : []
-    const results: WebSearchResult[] = raw.slice(0, maxResults).map((item) => {
-      const o = asRecord(item)
-      return {
-        title: String(o.title ?? ''),
-        url: String(o.url ?? ''),
-        snippet: String(o.content ?? ''),
-      }
-    })
-    const answerRaw = data.answer
-    const answer = typeof answerRaw === 'string' && answerRaw ? answerRaw : undefined
-    if (!results.length) return null
-    return answer !== undefined
-      ? { results, answer, method: 'tavily' }
-      : { results, method: 'tavily' }
+    const results: WebSearchResult[] = []
+    for (const item of raw) {
+      // v1 search has no result-count parameter, so GenOffice's limit is applied
+      // here. Cut the loop off once the list is full instead of slicing the source
+      // first: the URL check below drops entries, and slicing first would both
+      // concatenate excerpts for results that are then thrown away and under-fill
+      // the list whenever the leading items are unusable.
+      if (results.length >= maxResults) break
+      const result = asRecord(item)
+      if (typeof result.url !== 'string' || !/^https?:\/\//i.test(result.url)) continue
+      const excerpts: unknown[] = Array.isArray(result.excerpts) ? result.excerpts : []
+      results.push({
+        title: typeof result.title === 'string' && result.title ? result.title : result.url,
+        url: result.url,
+        snippet: excerpts
+          .filter((excerpt): excerpt is string => typeof excerpt === 'string')
+          .join('\n'),
+      })
+    }
+    return results.length ? { results, method: 'parallel' } : null
   } catch {
     return null
   }
@@ -133,38 +242,55 @@ async function tavilyWebSearch(
 
 // ── Web search ──────────────────────────────────────────────────────
 
+/**
+ * Model-driven search args arrive unvalidated: clamp the result count to a
+ * finite 1..20 and truncate the query so a wild maxResults cannot inflate
+ * backend cost/loops and a megabyte query cannot flood request bodies.
+ */
+function normalizeSearchArgs(
+  query: string,
+  maxResults: number,
+  fallback: number,
+): { query: string; max: number } {
+  const max = Number.isFinite(maxResults)
+    ? Math.min(Math.max(1, Math.floor(maxResults)), 20)
+    : fallback
+  return { query: typeof query === 'string' ? query.slice(0, 500) : '', max }
+}
+
 export async function webSearch(
   query: string,
   maxResults = 6,
   options: boolean | SearchOptions = true,
 ): Promise<WebSearchResponse> {
   const o = normalizeOptions(options)
+  const { query: q, max } = normalizeSearchArgs(query, maxResults, 6)
   // useGsk=false: the user turned Genspark cloud tools off or picked their own
   // search key — skip straight to the keyed/free backends
   if (o.useGsk && hasGskAuth()) {
     try {
-      const r = await gskWebSearch(query, maxResults)
+      const r = await gskWebSearch(q, max)
       if (r.results.length) return { ...r, method: 'gsk' }
     } catch {
-      /* fall back to Serper/Tavily/DuckDuckGo */
+      /* fall back to Serper/Serply/Tavily/Parallel/DuckDuckGo */
     }
   }
-  const keyed =
-    o.prefer === 'tavily'
-      ? [
-          () => tavilyWebSearch(o.tavilyKey, query, maxResults),
-          () => serperWebSearch(o.serperKey, query, maxResults),
-        ]
-      : [
-          () => serperWebSearch(o.serperKey, query, maxResults),
-          () => tavilyWebSearch(o.tavilyKey, query, maxResults),
-        ]
-  for (const attempt of keyed) {
-    const r = await attempt()
+  const keyed = {
+    serper: () => serperWebSearch(o.serperKey, q, max),
+    serply: () => serplyWebSearch(o.serplyKey, q, max),
+    tavily: () => tavilyWebSearch(o.tavilyKey, q, max),
+    parallel: () => parallelWebSearch(o.parallelKey, q, max),
+  }
+  const order = [
+    o.prefer,
+    ...(['serper', 'serply', 'tavily', 'parallel'] as const).filter((id) => id !== o.prefer),
+  ]
+  for (const id of order) {
+    const r = await keyed[id]()
     if (r) return r
   }
   try {
-    return { results: await duckWebSearch(query, maxResults), method: 'duckduckgo' }
+    return { results: await duckWebSearch(q, max), method: 'duckduckgo' }
   } catch (err) {
     // an unreachable backend must not read as an empty result set
     return { results: [], method: 'error', error: `duckduckgo: ${String(err)}` }
@@ -183,54 +309,114 @@ export async function imageSearch(
   error?: string
 }> {
   const o = normalizeOptions(options)
+  const { query: q, max } = normalizeSearchArgs(query, maxResults, 8)
   if (o.useGsk && hasGskAuth()) {
     try {
-      const images = await gskImageSearch(query, maxResults)
+      const images = await gskImageSearch(q, max)
       if (images.length) return { images, method: 'gsk' }
     } catch {
-      /* fall back to Serper/DuckDuckGo */
+      /* fall back to Serper/Serply/DuckDuckGo */
     }
   }
-  // Tavily has no image endpoint; Serper is the only keyed image backend
-  const key = o.serperKey
-  if (key) {
-    try {
-      const resp = await fetchWithTimeout('https://google.serper.dev/images', {
-        method: 'POST',
-        headers: { 'X-API-KEY': key, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ q: query, num: Math.min(maxResults, 10), gl: 'us', hl: 'en' }),
-      })
-      if (resp.ok) {
-        const data = asRecord(await resp.json())
-        const raw: unknown[] = Array.isArray(data.images) ? data.images : []
-        const images: ImageSearchResult[] = []
-        for (const item of raw) {
-          const img = asRecord(item)
-          const imageUrl = String(img.imageUrl ?? img.original ?? '')
-          if (!imageUrl) continue
-          if (COPYRIGHT_HOSTS.some((d) => imageUrl.toLowerCase().includes(d))) continue
-          const entry: ImageSearchResult = {
-            title: String(img.title ?? ''),
-            imageUrl,
-            sourceUrl: String(img.link ?? ''),
-            source: String(img.source ?? safeHost(img.link)),
-          }
-          if (typeof img.imageWidth === 'number') entry.width = img.imageWidth
-          if (typeof img.imageHeight === 'number') entry.height = img.imageHeight
-          images.push(entry)
-          if (images.length >= maxResults) break
-        }
-        if (images.length) return { images, method: 'serper' }
-      }
-    } catch {
-      /* fall back to DuckDuckGo */
-    }
+  // Tavily and Parallel have no image endpoint; Serper and Serply are the keyed image backends
+  const keyed = [
+    () => serperImageSearch(o.serperKey, q, max),
+    () => serplyImageSearch(o.serplyKey, q, max),
+  ]
+  if (o.prefer === 'serply') keyed.reverse()
+  for (const run of keyed) {
+    const r = await run()
+    if (r) return r
   }
   try {
-    return { images: await duckImageSearch(query, maxResults), method: 'duckduckgo' }
+    return { images: await duckImageSearch(q, max), method: 'duckduckgo' }
   } catch (err) {
     // an unreachable backend must not read as an empty gallery
     return { images: [], method: 'error', error: `duckduckgo: ${String(err)}` }
+  }
+}
+
+async function serperImageSearch(
+  key: string,
+  q: string,
+  max: number,
+): Promise<{ images: ImageSearchResult[]; method: string } | null> {
+  if (!key) return null
+  try {
+    const data = await fetchWithTimeout(
+      'https://google.serper.dev/images',
+      {
+        method: 'POST',
+        headers: { 'X-API-KEY': key, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ q, num: Math.min(max, 10), gl: 'us', hl: 'en' }),
+      },
+      async (resp) => (resp.ok ? asRecord(await resp.json()) : null),
+    )
+    if (!data) return null
+    const raw: unknown[] = Array.isArray(data.images) ? data.images : []
+    const images: ImageSearchResult[] = []
+    for (const item of raw) {
+      const img = asRecord(item)
+      const imageUrl = String(img.imageUrl ?? img.original ?? '')
+      if (!imageUrl) continue
+      if (isCopyrightHost(imageUrl)) continue
+      const entry: ImageSearchResult = {
+        title: String(img.title ?? ''),
+        imageUrl,
+        sourceUrl: String(img.link ?? ''),
+        source: String(img.source ?? safeHost(img.link)),
+      }
+      if (typeof img.imageWidth === 'number') entry.width = img.imageWidth
+      if (typeof img.imageHeight === 'number') entry.height = img.imageHeight
+      images.push(entry)
+      if (images.length >= max) break
+    }
+    return images.length ? { images, method: 'serper' } : null
+  } catch {
+    return null
+  }
+}
+
+/** Serply returns a fixed page of 20 images, so the limit is applied locally. */
+async function serplyImageSearch(
+  key: string,
+  q: string,
+  max: number,
+): Promise<{ images: ImageSearchResult[]; method: string } | null> {
+  if (!key) return null
+  try {
+    const data = await fetchWithTimeout(
+      `https://api.serply.io/v1/image?${new URLSearchParams({ q })}`,
+      { headers: SERPLY_HEADERS(key) },
+      async (resp) => (resp.ok ? asRecord(await resp.json()) : null),
+    )
+    if (!data) return null
+    const raw: unknown[] = Array.isArray(data.image_results) ? data.image_results : []
+    const images: ImageSearchResult[] = []
+    for (const item of raw) {
+      const result = asRecord(item)
+      const original = asRecord(result.original_image)
+      const thumb = asRecord(result.image)
+      const link = asRecord(result.link)
+      const imageUrl = String(original.src ?? thumb.src ?? '')
+      if (!/^https?:\/\//i.test(imageUrl) || isCopyrightHost(imageUrl)) continue
+      const entry: ImageSearchResult = {
+        title: String(link.title ?? thumb.alt ?? ''),
+        imageUrl,
+        sourceUrl: String(link.href ?? ''),
+        source: String(link.domain ?? safeHost(link.href)),
+      }
+      // dimensions arrive as strings ("330")
+      const width = Number(original.width)
+      const height = Number(original.height)
+      if (Number.isFinite(width) && width > 0) entry.width = width
+      if (Number.isFinite(height) && height > 0) entry.height = height
+      images.push(entry)
+      if (images.length >= max) break
+    }
+    return images.length ? { images, method: 'serply' } : null
+  } catch {
+    return null
   }
 }
 
@@ -249,12 +435,14 @@ const BROWSER_HEADERS = {
 
 async function duckWebSearch(query: string, maxResults: number): Promise<WebSearchResult[]> {
   // DuckDuckGo HTML endpoint (lightweight, no key needed)
-  const resp = await fetchWithTimeout(
+  const html = await fetchWithTimeout(
     `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
     { headers: BROWSER_HEADERS, timeoutMs: FALLBACK_TIMEOUT_MS },
+    async (resp) => {
+      if (!resp.ok) throw new Error(`http ${resp.status}`)
+      return await resp.text()
+    },
   )
-  if (!resp.ok) throw new Error(`http ${resp.status}`)
-  const html = await resp.text()
   const results: WebSearchResult[] = []
   const re = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g
   let m: RegExpExecArray | null
@@ -268,29 +456,33 @@ async function duckWebSearch(query: string, maxResults: number): Promise<WebSear
 
 async function duckImageSearch(query: string, maxResults: number): Promise<ImageSearchResult[]> {
   // DuckDuckGo i.js needs a vqd token, so it takes two steps
-  const tokenResp = await fetchWithTimeout(
+  const tokenHtml = await fetchWithTimeout(
     `https://duckduckgo.com/?q=${encodeURIComponent(query)}`,
     { headers: BROWSER_HEADERS, timeoutMs: FALLBACK_TIMEOUT_MS },
+    async (resp) => {
+      if (!resp.ok) throw new Error(`http ${resp.status}`)
+      return await resp.text()
+    },
   )
-  if (!tokenResp.ok) throw new Error(`http ${tokenResp.status}`)
-  const tokenHtml = await tokenResp.text()
   const vqd = /vqd=["']?([\d-]+)["']?/.exec(tokenHtml)?.[1]
   if (!vqd) throw new Error('no vqd token')
-  const resp = await fetchWithTimeout(
+  const data = await fetchWithTimeout(
     `https://duckduckgo.com/i.js?l=us-en&o=json&q=${encodeURIComponent(query)}&vqd=${vqd}`,
     {
       headers: { ...BROWSER_HEADERS, Referer: 'https://duckduckgo.com/' },
       timeoutMs: FALLBACK_TIMEOUT_MS,
     },
+    async (resp) => {
+      if (!resp.ok) throw new Error(`http ${resp.status}`)
+      return asRecord(await resp.json())
+    },
   )
-  if (!resp.ok) throw new Error(`http ${resp.status}`)
-  const data = asRecord(await resp.json())
   const list: unknown[] = Array.isArray(data.results) ? data.results : []
   const out: ImageSearchResult[] = []
   for (const item of list.slice(0, maxResults)) {
     const img = asRecord(item)
     const imageUrl = String(img.image ?? '')
-    if (!imageUrl || COPYRIGHT_HOSTS.some((d) => imageUrl.toLowerCase().includes(d))) continue
+    if (!imageUrl || isCopyrightHost(imageUrl)) continue
     const entry: ImageSearchResult = {
       title: String(img.title ?? ''),
       imageUrl,
@@ -306,16 +498,18 @@ async function duckImageSearch(query: string, maxResults: number): Promise<Image
 
 // ── utils ───────────────────────────────────────────────────────────
 
-async function fetchWithTimeout(
+async function fetchWithTimeout<T>(
   url: string,
-  init: RequestInit & { timeoutMs?: number } = {},
-): Promise<Response> {
+  init: RequestInit & { timeoutMs?: number },
+  consume: (response: Response) => Promise<T>,
+): Promise<T> {
   const controller = new AbortController()
-  const t = setTimeout(() => controller.abort(), init.timeoutMs ?? 15000)
+  const timer = setTimeout(() => controller.abort(), init.timeoutMs ?? 15000)
   try {
-    return await fetch(url, { ...init, signal: controller.signal })
+    const response = await fetch(url, { ...init, signal: controller.signal })
+    return await consume(response)
   } finally {
-    clearTimeout(t)
+    clearTimeout(timer)
   }
 }
 

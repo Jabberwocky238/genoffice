@@ -120,6 +120,12 @@ describe('format', () => {
     expect(format('{a} and {b}', { a: 'x' })).toBe('x and {b}')
     expect(format('no params')).toBe('no params')
   })
+
+  it('does not leak prototype properties into placeholders', () => {
+    expect(format('{toString}', {})).toBe('{toString}')
+    expect(format('{constructor} and {valueOf}', {})).toBe('{constructor} and {valueOf}')
+    expect(format('{n}', { n: 1 })).toBe('1')
+  })
 })
 
 describe('macShortcutsToWin', () => {
@@ -169,6 +175,15 @@ describe('macShortcutsToWin', () => {
     const plain = 'Ctrl+S saves the file'
     expect(macShortcutsToWin(plain)).toBe(plain)
     expect(macShortcutsToWin('文件')).toBe('文件')
+  })
+})
+
+describe('shortcut rewrite order', () => {
+  it('rewrites the template before interpolation so values keep their glyphs', () => {
+    const template = 'Saved {name} (⌘S)'
+    const params = { name: 'Plan ⇧Final.xlsx' }
+    expect(format(macShortcutsToWin(template), params)).toBe('Saved Plan ⇧Final.xlsx (Ctrl+S)')
+    expect(macShortcutsToWin(format(template, params))).toBe('Saved Plan Shift+Final.xlsx (Ctrl+S)')
   })
 })
 

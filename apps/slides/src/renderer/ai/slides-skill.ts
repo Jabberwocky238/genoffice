@@ -7,8 +7,8 @@ import type {
   ShapeRenderNode,
 } from '@genoffice/pptx-render'
 import type { AgentToolCall, AgentToolDef } from '../../shared/ipc'
-import { OP_GROUPS, opGuide, opGuideCatalog, opSignatureIndex } from '../../shared/op-docs'
-import { auditSlideLayout, formatAudit } from './layout-audit'
+import { OP_GROUPS, opGuide, opGuideCatalog, opSignatureIndex } from '@genoffice/pptx-ops/op-docs'
+import { auditSlideLayout, formatAudit } from '@genoffice/pipelines/slides/layout-audit'
 import { runLayoutScript, type LayoutScriptElement } from './layout-script'
 import { t } from '../i18n/locale'
 import systemPrompt from './prompts/system.md?raw'
@@ -21,6 +21,10 @@ import systemPrompt from './prompts/system.md?raw'
  */
 
 // ── Generation progress events (for the onProgress callback; renderer memory only, never persisted or journaled) ──
+
+/** Upper bound on generate_deck approx_pages; bounds planner round trips and the progress note. */
+export const MAX_APPROX_PAGES = 200
+const MAX_PROGRESS_NOTE_PAGES = 40
 
 /** Per-page progress status */
 export type PageProgressStatus = 'pending' | 'running' | 'done' | 'error'
@@ -61,7 +65,13 @@ export type DeckProgressEvent =
       summary: string
       pages: PageProgressItem[]
     }
-  | { stage: 'done'; total: number; summary: string }
+  | {
+      stage: 'done'
+      total: number
+      summary: string
+      /** absent on success; the card must not read a failed or stopped run as "done" */
+      outcome?: 'failed' | 'cancelled'
+    }
 
 /** Panel/skill access point to the currently open deck (refs provided by App, stay fresh across renders). */
 export interface DeckAccess {
@@ -220,6 +230,25 @@ export interface DeckAccess {
    * (decks must be built from attachment content, not generic filler).
    */
   unreadTextAttachments?(): string[]
+  /**
+   * Resolve a user image attachment by file name (an `attachment://` reference in
+   * insert_web_image / replace_image) to its raw bytes, so the original file is
+   * embedded as-is — the model must never recreate an attached image (r182 family).
+   */
+  resolveAttachmentImage?(
+    name: string,
+  ): Promise<{ ok: true; base64: string; ext: string } | { ok: false; error: string }>
+}
+
+/** `attachment://<file name>` → decoded file name, or null when not an attachment reference. */
+export function attachmentRefName(url: string): string | null {
+  if (!url.toLowerCase().startsWith('attachment://')) return null
+  const raw = url.slice('attachment://'.length).trim()
+  try {
+    return decodeURIComponent(raw)
+  } catch {
+    return raw
+  }
 }
 
 /** Single survey question structure (with options). */
@@ -318,7 +347,7 @@ const TOOLS: AgentToolDef[] = [
   {
     name: 'generate_image',
     description:
-      'AI image generation/editing. Text-to-image, or pass referenceImageUrls for image editing; returns an image URL. NEW imagery: insert with insert_web_image. Editing an EXISTING slide picture (background removal/upscaling/etc.): swap it in place with replace_image — do not insert a duplicate. Use for custom illustrations/icons/backgrounds, style-consistent imagery; for real photos/screenshots still use image_search.',
+      'AI image generation/editing. Text-to-image, or pass referenceImageUrls for image editing; returns an image URL. NEW imagery: insert with insert_web_image. Editing an EXISTING slide picture (background removal/upscaling/etc.): swap it in place with replace_image — do not insert a duplicate. Use for custom illustrations/icons/backgrounds, style-consistent imagery; for real photos/screenshots still use image_search. NEVER use it to recreate an image the user attached (logo, photo) — embed the original with insert_web_image / replace_image and url=attachment://<file name>. Icons/logos/cutouts that must sit on slide content need transparentBackground:true — asking for a transparent background in the prompt does NOT work (models paint a fake gray checkerboard into the pixels).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -340,6 +369,11 @@ const TOOLS: AgentToolDef[] = [
         aspectRatio: {
           type: 'string',
           description: 'Aspect ratio: 1:1|4:3|16:9|9:16|3:4|2:3|3:2|auto',
+        },
+        transparentBackground: {
+          type: 'boolean',
+          description:
+            'Set true when the result must have a real transparent background (icons, logos, cutouts placed over slide content). The app strips the background automatically after generation; never rely on the prompt for transparency.',
         },
       },
       required: ['prompt'],
@@ -369,12 +403,17 @@ const TOOLS: AgentToolDef[] = [
   {
     name: 'insert_web_image',
     description:
-      'Download an image URL obtained from image_search or generate_image and insert it into a page (pixel coordinates). w×h is a layout frame, not a stretch target: the image keeps its aspect ratio, fills the frame, and the overflow is center-cropped (object-fit: cover) — pick the frame for the layout freely.',
+      'Download an image URL obtained from image_search or generate_image and insert it into a page (pixel coordinates). w×h is a layout frame, not a stretch target: the image keeps its aspect ratio, fills the frame, and the overflow is center-cropped (object-fit: cover) — pick the frame for the layout freely. ' +
+      'To place an image the USER ATTACHED (logo, photo, screenshot), pass url=attachment://<file name> (the exact name from the attachment list) — the app embeds the original file bytes as-is. Never recreate an attached image with generate_image and never ask for base64.',
     inputSchema: {
       type: 'object',
       properties: {
         slideIndex: { type: 'integer' },
-        url: { type: 'string', description: 'Direct image link (imageUrl from image_search)' },
+        url: {
+          type: 'string',
+          description:
+            'Direct image link (imageUrl from image_search), or attachment://<file name> to embed a user-attached image as-is',
+        },
         x: { type: 'number' },
         y: { type: 'number' },
         w: { type: 'number' },
@@ -531,7 +570,9 @@ const TOOLS: AgentToolDef[] = [
         },
         approx_pages: {
           type: 'integer',
-          description: 'Expected page count (used together with topic)',
+          minimum: 1,
+          maximum: MAX_APPROX_PAGES,
+          description: `Expected page count (used together with topic; at most ${MAX_APPROX_PAGES})`,
         },
         context: {
           type: 'string',
@@ -1113,9 +1154,14 @@ function buildProgressNote(state?: SkillState): string {
   }
   // Name unfinished pages one by one from pageDone (page numbers stay accurate when a middle page fails)
   const remaining: string[] = []
+  let omitted = 0
   for (let i = 0; i < planned; i++) {
-    if (!flags[i]) remaining.push(`page ${i + 1}${titles[i] ? ` "${titles[i]}"` : ''}`)
+    if (flags[i]) continue
+    if (remaining.length < MAX_PROGRESS_NOTE_PAGES) {
+      remaining.push(`page ${i + 1}${titles[i] ? ` "${titles[i]}"` : ''}`)
+    } else omitted++
   }
+  if (omitted > 0) remaining.push(`and ${omitted} more`)
   return (
     `<generation-progress>\n` +
     `⚠️ Incomplete: ${planned} pages planned, ${done} generated, ${planned - done} still missing.\n` +
@@ -1467,6 +1513,7 @@ async function executeTool(
         model: call.input.model ? String(call.input.model) : undefined,
         referenceImageUrls: refs,
         aspectRatio: call.input.aspectRatio ? String(call.input.aspectRatio) : undefined,
+        transparentBackground: call.input.transparentBackground === true,
       })
       if (!r.url) return fail(t('aiFailGenImage'), r.error ?? 'Generation failed')
       const display: ToolDisplay = {
@@ -1509,11 +1556,22 @@ async function executeTool(
       if (!slides[idx])
         return fail(t('aiFailInsertImage'), `slideIndex out of range (0-${slides.length - 1})`)
       const url = String(call.input.url ?? '')
-      // file:// = a BYOK-generated image in the local store (the main process only resolves its own files)
-      if (!/^(https?|file):\/\//.test(url)) return fail(t('aiFailInsertImage'), 'Invalid url')
+      const attachmentName = attachmentRefName(url)
+      let payload: { url: string } | { base64: string; ext: string }
+      if (attachmentName != null) {
+        if (!access.resolveAttachmentImage)
+          return fail(t('aiFailInsertImage'), 'Attachment embedding is unavailable here')
+        const resolved = await access.resolveAttachmentImage(attachmentName)
+        if (!resolved.ok) return fail(t('aiFailInsertImage'), resolved.error)
+        payload = { base64: resolved.base64, ext: resolved.ext }
+      } else {
+        // file:// = a BYOK-generated image in the local store (the main process only resolves its own files)
+        if (!/^(https?|file):\/\//.test(url)) return fail(t('aiFailInsertImage'), 'Invalid url')
+        payload = { url }
+      }
       const r = await window.slidesApi.insertImageUrl({
         slideIndex: idx,
-        url,
+        ...payload,
         xPx: Number(call.input.x),
         yPx: Number(call.input.y),
         wPx: Number(call.input.w),
@@ -1551,11 +1609,22 @@ async function executeTool(
         )
 
       const url = String(call.input.url ?? '')
-      if (!/^(https?|file):\/\//.test(url)) return fail(t(failKey), 'Invalid url')
+      const attachmentName = attachmentRefName(url)
+      let payload: { url: string } | { base64: string; ext: string }
+      if (attachmentName != null) {
+        if (!access.resolveAttachmentImage)
+          return fail(t(failKey), 'Attachment embedding is unavailable here')
+        const resolved = await access.resolveAttachmentImage(attachmentName)
+        if (!resolved.ok) return fail(t(failKey), resolved.error)
+        payload = { base64: resolved.base64, ext: resolved.ext }
+      } else {
+        if (!/^(https?|file):\/\//.test(url)) return fail(t(failKey), 'Invalid url')
+        payload = { url }
+      }
       const updated = await window.slidesApi.replacePictureUrl({
         slideIndex: idx,
         sourceId,
-        url,
+        ...payload,
         ...(call.input.keepCrop ? { keepSrcRect: true } : {}),
       })
       if (!updated)
@@ -1679,15 +1748,24 @@ async function executeTool(
         canvasW: 1280,
         canvasH: 720,
       }
-      const regenGen = regenUseCloud ? access.generatePageCloud! : access.generatePageLocal!
-      for (let attempt = 0; attempt < 2 && !marker; attempt++) {
-        if (attempt > 0 && backoff > 0) await new Promise((r) => setTimeout(r, backoff))
-        const res = await regenGen(regenArgs)
-        if (res.ok && res.marker) {
-          marker = res.marker
-          if ('imageFailures' in res && Array.isArray(res.imageFailures))
-            genImageFails = res.imageFailures
-        } else lastErr = res.error ?? t('aiErrUnknown')
+      const runRegen = async (gen: NonNullable<DeckAccess['generatePageLocal']>) => {
+        for (let attempt = 0; attempt < 2 && !marker; attempt++) {
+          if (attempt > 0 && backoff > 0) await new Promise((r) => setTimeout(r, backoff))
+          const res = await gen(regenArgs)
+          if (res.ok && res.marker) {
+            marker = res.marker
+            if ('imageFailures' in res && Array.isArray(res.imageFailures))
+              genImageFails = res.imageFailures
+          } else lastErr = res.error ?? t('aiErrUnknown')
+        }
+      }
+      // Cloud first when enabled; a cloud failure (free plan / credits / outage) falls back
+      // to the local BYOK pipeline instead of failing the redo outright.
+      if (regenUseCloud && access.generatePageCloud) {
+        await runRegen(access.generatePageCloud)
+        if (!marker && access.generatePageLocal) await runRegen(access.generatePageLocal)
+      } else {
+        await runRegen(access.generatePageLocal!)
       }
       if (!marker)
         return fail(
@@ -1722,6 +1800,9 @@ async function executeTool(
       //      transport, works with BYOK) writes a slide spec that is built directly into a pptx.
       const useCloud =
         !!access.generatePageCloud && !!(await access.isCloudPageGenEnabled?.().catch(() => false))
+      // Cloud can still fail mid-run (free plan / exhausted credits / outage). When it does
+      // the deck finishes on the local BYOK pipeline instead; cloudActive tracks that switch.
+      let cloudActive = useCloud
       if (!useCloud && !access.generatePageLocal)
         return fail(
           t('aiFailGenDeck'),
@@ -1831,9 +1912,9 @@ async function executeTool(
       if (!styleSkill) styleSkill = style // Fallback: use the user-passed style, or empty
 
       // ── Step 1: plan the outline — without pages, plan in-tool from topic (batched recursion over PLAN_BATCH; layouts chosen per the Style Skill).
-      const approxForProgress = Math.max(
-        1,
-        parseInt(String(call.input.approx_pages ?? '0'), 10) || pages.length || 1,
+      const approxForProgress = Math.min(
+        MAX_APPROX_PAGES,
+        Math.max(1, parseInt(String(call.input.approx_pages ?? '0'), 10) || pages.length || 1),
       )
       if (pages.length === 0) {
         const approx = approxForProgress
@@ -2044,6 +2125,7 @@ async function executeTool(
       const degraded: number[] = [] // Page indexes (0-based) that "landed" via the plain-text fallback — must be reported, otherwise dead pages appear silently
       const deckImageFails: { page: number; url: string }[] = [] // Image download/conversion failures (page numbers are deck-global 1-based)
       const pageErrors: (string | undefined)[] = new Array(total).fill(undefined) // Last failure reason per page
+      let cloudFallbackReason: string | null = null // First cloud failure that switched the run to the local pipeline
       let landedPages = 0
       let firstDone = false
       let baseOffset = 0 // Number of existing pages before generated page 0 in the deck (>0 in append mode); used to re-insert retries at their original position
@@ -2066,6 +2148,28 @@ async function executeTool(
         pages: [...pageProgressItems],
       })
 
+      type PageGen = NonNullable<DeckAccess['generatePageLocal']>
+      // Up to two attempts on one pipeline; returns the marker or the last error.
+      const tryGenerate = async (
+        gen: PageGen,
+        pageArgs: Parameters<PageGen>[0],
+        pageIndex: number,
+      ): Promise<{ marker: string | null; err: string }> => {
+        let lastErr = ''
+        for (let attempt = 0; attempt < 2; attempt++) {
+          if (cancelled()) return { marker: null, err: lastErr }
+          if (attempt > 0 && BACKOFF_MS > 0) await new Promise((r) => setTimeout(r, BACKOFF_MS))
+          const res = await gen(pageArgs)
+          if (res.ok && res.marker) {
+            if ('imageFailures' in res && Array.isArray(res.imageFailures))
+              deckImageFails.push(...res.imageFailures.map((url) => ({ page: pageIndex, url })))
+            return { marker: res.marker, err: '' }
+          }
+          lastErr = res.error ?? t('aiErrUnknown')
+        }
+        return { marker: null, err: lastErr }
+      }
+
       const genOne = async (p: Record<string, unknown>, pageIndex: number) => {
         // Mark as running
         pageProgressItems[pageIndex - 1] = {
@@ -2086,7 +2190,6 @@ async function executeTool(
               .map((x) => String(x))
               .filter((x) => /^https?:\/\//.test(x))
           : []
-        let lastErr = ''
         const pageArgs = {
           pageIndex,
           totalPages: total,
@@ -2102,24 +2205,34 @@ async function executeTool(
           canvasH,
           ...(signal ? { signal } : {}),
         }
-        // Both paths return a marker pointing at a one-slide pptx temp file. One retry, then the
-        // page is skipped for now (locally-failed pages get one more chance in the retry round)
-        // and the rest of the deck keeps generating.
-        const gen = useCloud ? access.generatePageCloud! : access.generatePageLocal!
-        for (let attempt = 0; attempt < 2; attempt++) {
-          if (cancelled()) return null
-          if (attempt > 0 && BACKOFF_MS > 0) await new Promise((r) => setTimeout(r, BACKOFF_MS))
-          const res = await gen(pageArgs)
-          if (res.ok && res.marker) {
+        // Cloud first when enabled; on failure fall back to the local BYOK pipeline and stay
+        // there — a cloud failure is normally account-wide (free plan / exhausted credits /
+        // expired key / outage), so retrying the cloud for every remaining page only wastes
+        // time. Both paths return a marker for the same one-slide pptx landing contract.
+        if (cloudActive && access.generatePageCloud) {
+          const cloud = await tryGenerate(access.generatePageCloud, pageArgs, pageIndex)
+          if (cloud.marker) {
             pageErrors[pageIndex - 1] = undefined
-            if ('imageFailures' in res && Array.isArray(res.imageFailures))
-              deckImageFails.push(...res.imageFailures.map((url) => ({ page: pageIndex, url })))
-            return res.marker
+            return cloud.marker
           }
-          lastErr = res.error ?? t('aiErrUnknown')
+          if (access.generatePageLocal) {
+            if (!cloudFallbackReason) {
+              cloudFallbackReason = cloud.err
+              // surface the downgrade where the user is looking: the switching page's item
+              pageProgressItems[pageIndex - 1] = {
+                ...pageProgressItems[pageIndex - 1]!,
+                title: `${pageProgressItems[pageIndex - 1]!.title} · ${t('aiPageCloudToLocal')}`,
+              }
+            }
+            cloudActive = false
+          } else {
+            pageErrors[pageIndex - 1] = cloud.err
+            return null
+          }
         }
-        pageErrors[pageIndex - 1] = lastErr
-        return null
+        const local = await tryGenerate(access.generatePageLocal!, pageArgs, pageIndex)
+        pageErrors[pageIndex - 1] = local.marker ? undefined : local.err
+        return local.marker
       }
 
       // Land in page order: starting from nextToLand, land as many as possible (stop at a gap and wait for it to generate).
@@ -2195,18 +2308,18 @@ async function executeTool(
 
       // ── One retry round for failed pages, re-inserted at their original page position with
       //   insert_at (target position = existing-page offset + pages completed before this one).
-      //   Landing-failed pages re-land (cheap: the one-slide pptx already exists). Cloud
-      //   generation-failed pages already spent their single retry and stay skipped; local
-      //   generation-failed pages get one more generation attempt here (LLM calls are the
-      //   user's own quota, and a JSON spec retry is cheap).
+      //   Landing-failed pages re-land (cheap: the one-slide pptx already exists). Pages whose
+      //   generation failed get one more local attempt here when the run ended on the local
+      //   pipeline (LLM calls are the user's own quota, and a JSON spec retry is cheap) — that
+      //   includes pages that failed during a mid-run cloud→local switch.
       if (!cancelled()) {
-        const retryIdxs = [...new Set([...(useCloud ? [] : genFailed), ...landFailed])].sort(
+        const retryIdxs = [...new Set([...(cloudActive ? [] : genFailed), ...landFailed])].sort(
           (a, b) => a - b,
         )
         for (const idx of retryIdxs) {
           if (cancelled()) break
           let marker = markerByIndex[idx]
-          if (!marker && !useCloud) marker = await genOne(pages[idx]!, idx + 1)
+          if (!marker && !cloudActive) marker = await genOne(pages[idx]!, idx + 1)
           if (!marker) {
             pageProgressItems[idx] = {
               ...pageProgressItems[idx]!,
@@ -2266,6 +2379,7 @@ async function executeTool(
           stage: 'done',
           total: landedPages,
           summary: t('aiSumStoppedKept', { n: landedPages }),
+          outcome: 'cancelled',
         })
         return cancelResult(landedPages, total)
       }
@@ -2290,6 +2404,7 @@ async function executeTool(
           stage: 'done',
           total: 0,
           summary: t('aiStageAllFailed', { n: total }),
+          outcome: 'failed',
         })
         return fail(
           t('aiFailGenDeck'),
@@ -2310,6 +2425,9 @@ async function executeTool(
       const stillFailed: number[] = []
       for (let i = 0; i < total; i++) if (!doneFlags[i]) stillFailed.push(i + 1)
       const briefErr = (s?: string) => (s ? (s.length > 80 ? `${s.slice(0, 80)}…` : s) : '')
+      const cloudNote = cloudFallbackReason
+        ? ` Cloud page generation was unavailable (${briefErr(cloudFallbackReason)}); the deck was generated locally with your configured AI model instead.`
+        : ''
       const okMsg = `Self-driven generation produced ${landedPages}/${total} pages (HTML written page by page, displayed as generated; failed pages were auto-retried).`
       const failDetail = stillFailed
         .map((n) => `page ${n}${pageErrors[n - 1] ? ` (${briefErr(pageErrors[n - 1])})` : ''}`)
@@ -2330,7 +2448,8 @@ async function executeTool(
             )} degraded to a plain-text fallback page after conversion failure (all layout and styling lost): immediately redo these pages in place with regenerate_slide following the original brief, then reply to the user.`
         : ''
       return {
-        output: okMsg + failMsg + degradedMsg + imageFailNote(deckImageFails) + progressTail,
+        output:
+          okMsg + failMsg + degradedMsg + cloudNote + imageFailNote(deckImageFails) + progressTail,
         mutated: true,
         summary: t('aiSumDeckGenerated', { done: landedPages, total }),
       }

@@ -10,8 +10,11 @@ beforeAll(() => {
 
 const realFetch = globalThis.fetch
 afterEach(() => {
+  vi.useRealTimers()
   globalThis.fetch = realFetch
   delete process.env.SERPER_API_KEY
+  delete process.env.SERPLY_API_KEY
+  delete process.env.PARALLEL_API_KEY
   delete process.env.TAVILY_API_KEY
 })
 
@@ -53,18 +56,37 @@ describe('webSearch (Serper)', () => {
     expect(r.results[0]).toEqual({ title: 'A', url: 'https://a.com', snippet: 'sa' })
   })
 
-  it('falls back to DuckDuckGo when no key', async () => {
+  it('falls back to DuckDuckGo when no key and the free Parallel MCP is down', async () => {
+    const urls: string[] = []
     mockFetch((url) => {
-      expect(url).toContain('duckduckgo.com')
+      urls.push(url)
+      if (url === 'https://search.parallel.ai/mcp') return { ok: false }
       return {
         ok: true,
         text: '<a class="result__a" href="/l/?uddg=https%3A%2F%2Fx.com">X Title</a>',
       }
     })
     const r = await webSearch('q', 3)
+    expect(urls[0]).toBe('https://search.parallel.ai/mcp')
+    expect(urls.at(-1)).toContain('duckduckgo.com')
     expect(r.method).toBe('duckduckgo')
     expect(r.results[0]?.url).toBe('https://x.com')
     expect(r.results[0]?.title).toBe('X Title')
+  })
+
+  it('clamps wild maxResults and truncates huge queries at entry', async () => {
+    process.env.SERPER_API_KEY = 'test-key'
+    let seen: { q: string; num: number } | undefined
+    mockFetch((url, init) => {
+      if (url !== 'https://google.serper.dev/search') return { ok: false }
+      seen = JSON.parse(String(init?.body)) as { q: string; num: number }
+      return { ok: true, json: { organic: [] } }
+    })
+    await webSearch('x'.repeat(5000), 1e9)
+    expect(seen!.num).toBeLessThanOrEqual(20)
+    expect(seen!.q.length).toBeLessThanOrEqual(500)
+    await webSearch('normal', NaN)
+    expect(seen!.num).toBeGreaterThanOrEqual(1)
   })
 })
 
@@ -129,6 +151,57 @@ describe('DuckDuckGo fallback error surfacing', () => {
     expect(r.error).toContain('duckduckgo')
   })
 
+  it('web: aborts a stalled response body and falls back', async () => {
+    vi.useFakeTimers()
+    let serperSignal: AbortSignal | undefined
+    let markBodyStarted = (): void => {}
+    const bodyStarted = new Promise<void>((resolve) => {
+      markBodyStarted = resolve
+    })
+    const urls: string[] = []
+    globalThis.fetch = vi.fn(async (url: any, init: any) => {
+      urls.push(String(url))
+      // the keyless Parallel MCP sits between Serper and DuckDuckGo here; take it down
+      if (String(url) === 'https://search.parallel.ai/mcp') {
+        return { ok: false, status: 500, headers: new Map() } as any
+      }
+      if (String(url) === 'https://google.serper.dev/search') {
+        const signal = (serperSignal = init.signal as AbortSignal)
+        return {
+          ok: true,
+          status: 200,
+          headers: new Map(),
+          json: () => {
+            markBodyStarted()
+            return new Promise((_resolve, reject) => {
+              const rejectOnAbort = () => reject(signal.reason)
+              if (signal.aborted) rejectOnAbort()
+              else signal.addEventListener('abort', rejectOnAbort, { once: true })
+            })
+          },
+        } as any
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: new Map(),
+        text: async () => '<a class="result__a" href="/l/?uddg=https%3A%2F%2Fx.com">X</a>',
+      } as any
+    }) as any
+
+    const pending = webSearch('q', 3, { useGsk: false, serperKey: 'test-key' })
+    await bodyStarted
+    expect(serperSignal).toBeInstanceOf(AbortSignal)
+    await vi.advanceTimersByTimeAsync(15000)
+    const result = await pending
+
+    expect(result.method).toBe('duckduckgo')
+    expect(result.results[0]?.url).toBe('https://x.com')
+    // the stalled Serper call is abandoned once, never retried, and the chain ends at DuckDuckGo
+    expect(urls.filter((u) => u === 'https://google.serper.dev/search')).toHaveLength(1)
+    expect(urls.at(-1)).toContain('duckduckgo.com')
+  })
+
   it('web: stays a plain empty result when the backend responds with nothing', async () => {
     mockFetch(() => ({ ok: true, text: '<html></html>' }))
     const r = await webSearch('q', 3)
@@ -169,13 +242,25 @@ describe('imageSearch (Serper)', () => {
               imageUrl: 'https://gettyimages.com/x.jpg',
               link: 'https://gettyimages.com',
             },
+            {
+              title: 'review',
+              imageUrl: 'https://cdn.example.com/shutterstock-review.png',
+              link: 'https://example.com/review',
+            },
+            {
+              title: 'subdomain',
+              imageUrl: 'https://media.shutterstock.com/y.jpg',
+              link: 'https://media.shutterstock.com',
+            },
           ],
         },
       }
     })
     const r = await imageSearch('cats', 8)
     expect(r.method).toBe('serper')
-    expect(r.images).toHaveLength(1) // getty is filtered out
+    // getty host + shutterstock subdomain filtered out; a mere path
+    // mention of a stock host on an unrelated domain is kept
+    expect(r.images.map((i) => i.title)).toEqual(['good', 'review'])
     expect(r.images[0]).toMatchObject({
       imageUrl: 'https://cdn.example.com/a.jpg',
       width: 800,
@@ -224,7 +309,12 @@ describe('search-tools', () => {
       ...base,
       search: {
         provider: 'serper' as const,
-        providers: { serper: { apiKey: 'k' }, tavily: { apiKey: '' } },
+        providers: {
+          serper: { apiKey: 'k' },
+          serply: { apiKey: '' },
+          tavily: { apiKey: '' },
+          parallel: { apiKey: '' },
+        },
       },
     }
     expect(searchOptionsFromSettings(serper)).toEqual({ useGsk: false, serperKey: 'k' })
@@ -232,7 +322,12 @@ describe('search-tools', () => {
       ...base,
       search: {
         provider: 'tavily' as const,
-        providers: { serper: { apiKey: '' }, tavily: { apiKey: 't' } },
+        providers: {
+          serper: { apiKey: '' },
+          serply: { apiKey: '' },
+          tavily: { apiKey: 't' },
+          parallel: { apiKey: '' },
+        },
       },
     }
     expect(searchOptionsFromSettings(tavily)).toEqual({
@@ -245,7 +340,12 @@ describe('search-tools', () => {
       ...base,
       search: {
         provider: 'serper' as const,
-        providers: { serper: { apiKey: '' }, tavily: { apiKey: '' } },
+        providers: {
+          serper: { apiKey: '' },
+          serply: { apiKey: '' },
+          tavily: { apiKey: '' },
+          parallel: { apiKey: '' },
+        },
       },
     }
     expect(searchOptionsFromSettings(empty)).toEqual({ useGsk: true })

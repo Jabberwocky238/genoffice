@@ -1,7 +1,24 @@
 export * from './types'
-export { deobfuscateOdttf, isSfnt, parseFontTable, readEmbeddedFonts } from './font-table'
+export {
+  deobfuscateOdttf,
+  isSfnt,
+  parseFontTable,
+  readEmbeddedFonts,
+  sfntLineMetrics,
+} from './font-table'
 export { decodeEntities } from './parse-xml-text'
-export { parseDocx, styleRunFormat, type ParseExtras } from './parse'
+export { sdtCheckboxGlyphs, sdtCheckboxIsChecked } from './checkbox-control'
+export {
+  parseDocx,
+  reconcileGridColumns,
+  styleRunFormat,
+  type ParseExtras,
+  type ParseOptions,
+} from './parse'
+export { assertZipInflatesWithinLimits, assertZipWithinLimits, DOCX_ZIP_LIMITS } from './zip-load'
+export { LAZY_MEDIA_SCHEME, isLazyMediaPart, lazyMediaUrl, parseLazyMediaUrl } from './lazy-media'
+export { setAltChunkHtmlConverter, type AltChunkHtmlConverter } from './alt-chunk'
+export { tocLevelOf } from './parse-fields'
 export {
   saveDocx,
   findChartWorkbookPath,
@@ -60,6 +77,7 @@ export {
   parseChartPartXml,
   patchChartPartXml,
   lumHex,
+  colLetter,
   CHART_WORKBOOK_REL_TYPE,
   type ChartPatch,
   type ChartSeriesPatch,
@@ -77,7 +95,14 @@ export {
   BLANK_BULLET_NUM_ID,
   BLANK_ORDERED_NUM_ID,
   buildBlankDocx,
+  customLevelFromNumberingLevel,
+  customLevelXml,
+  mergeLevelXml,
+  numberingLevelFromCustom,
+  paperSizeForLocale,
+  paperSizeForRegion,
   type BlankDocxOptions,
+  type BlankPaperSize,
   type CustomNumberingLevel,
 } from './blank'
 export {
@@ -85,13 +110,35 @@ export {
   applySectionSettings,
   applyPageNumType,
   applySectionStartType,
+  applyTitlePg,
+  sectionFromSectPr,
   readPageColor,
   readSections,
   readSectionSettings,
   sectionSettingsFromXml,
+  notePropsFromXml,
+  xmlFlagOn,
 } from './section'
 export { nextNoteId, parseNotesXml, type NoteKind } from './notes'
-export { readWatermarkText } from './watermark'
+export {
+  isPictureWatermark,
+  pictureWatermarkPreviewImage,
+  readPictureWatermark,
+  readWatermarkText,
+  type PictureWatermarkInfo,
+  type PictureWatermarkSpec,
+  type Watermark,
+  type WatermarkSpec,
+} from './watermark'
+export {
+  mergeStyleXml,
+  mergeDefaultFontsXml,
+  type DefaultFonts,
+  pendingHeadingLevel,
+  type StyleHeadingInfo,
+  type StyleParaProps,
+  type StyleRunProps,
+} from './style-upsert'
 export {
   INK_NAME_PREFIX,
   anchoredInkRunXml,
@@ -100,16 +147,33 @@ export {
   stripInkRuns,
 } from './ink'
 export { bibliographyLine, citationText, parseSourcesXml } from './sources'
+export { parseZoteroDocumentDataXml, patchZoteroDocumentDataXml } from './zotero-doc-props'
 export { readThemeColors, readThemeFonts } from './theme'
-export { hashProtectionPassword, verifyProtectionPassword } from './protection'
-export { decodeSymbolChar, decodeSymbolText, isSymbolFont, toSymbolPua } from './symbol-fonts'
+export {
+  DEFAULT_SPIN_COUNT,
+  MAX_SPIN_COUNT,
+  hashProtectionPassword,
+  resolveSpinCount,
+  verifyProtectionPassword,
+} from './protection'
+export {
+  decodeSymbolChar,
+  decodeSymbolText,
+  isSymbolFont,
+  symbolGlyph,
+  symbolPuaChar,
+  toSymbolPua,
+} from './symbol-fonts'
 export {
   bulletMarkerScale,
   computeListMarkerInfos,
   computeListMarkers,
+  computeListValues,
   customEnumItems,
   formatNumber,
   markerTabAdvance,
   type ListItemRef,
   type ListMarkerInfo,
 } from './list-markers'
+
+export { previewFontSettings } from './font-settings'

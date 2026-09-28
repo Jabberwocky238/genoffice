@@ -20,11 +20,27 @@ import {
   injectInkRunsIntoParagraph,
   stripInkRuns,
 } from './ink'
+import { resolveRelationshipTargetPath } from './parse-package'
 import { assertZipWithinLimits, resolveMainDocumentPath, type ParseExtras } from './parse'
 import { cleanupDocxOwnedResources } from './resource-cleanup'
 import { loadDocxZip } from './zip-load'
-import { BLANK_NUMBERING_XML, abstractNumXml, type CustomNumberingLevel } from './blank'
-import { applyPageNumType, applySectionSettings, applySectionStartType } from './section'
+import {
+  BLANK_NUMBERING_XML,
+  abstractNumXml,
+  customLevelXml,
+  mergeLevelXml,
+  numPicBulletXml,
+  type CustomNumberingLevel,
+} from './blank'
+import {
+  applyPageNumType,
+  applySectionSettings,
+  applySectionStartType,
+  applyTitlePg,
+  hfReferenceRId,
+  hfReferenceTags,
+  hfReferenceType,
+} from './section'
 import {
   CUSTOM_XML_REL_TYPE,
   buildSourcesItemPropsXml,
@@ -51,6 +67,7 @@ import type {
   NewInkImage,
   NoteInfo,
   ParsedDoc,
+  SdtShell,
   SectionSettings,
   SourceInfo,
   ThemeColors,
@@ -58,15 +75,36 @@ import type {
 } from './types'
 import { PAGE_MARK, TOTAL_PAGES_MARK } from './types'
 import { patchParagraphTexts } from './text-patch'
-import { WATERMARK_NS, watermarkParagraphXml } from './watermark'
+import { balanceFieldChars } from './field-balance'
+import {
+  mergeDefaultFontsXml,
+  upsertStyleXml,
+  type DefaultFonts,
+  type StyleUpsert,
+} from './style-upsert'
+import {
+  WATERMARK_NS,
+  isPictureWatermark,
+  isWatermarkChild,
+  pictureWatermarkParagraphXml,
+  readPictureWatermark,
+  watermarkParagraphXml,
+  type Watermark,
+} from './watermark'
 import { escapeXmlAttr, escapeXmlText } from './xml-utils'
+import {
+  CUSTOM_PROPERTIES_CONTENT_TYPE,
+  CUSTOM_PROPERTIES_PATH,
+  CUSTOM_PROPERTIES_REL_TYPE,
+  patchZoteroDocumentDataXml,
+} from './zotero-doc-props'
 
 export type ParsedDocFull = ParsedDoc & { extras: ParseExtras }
 
 /** Body content in final editor order (hidden trailing elements are appended automatically). */
 export type SaveBlock = (
   | { kind: 'original'; docxIndex: number }
-  | { kind: 'generated'; block: GeneratedBlock }
+  | { kind: 'generated'; block: GeneratedBlock; docxIndex?: number }
   /** self-contained OOXML fragment created by the editor (e.g. a new table);
    *  docxIndex marks the source block (kept when a section-break paragraph is
    *  rewritten, used to inject per-section header references); replaceImage
@@ -80,6 +118,9 @@ export type SaveBlock = (
     }
   /** a new inline image; bytes become word/media/... + relationship */
   | { kind: 'image'; image: NewImage }
+  /** several anchored pictures sharing one holder paragraph (page-pinned floats
+   *  of a rebuilt page): one block instead of one empty paragraph per picture */
+  | { kind: 'images'; images: NewImage[] }
   /** a new embedded chart; data becomes word/charts/chartN.xml + relationship */
   | { kind: 'chart'; chart: NewChart; extentPx?: { w: number; h: number } }
 ) & {
@@ -90,6 +131,10 @@ export type SaveBlock = (
 export interface SaveOptions {
   /** save timestamp (ISO), written to docProps/core.xml dcterms:modified; default = now */
   savedAt?: string
+  /** Zotero document preferences; written as Word-compatible 255-character custom-property chunks */
+  zoteroDocumentData?: string
+  /** replace the trailing w:sectPr with this XML before the field-level options below apply (headless editors that keep the sectPr itself) */
+  trailingSectPr?: string
   /** rewrite page size / margins in the trailing w:sectPr */
   section?: SectionSettings
   /** last-section start type (w:type); rewrites the trailing sectPr when inserting a continuous section break; undefined = keep */
@@ -119,9 +164,27 @@ export interface SaveOptions {
    * reference injected into this section's sectPr (the section becomes independent,
    * earlier sections are unaffected).
    */
-  sectionHf?: Array<{ lastBlockIndex: number; kind: 'header' | 'footer'; hf: HeaderFooter }>
+  sectionHf?: Array<{
+    lastBlockIndex: number
+    kind: 'header' | 'footer'
+    hf: HeaderFooter
+    /** w:type of the reference; absent = default */
+    variant?: 'default' | 'first' | 'even'
+  }>
+  /**
+   * Word's "Link to Previous" switched on: drop the section's own header/footer
+   * reference of that variant so it inherits the previous section's part again.
+   * lastBlockIndex locates the sectPr (a break paragraph or the trailing sectPr).
+   */
+  sectionHfUnlink?: Array<{
+    lastBlockIndex: number
+    kind: 'header' | 'footer'
+    variant?: 'default' | 'first' | 'even'
+  }>
   /** "different odd & even pages": set/remove settings.xml w:evenAndOddHeaders */
   evenAndOddHeaders?: boolean
+  /** mirrored facing pages: set/remove settings.xml w:mirrorMargins */
+  mirrorMargins?: boolean
   /**
    * Inject the newly created header/footer references into EVERY body sectPr
    * that has none (not just the trailing one). Generated multi-section
@@ -145,9 +208,14 @@ export interface SaveOptions {
       abstractNumId: string
       startOverrides: Record<number, number>
     }>
+    /** replace one w:lvl of an existing abstractNum (Adjust List Indents / define on an existing list) */
+    levelEdits?: Array<{ abstractNumId: string; ilvl: number; level: CustomNumberingLevel }>
+    /** new w:numPicBullet images referenced by levels' picBulletId */
+    picBullets?: Array<{ id: number; base64: string; mime: NewImage['mime'] }>
   }
   /** create/modify styles: surgical upsert of word/styles.xml by styleId (replace when present, else append) */
   styleUpserts?: StyleUpsert[]
+  defaultFonts?: DefaultFonts
   /**
    * Replace whole zip parts by path (e.g. patched chart parts from
    * patchChartPartXml). Only paths that already exist in the package are
@@ -183,10 +251,10 @@ export interface SaveOptions {
   footnotes?: NoteInfo[]
   endnotes?: NoteInfo[]
   /**
-   * Text watermark in the default page header: a string sets it, null removes
-   * it, undefined keeps whatever the header already has.
+   * Watermark in the default page header: a string / text spec / picture spec
+   * sets it, null removes it, undefined keeps whatever the header already has.
    */
-  watermark?: string | null
+  watermark?: Watermark | null
   /**
    * Full desired ink-annotation list (freehand strokes), as floating anchored pictures.
    * Existing aidocs-ink runs are stripped and re-emitted from this list, so
@@ -208,73 +276,7 @@ const HF_REL_TYPE = {
   header: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/header',
   footer: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer',
 } as const
-/** Model for creating/modifying a style (used by styleUpserts) */
-export interface StyleUpsert {
-  styleId: string
-  type: 'paragraph' | 'character'
-  name: string
-  basedOn?: string
-  rPr?: {
-    bold?: boolean
-    italic?: boolean
-    underline?: boolean
-    strike?: boolean
-    /** hex without '#' */
-    color?: string
-    sizeHalfPoints?: number
-    font?: string
-  }
-  pPr?: {
-    align?: 'left' | 'center' | 'right' | 'justify'
-    spaceBeforeTwips?: number
-    spaceAfterTwips?: number
-    /** line spacing as a multiple (auto) */
-    lineSpacing?: number
-  }
-}
-
-function buildStyleXml(up: StyleUpsert): string {
-  const rPr: string[] = []
-  if (up.rPr?.font) {
-    const f = escapeXmlAttr(up.rPr.font)
-    rPr.push(`<w:rFonts w:ascii="${f}" w:hAnsi="${f}" w:eastAsia="${f}"/>`)
-  }
-  if (up.rPr?.bold) rPr.push('<w:b/>')
-  if (up.rPr?.italic) rPr.push('<w:i/>')
-  if (up.rPr?.strike) rPr.push('<w:strike/>')
-  if (up.rPr?.color) rPr.push(`<w:color w:val="${escapeXmlAttr(up.rPr.color)}"/>`)
-  if (up.rPr?.sizeHalfPoints) {
-    rPr.push(`<w:sz w:val="${up.rPr.sizeHalfPoints}"/><w:szCs w:val="${up.rPr.sizeHalfPoints}"/>`)
-  }
-  if (up.rPr?.underline) rPr.push('<w:u w:val="single"/>')
-  const pPr: string[] = []
-  const sp = up.pPr
-  if (
-    sp &&
-    (sp.spaceBeforeTwips !== undefined ||
-      sp.spaceAfterTwips !== undefined ||
-      sp.lineSpacing !== undefined)
-  ) {
-    const attrs = [
-      sp.spaceBeforeTwips !== undefined ? ` w:before="${sp.spaceBeforeTwips}"` : '',
-      sp.spaceAfterTwips !== undefined ? ` w:after="${sp.spaceAfterTwips}"` : '',
-      sp.lineSpacing !== undefined
-        ? ` w:line="${Math.round(sp.lineSpacing * 240)}" w:lineRule="auto"`
-        : '',
-    ].join('')
-    pPr.push(`<w:spacing${attrs}/>`)
-  }
-  if (sp?.align) pPr.push(`<w:jc w:val="${sp.align === 'justify' ? 'both' : sp.align}"/>`)
-  return (
-    `<w:style w:type="${up.type}" w:styleId="${escapeXmlAttr(up.styleId)}" w:customStyle="1">` +
-    `<w:name w:val="${escapeXmlAttr(up.name)}"/>` +
-    (up.basedOn ? `<w:basedOn w:val="${escapeXmlAttr(up.basedOn)}"/>` : '') +
-    '<w:qFormat/>' +
-    (pPr.length > 0 ? `<w:pPr>${pPr.join('')}</w:pPr>` : '') +
-    (rPr.length > 0 ? `<w:rPr>${rPr.join('')}</w:rPr>` : '') +
-    '</w:style>'
-  )
-}
+export type { StyleUpsert } from './style-upsert'
 
 const NUMBERING_REL_TYPE =
   'http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering'
@@ -287,6 +289,39 @@ const SETTINGS_REL_TYPE =
 const CHART_REL_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart'
 const CHART_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.drawingml.chart+xml'
 const XLSX_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+
+/** Swap one w:lvl inside the named abstractNum; a missing level is appended in ilvl order */
+function replaceAbstractNumLevel(
+  xml: string,
+  abstractNumId: string,
+  ilvl: number,
+  level: CustomNumberingLevel,
+): string {
+  const absRe = new RegExp(
+    `<w:abstractNum [^>]*w:abstractNumId="${abstractNumId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^>]*>[\\s\\S]*?</w:abstractNum>`,
+  )
+  const abs = absRe.exec(xml)
+  if (!abs) return xml
+  const lvlRe = new RegExp(
+    `<w:lvl [^>]*w:ilvl="${ilvl}"[^>]*>[\\s\\S]*?</w:lvl>|<w:lvl [^>]*w:ilvl="${ilvl}"[^>]*/>`,
+  )
+  let body = abs[0]
+  const existing = lvlRe.exec(body)?.[0]
+  if (existing) body = body.replace(existing, mergeLevelXml(existing, level, ilvl))
+  else {
+    const lvlXml = customLevelXml(level, ilvl)
+    const later = new RegExp(`<w:lvl [^>]*w:ilvl="(\\d)"`, 'g')
+    let insertAt = body.lastIndexOf('</w:abstractNum>')
+    for (const m of body.matchAll(later)) {
+      if (parseInt(m[1], 10) > ilvl) {
+        insertAt = m.index!
+        break
+      }
+    }
+    body = body.slice(0, insertAt) + lvlXml + body.slice(insertAt)
+  }
+  return xml.replace(abs[0], body)
+}
 
 const IMAGE_EXT: Record<NewImage['mime'], string> = {
   'image/png': 'png',
@@ -318,10 +353,8 @@ export async function findChartWorkbookPath(
     // find Relationship with Type ending in /package
     const m = relsXml.match(/Type="[^"]*\/package"[^/]*Target="([^"]+)"/)
     if (!m) return null
-    // Target is relative to dir (word/charts/)
     const target = m[1]
-    if (target.startsWith('/')) return target.slice(1)
-    return `${dir}/${target}`
+    return resolveRelationshipTargetPath(chartPath, target)
   } catch {
     return null
   }
@@ -382,8 +415,8 @@ export async function saveDocx(
   finalBlocks: SaveBlock[],
   options: SaveOptions = {},
 ): Promise<Uint8Array> {
-  const { documentXml, originalBytes, bodyInnerStart, bodyInnerEnd } = parsed.internal
-  const elements = parsed.extras.elements
+  const { documentXml, originalBytes, bodyContentStart, bodyContentEnd } = parsed.internal
+  const { elements, opaqueRegions } = parsed.extras
   const scrubPersonalInfo = options.removePersonalInfo ?? parsed.removePersonalInfo ?? false
 
   const visibleOriginalOrder = parsed.blocks.filter((b) => !b.hidden).map((b) => b.docxIndex)
@@ -396,6 +429,8 @@ export async function saveDocx(
         fb.revision === undefined,
     ) &&
     options.section === undefined &&
+    options.trailingSectPr === undefined &&
+    options.zoteroDocumentData === undefined &&
     options.sectionStartType === undefined &&
     options.pgNumType === undefined &&
     options.pageColor === undefined &&
@@ -407,9 +442,12 @@ export async function saveDocx(
     options.footerEven === undefined &&
     options.titlePg === undefined &&
     (options.sectionHf === undefined || options.sectionHf.length === 0) &&
+    (options.sectionHfUnlink === undefined || options.sectionHfUnlink.length === 0) &&
     options.numbering === undefined &&
+    options.defaultFonts === undefined &&
     (options.styleUpserts === undefined || options.styleUpserts.length === 0) &&
     options.evenAndOddHeaders === undefined &&
+    options.mirrorMargins === undefined &&
     options.comments === undefined &&
     options.protection === undefined &&
     options.writeProtection === undefined &&
@@ -428,6 +466,33 @@ export async function saveDocx(
   const zip = await loadDocxZip(originalBytes)
   assertZipWithinLimits(zip)
   const docPath = (await resolveMainDocumentPath(zip)) ?? 'word/document.xml'
+
+  const customPropertiesEntry = zip.file(CUSTOM_PROPERTIES_PATH)
+  const shouldWriteZoteroData =
+    options.zoteroDocumentData !== undefined &&
+    (options.zoteroDocumentData !== '' || customPropertiesEntry !== null)
+  const customPropertiesXml = shouldWriteZoteroData
+    ? patchZoteroDocumentDataXml(
+        customPropertiesEntry ? await customPropertiesEntry.async('string') : null,
+        options.zoteroDocumentData!,
+      )
+    : null
+  const customPropertiesIsNew = customPropertiesXml !== null && customPropertiesEntry === null
+  const rootRelsPath = '_rels/.rels'
+  let rootRelsXml: string | null = null
+  if (customPropertiesIsNew) {
+    const rootRelsEntry = zip.file(rootRelsPath)
+    if (rootRelsEntry) {
+      rootRelsXml = await rootRelsEntry.async('string')
+      if (!rootRelsXml.includes(CUSTOM_PROPERTIES_REL_TYPE)) {
+        const rId = `rId${maxRelId(rootRelsXml) + 1}`
+        rootRelsXml = rootRelsXml.replace(
+          '</Relationships>',
+          `<Relationship Id="${rId}" Type="${CUSTOM_PROPERTIES_REL_TYPE}" Target="${CUSTOM_PROPERTIES_PATH}"/></Relationships>`,
+        )
+      }
+    }
+  }
 
   // Relationship allocation for newly created hyperlinks and images.
   const relsPath = docPath.replace(/([^/]+)$/, '_rels/$1.rels')
@@ -457,16 +522,40 @@ export async function saveDocx(
   const usedExtensions = new Set<string>()
   // identical bytes embed ONE media part (repeated logos / per-page backgrounds)
   const mediaRelByContent = new Map<string, string>()
+  const mediaPathByContent = new Map<string, string>()
   let imageSeq = nextImageSeq(zip)
   let docPrSeq = imageSeq
-  /** Land image bytes as a media part + relationship; returns the rId.
-   *  Identical bytes reuse ONE media part (repeated logos / per-page backgrounds). */
-  const embedImageMedia = (image: { base64: string; mime: NewImage['mime'] }): string => {
-    const ext = IMAGE_EXT[image.mime]
+  /** Land image bytes as a media part (no relationship); identical bytes share one part. */
+  const landMedia = (image: {
+    base64: string
+    mime: NewImage['mime']
+    sourcePart?: string
+  }): string => {
+    if (image.sourcePart) return image.sourcePart
     const contentKey = `${image.mime}:${image.base64}`
+    let mediaPath = mediaPathByContent.get(contentKey)
+    if (mediaPath === undefined) {
+      const ext = IMAGE_EXT[image.mime]
+      mediaPath = `word/media/aidocs${imageSeq++}.${ext}`
+      newMedia.push({ path: mediaPath, base64: image.base64 })
+      usedExtensions.add(ext)
+      mediaPathByContent.set(contentKey, mediaPath)
+    }
+    return mediaPath
+  }
+  /** Land image bytes as a media part + document relationship; returns the rId.
+   *  Identical bytes reuse ONE media part (repeated logos / per-page backgrounds). */
+  const embedImageMedia = (image: {
+    base64: string
+    mime: NewImage['mime']
+    sourcePart?: string
+  }): string => {
+    const contentKey = image.sourcePart
+      ? `part:${image.sourcePart}`
+      : `${image.mime}:${image.base64}`
     let rId = mediaRelByContent.get(contentKey)
     if (rId === undefined) {
-      const mediaPath = `word/media/aidocs${imageSeq++}.${ext}`
+      const mediaPath = landMedia(image)
       rId = `rId${nextRelNum++}`
       newRels.push({
         rId,
@@ -474,8 +563,6 @@ export async function saveDocx(
         target: mediaPath.replace(/^word\//, ''),
         external: false,
       })
-      newMedia.push({ path: mediaPath, base64: image.base64 })
-      usedExtensions.add(ext)
       mediaRelByContent.set(contentKey, rId)
     }
     return rId
@@ -511,7 +598,7 @@ export async function saveDocx(
       `<w:p>${pPr}<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0">` +
       `<wp:extent cx="${cx}" cy="${cy}"/>` +
       `<wp:effectExtent l="${eeX}" t="${eeY}" r="${eeX}" b="${eeY}"/>` +
-      `<wp:docPr id="${docPrId}" name="Picture ${docPrId}"/>` +
+      `<wp:docPr id="${docPrId}" name="Picture ${docPrId}"${image.altText ? ` descr="${escapeXmlAttr(image.altText)}"` : ''}/>` +
       '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">' +
       '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
       '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
@@ -523,6 +610,16 @@ export async function saveDocx(
     return image.wrap
       ? applyImageWrap(xml, image.wrap, image.posOffsetEmu, undefined, image.zOrder)
       : xml
+  }
+  /** the pictures' runs collected into the first picture's holder paragraph */
+  const embedImages = (images: NewImage[]): string => {
+    const paras = images.map(embedImage)
+    if (paras.length <= 1) return paras[0] ?? ''
+    const runOf = (para: string) => para.slice(para.indexOf('<w:r>'), para.lastIndexOf('</w:p>'))
+    const first = paras[0]
+    return (
+      first.slice(0, first.lastIndexOf('</w:p>')) + paras.slice(1).map(runOf).join('') + '</w:p>'
+    )
   }
 
   // ---- new embedded charts: chart part + workbook + relationship + drawing paragraph ----
@@ -620,38 +717,112 @@ export async function saveDocx(
   const hfParts: Array<{ path: string; xml: string }> = []
   const hfRefTags: string[] = []
   const hfOverrides: string[] = []
+  /** header-part rels rewritten for a picture watermark (path -> xml) */
+  const hfRelsOut = new Map<string, string>()
+  // the page box the watermark is fitted to must be the one this save writes
+  const savedSectPr = options.section
+    ? applySectionSettings(options.trailingSectPr ?? trailingSectPr, options.section)
+    : (options.trailingSectPr ?? trailingSectPr)
+  const sectAttr = (tag: RegExp, key: string): number | null => {
+    const el = tag.exec(savedSectPr)?.[0]
+    const v = el ? new RegExp(`\\sw:${key}="(-?\\d+)"`).exec(el)?.[1] : undefined
+    return v ? parseInt(v, 10) : null
+  }
+  const pgW = sectAttr(/<w:pgSz\b[^>]*>/, 'w')
+  const pgH = sectAttr(/<w:pgSz\b[^>]*>/, 'h')
+  const marginBoxPt =
+    pgW && pgH
+      ? {
+          widthPt:
+            (pgW -
+              (sectAttr(/<w:pgMar\b[^>]*>/, 'left') ?? 1440) -
+              (sectAttr(/<w:pgMar\b[^>]*>/, 'right') ?? 1440)) /
+            20,
+          heightPt:
+            (pgH -
+              (sectAttr(/<w:pgMar\b[^>]*>/, 'top') ?? 1440) -
+              (sectAttr(/<w:pgMar\b[^>]*>/, 'bottom') ?? 1440)) /
+            20,
+        }
+      : null
+  /**
+   * The watermark paragraph XML for a header part: undefined = keep the part's
+   * own watermark, '' = remove it, otherwise the regenerated sdt. A picture
+   * watermark lands its media part and an image relationship in the part's
+   * own rels; a superseded picture watermark's relationship is dropped.
+   */
+  const watermarkXmlFor = async (
+    watermark: Watermark | null | undefined,
+    partPath: string,
+    originalXml: string | null,
+  ): Promise<string | undefined> => {
+    if (watermark === undefined) return undefined
+    const relsPath = partPath.replace(/^word\/([^/]+)$/, 'word/_rels/$1.rels')
+    const relsFile = zip.file(relsPath)
+    let relsXml =
+      (await relsFile?.async('string')) ??
+      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>'
+    let relsChanged = false
+    const old = originalXml ? readPictureWatermark(originalXml) : null
+    if (old && (originalXml!.match(new RegExp(`r:id="${old.rId}"`, 'g')) ?? []).length === 1) {
+      const before = relsXml
+      relsXml = relsXml.replace(new RegExp(`<Relationship\\s[^>]*\\bId="${old.rId}"[^>]*/>`), '')
+      relsChanged = relsXml !== before
+    }
+    let xml: string
+    if (watermark === null) xml = ''
+    else if (!isPictureWatermark(watermark)) xml = watermarkParagraphXml(watermark)
+    else {
+      const mediaPath = landMedia(watermark.image)
+      let n = 1
+      while (relsXml.includes(`Id="rId${n}"`)) n++
+      const rId = `rId${n}`
+      relsXml = relsXml.replace(
+        '</Relationships>',
+        `<Relationship Id="${rId}" Type="${IMAGE_REL_TYPE}" Target="${mediaPath.replace(/^word\//, '')}"/></Relationships>`,
+      )
+      relsChanged = true
+      xml = pictureWatermarkParagraphXml(watermark, rId, marginBoxPt)
+    }
+    if (relsChanged) hfRelsOut.set(relsPath, relsXml)
+    return xml
+  }
   const planHeaderFooter = async (
     kind: 'header' | 'footer',
     hf: HeaderFooter | undefined,
-    watermark: string | null = null,
+    watermark: Watermark | null | undefined = undefined,
     hfType: 'default' | 'first' | 'even' = 'default',
     watermarkOnly = false,
   ) => {
     if (hf === undefined) return
-    const refs = trailingSectPr.match(new RegExp(`<w:${kind}Reference[^>]*/>`, 'g')) ?? []
+    const refs = hfReferenceTags(trailingSectPr, kind)
     // non-schema w:type="odd" and untyped references count as default (mirrors parse)
     const existing =
-      refs.find((r) => r.includes(`w:type="${hfType}"`)) ??
+      refs.find((r) => hfReferenceType(r) === hfType) ??
       (hfType === 'default'
-        ? (refs.find((r) => r.includes('w:type="odd"')) ?? refs.find((r) => !/w:type="/.test(r)))
+        ? (refs.find((r) => hfReferenceType(r) === 'odd') ??
+          refs.find((r) => hfReferenceType(r) === undefined))
         : undefined)
-    const rId = existing ? /r:id="([^"]+)"/.exec(existing)?.[1] : undefined
+    const rId = existing ? hfReferenceRId(existing) : undefined
     const target = rId ? relTargets.get(rId) : undefined
     if (target) {
-      const path = target.startsWith('/') ? target.slice(1) : `word/${target}`
+      const path = resolveRelationshipTargetPath(docPath, target)
+      if (!path) return
       const file = zip.file(path)
       const originalXml = file ? await file.async('string') : null
+      const wmXml =
+        kind === 'header' ? await watermarkXmlFor(watermark, path, originalXml) : undefined
       // A watermark-only change patches the original part in place (tables/logos/fields
       // all preserved); header text edits use paragraph replace-merge (non-paragraph
       // children preserved).
       let partXml: string | null = null
-      if (watermarkOnly && kind === 'header' && originalXml) {
-        partXml = patchWatermarkInPart(originalXml, watermark)
+      if (watermarkOnly && kind === 'header' && originalXml && wmXml !== undefined) {
+        partXml = patchWatermarkInPart(originalXml, wmXml)
       }
-      if (partXml === null) partXml = headerFooterPartXml(kind, hf, watermark, originalXml)
+      if (partXml === null) partXml = headerFooterPartXml(kind, hf, wmXml, originalXml)
       hfParts.push({ path, xml: partXml })
     } else {
-      const partXml = headerFooterPartXml(kind, hf, watermark)
       let n = 1
       while (
         zip.file(`word/${kind}${n}.xml`) ||
@@ -659,6 +830,9 @@ export async function saveDocx(
       )
         n++
       const filename = `${kind}${n}.xml`
+      const wmXml =
+        kind === 'header' ? await watermarkXmlFor(watermark, `word/${filename}`, null) : undefined
+      const partXml = headerFooterPartXml(kind, hf, wmXml)
       const newRId = `rId${nextRelNum++}`
       newRels.push({ rId: newRId, type: HF_REL_TYPE[kind], target: filename, external: false })
       hfParts.push({ path: `word/${filename}`, xml: partXml })
@@ -669,47 +843,57 @@ export async function saveDocx(
     }
   }
   // A watermark change forces a header-part rewrite even when the header text
-  // itself is untouched; conversely a header rewrite must carry the existing
-  // watermark through (the part is regenerated wholesale).
+  // itself is untouched; a header rewrite without a watermark change keeps the
+  // part's own watermark bytes.
   const effectiveHeader =
     options.header ??
     (options.watermark !== undefined ? { text: parsed.headerText ?? '' } : undefined)
-  const effectiveWatermark =
-    options.watermark !== undefined ? options.watermark : (parsed.watermarkText ?? null)
   await planHeaderFooter(
     'header',
     effectiveHeader,
-    effectiveWatermark,
+    options.watermark,
     'default',
     options.header === undefined,
   )
   await planHeaderFooter('footer', options.footer)
-  await planHeaderFooter('header', options.headerFirst, null, 'first')
-  await planHeaderFooter('footer', options.footerFirst, null, 'first')
-  await planHeaderFooter('header', options.headerEven, null, 'even')
-  await planHeaderFooter('footer', options.footerEven, null, 'even')
+  await planHeaderFooter('header', options.headerFirst, undefined, 'first')
+  await planHeaderFooter('footer', options.footerFirst, undefined, 'first')
+  await planHeaderFooter('header', options.headerEven, undefined, 'even')
+  await planHeaderFooter('footer', options.footerEven, undefined, 'even')
 
   // ---- Per-section header/footer (non-last sections): with a reference, rewrite the
   // part; without one, create a part + inject the reference ----
   const sectionRefTags = new Map<number, string[]>()
+  const unlinkSectionHf = (xml: string, docxIndex: number): string => {
+    let out = xml
+    for (const u of options.sectionHfUnlink ?? []) {
+      if (u.lastBlockIndex !== docxIndex) continue
+      out = removeHfReference(out, u.kind, u.variant ?? 'default')
+    }
+    return out
+  }
   for (const edit of options.sectionHf ?? []) {
     const block = parsed.blocks.find((b) => b.docxIndex === edit.lastBlockIndex)
     const sectPr =
       block?.originalXml?.match(/<w:sectPr[^>]*\/>|<w:sectPr[\s\S]*?<\/w:sectPr>/)?.[0] ?? ''
     const refs = sectPr.match(new RegExp(`<w:${edit.kind}Reference[^>]*/>`, 'g')) ?? []
+    const variant = edit.variant ?? 'default'
     const existing =
-      refs.find((r) => r.includes('w:type="default"')) ??
-      refs.find((r) => r.includes('w:type="odd"')) ??
-      refs.find((r) => !/w:type="/.test(r))
+      variant === 'default'
+        ? (refs.find((r) => r.includes('w:type="default"')) ??
+          refs.find((r) => r.includes('w:type="odd"')) ??
+          refs.find((r) => !/w:type="/.test(r)))
+        : refs.find((r) => r.includes(`w:type="${variant}"`))
     const rId = existing ? /r:id="([^"]+)"/.exec(existing)?.[1] : undefined
     const target = rId ? relTargets.get(rId) : undefined
     if (target) {
-      const path = target.startsWith('/') ? target.slice(1) : `word/${target}`
+      const path = resolveRelationshipTargetPath(docPath, target)
+      if (!path) continue
       const file = zip.file(path)
       const originalXml = file ? await file.async('string') : null
-      hfParts.push({ path, xml: headerFooterPartXml(edit.kind, edit.hf, null, originalXml) })
+      hfParts.push({ path, xml: headerFooterPartXml(edit.kind, edit.hf, undefined, originalXml) })
     } else {
-      const partXml = headerFooterPartXml(edit.kind, edit.hf, null)
+      const partXml = headerFooterPartXml(edit.kind, edit.hf)
       let n = 1
       while (
         zip.file(`word/${edit.kind}${n}.xml`) ||
@@ -724,7 +908,7 @@ export async function saveDocx(
         `<Override PartName="/word/${filename}" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.${edit.kind}+xml"/>`,
       )
       const tags = sectionRefTags.get(edit.lastBlockIndex) ?? []
-      tags.push(`<w:${edit.kind}Reference w:type="default" r:id="${newRId}"/>`)
+      tags.push(`<w:${edit.kind}Reference w:type="${variant}" r:id="${newRId}"/>`)
       sectionRefTags.set(edit.lastBlockIndex, tags)
     }
   }
@@ -734,9 +918,12 @@ export async function saveDocx(
   const numberingPath = 'word/numbering.xml'
   let numberingXmlOut: string | null = null
   let numberingIsNew = false
+  let numberingRelsOut: { path: string; xml: string; isNew: boolean } | null = null
   if (
     (options.numbering?.newDefs?.length ?? 0) > 0 ||
-    (options.numbering?.restartNums?.length ?? 0) > 0
+    (options.numbering?.restartNums?.length ?? 0) > 0 ||
+    (options.numbering?.levelEdits?.length ?? 0) > 0 ||
+    (options.numbering?.picBullets?.length ?? 0) > 0
   ) {
     const file = zip.file(numberingPath)
     let xml = file ? await file.async('string') : null
@@ -758,12 +945,17 @@ export async function saveDocx(
     }
     const absXmls: string[] = []
     const numXmls: string[] = []
+    // the renderer names a not-yet-saved definition's abstractNum "pending-<numId>"
+    const pendingAbs = new Map<string, string>()
     for (const def of options.numbering?.newDefs ?? []) {
       const absId = String(++maxAbs)
+      pendingAbs.set(`pending-${def.numId}`, absId)
       absXmls.push(abstractNumXml(absId, def.kind, def.levels))
       numXmls.push(`<w:num w:numId="${def.numId}"><w:abstractNumId w:val="${absId}"/></w:num>`)
     }
     for (const r of options.numbering?.restartNums ?? []) {
+      const absId = pendingAbs.get(r.abstractNumId) ?? r.abstractNumId
+      if (absId.startsWith('pending-')) continue
       const overrides = Object.entries(r.startOverrides)
         .map(
           ([ilvl, v]) =>
@@ -771,8 +963,37 @@ export async function saveDocx(
         )
         .join('')
       numXmls.push(
-        `<w:num w:numId="${r.numId}"><w:abstractNumId w:val="${r.abstractNumId}"/>${overrides}</w:num>`,
+        `<w:num w:numId="${r.numId}"><w:abstractNumId w:val="${absId}"/>${overrides}</w:num>`,
       )
+    }
+    for (const edit of options.numbering?.levelEdits ?? []) {
+      if (edit.abstractNumId.startsWith('pending-')) continue
+      xml = replaceAbstractNumLevel(xml, edit.abstractNumId, edit.ilvl, edit.level)
+    }
+    if ((options.numbering?.picBullets?.length ?? 0) > 0) {
+      const relsPath = 'word/_rels/numbering.xml.rels'
+      const relsFile = zip.file(relsPath)
+      let relsXml = relsFile
+        ? await relsFile.async('string')
+        : '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>'
+      let relNum = 1
+      for (const m of relsXml.matchAll(/Id="rId(\d+)"/g))
+        relNum = Math.max(relNum, parseInt(m[1], 10) + 1)
+      const picXmls: string[] = []
+      for (const pic of options.numbering?.picBullets ?? []) {
+        const mediaPath = landMedia(pic)
+        const rId = `rId${relNum++}`
+        relsXml = relsXml.replace(
+          '</Relationships>',
+          `<Relationship Id="${rId}" Type="${IMAGE_REL_TYPE}" Target="${escapeXmlAttr(mediaPath.replace(/^word\//, ''))}"/></Relationships>`,
+        )
+        picXmls.push(numPicBulletXml(pic.id, rId))
+      }
+      // Schema order: numPicBullet* precedes abstractNum*
+      xml = /<w:abstractNum[\s>]/.test(xml)
+        ? xml.replace(/<w:abstractNum[\s>]/, (m) => picXmls.join('') + m)
+        : xml.replace('</w:numbering>', `${picXmls.join('')}</w:numbering>`)
+      numberingRelsOut = { path: relsPath, xml: relsXml, isNew: !relsFile }
     }
     // Schema order: abstractNum* comes before num* — insert new abstracts before the first w:num
     if (absXmls.length > 0) {
@@ -787,22 +1008,14 @@ export async function saveDocx(
   // ---- styles: surgical upsert of word/styles.xml (create/modify styles) ----
   const stylesPath = 'word/styles.xml'
   let stylesXmlOut: string | null = null
-  if ((options.styleUpserts?.length ?? 0) > 0) {
+  if ((options.styleUpserts?.length ?? 0) > 0 || options.defaultFonts !== undefined) {
     const file = zip.file(stylesPath)
     let xml = file
       ? await file.async('string')
       : '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' +
         '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"></w:styles>'
-    for (const up of options.styleUpserts ?? []) {
-      const styleXml = buildStyleXml(up)
-      const existing = new RegExp(
-        `<w:style [^>]*w:styleId="${up.styleId.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}"[\\s\\S]*?</w:style>`,
-      )
-      xml = existing.test(xml)
-        ? xml.replace(existing, styleXml)
-        : xml.replace('</w:styles>', `${styleXml}</w:styles>`)
-    }
-    stylesXmlOut = xml
+    for (const up of options.styleUpserts ?? []) xml = upsertStyleXml(xml, up)
+    stylesXmlOut = options.defaultFonts ? mergeDefaultFontsXml(xml, options.defaultFonts) : xml
   }
 
   // ---- comments: regenerate word/comments.xml from the full desired list ----
@@ -935,7 +1148,79 @@ export async function saveDocx(
     }
   }
 
-  const parts: string[] = []
+  const retainedIndexes = new Set<number>()
+  for (const block of finalBlocks) {
+    if (block.kind === 'original') retainedIndexes.add(block.docxIndex)
+    else if (
+      (block.kind === 'xml' || block.kind === 'generated') &&
+      block.docxIndex !== undefined
+    ) {
+      retainedIndexes.add(block.docxIndex)
+    }
+  }
+  for (const block of parsed.blocks) {
+    if (block.hidden && block.docxIndex !== null) retainedIndexes.add(block.docxIndex)
+  }
+  // an sdt shell is re-emitted from its raw openXml/closeXml bytes, so opaque
+  // markup inside the shell (a comment in w:sdtPr) is already carried along
+  const sdtShellByIndex = new Map<number, SdtShell>()
+  for (const block of parsed.blocks) {
+    if (block.sdtShell && block.docxIndex !== null)
+      sdtShellByIndex.set(block.docxIndex, block.sdtShell)
+  }
+  const insideSdtShell = (index: number, region: { start: number; end: number }): boolean => {
+    const shell = sdtShellByIndex.get(index)
+    const element = elements[index]
+    if (!shell || !element) return false
+    return (
+      region.end <= element.start + shell.openXml.length ||
+      region.start >= element.end - shell.closeXml.length
+    )
+  }
+  const opaqueBefore = new Map<number, string[]>()
+  const opaqueAfter = new Map<number, string[]>()
+  const nestedOpaque = new Map<number, string[]>()
+  const detachedOpaque: string[] = []
+  for (const region of opaqueRegions) {
+    if (region.start < bodyContentStart || region.end > bodyContentEnd) continue
+    const containingIndex = elements.findIndex(
+      (element) => region.start >= element.start && region.end <= element.end,
+    )
+    const xml = documentXml.slice(region.start, region.end)
+    if (containingIndex !== -1) {
+      if (insideSdtShell(containingIndex, region)) continue
+      if (retainedIndexes.has(containingIndex)) {
+        const regions = nestedOpaque.get(containingIndex) ?? []
+        regions.push(xml)
+        nestedOpaque.set(containingIndex, regions)
+      } else {
+        detachedOpaque.push(xml)
+      }
+      continue
+    }
+    let afterIndex = -1
+    let beforeIndex = -1
+    for (let index = 0; index < elements.length; index++) {
+      if (elements[index].end <= region.start) afterIndex = index
+      if (elements[index].start >= region.end) {
+        beforeIndex = index
+        break
+      }
+    }
+    if (afterIndex !== -1 && retainedIndexes.has(afterIndex)) {
+      const regions = opaqueAfter.get(afterIndex) ?? []
+      regions.push(xml)
+      opaqueAfter.set(afterIndex, regions)
+    } else if (beforeIndex !== -1 && retainedIndexes.has(beforeIndex)) {
+      const regions = opaqueBefore.get(beforeIndex) ?? []
+      regions.push(xml)
+      opaqueBefore.set(beforeIndex, regions)
+    } else {
+      detachedOpaque.push(xml)
+    }
+  }
+
+  const parts: string[] = [...detachedOpaque]
   for (let i = 0; i < finalBlocks.length; i++) {
     const fb = finalBlocks[i]
     let xml: string
@@ -946,6 +1231,7 @@ export async function saveDocx(
       xml = documentXml.slice(el.start, el.end)
       fbDocxIndex = fb.docxIndex
     } else if (fb.kind === 'generated') {
+      if (fb.docxIndex !== undefined) fbDocxIndex = fb.docxIndex
       xml = generateParagraphXml(fb.block, genCtx)
       // If the original paragraph was inside a w:sdt shell, re-wrap it
       if (fb.block.sdtShell) {
@@ -957,6 +1243,8 @@ export async function saveDocx(
       if (fb.replaceImage) xml = retargetImageBlip(xml, embedImageMedia(fb.replaceImage))
     } else if (fb.kind === 'chart') {
       xml = await embedChart(fb.chart, fb.extentPx)
+    } else if (fb.kind === 'images') {
+      xml = embedImages(fb.images)
     } else {
       xml = embedImage(fb.image)
     }
@@ -966,6 +1254,7 @@ export async function saveDocx(
     if (refTags && refTags.length > 0) {
       xml = xml.replace(/(<w:sectPr[^>]*>)/, `$1${refTags.join('')}`)
     }
+    if (fbDocxIndex !== undefined) xml = unlinkSectionHf(xml, fbDocxIndex)
     // The ink list is authoritative: old aidocs-ink runs go away, the desired
     // set is re-injected at its (possibly new) anchor paragraphs.
     if (options.inks !== undefined) xml = stripInkRuns(xml)
@@ -976,13 +1265,22 @@ export async function saveDocx(
       const injected = injectInkRunsIntoParagraph(xml, blockInks.map(inkRunXml).join(''))
       if (injected !== null) xml = injected
     }
-    if (fb.revision && !new RegExp(`^<w:${fb.revision.kind}[\\s>]`).test(xml)) {
+    if (fb.revision && !new RegExp(`^<w:${fb.revision.kind}(?:\\s|>)`).test(xml)) {
       const revision = fb.revision
       const attrs =
         ` w:id="${escapeXmlAttr(revision.id ?? '0')}"` +
         ` w:author="${escapeXmlAttr(revision.author)}"` +
         (revision.date ? ` w:date="${escapeXmlAttr(revision.date)}"` : '')
       xml = `<w:${revision.kind}${attrs}>${xml}</w:${revision.kind}>`
+    }
+    if (fbDocxIndex !== undefined && fb.kind !== 'original') {
+      const nested = (nestedOpaque.get(fbDocxIndex) ?? []).join('')
+      if (nested) xml = insertBeforeClosingTag(xml, nested)
+    }
+    if (fbDocxIndex !== undefined) {
+      const leadingOpaque = (opaqueBefore.get(fbDocxIndex) ?? []).join('')
+      const trailingOpaque = (opaqueAfter.get(fbDocxIndex) ?? []).join('')
+      if (leadingOpaque || trailingOpaque) xml = leadingOpaque + xml + trailingOpaque
     }
     parts.push(xml)
   }
@@ -993,6 +1291,7 @@ export async function saveDocx(
       const el = elements[block.docxIndex]
       let xml = documentXml.slice(el.start, el.end)
       if (xml.includes('<w:sectPr')) {
+        if (options.trailingSectPr) xml = options.trailingSectPr
         if (options.section) xml = applySectionSettings(xml, options.section)
         if (options.sectionStartType) xml = applySectionStartType(xml, options.sectionStartType)
         if (options.pgNumType)
@@ -1002,13 +1301,22 @@ export async function saveDocx(
         if (hfRefTags.length > 0) {
           xml = xml.replace(/(<w:sectPr[^>]*>)/, `$1${hfRefTags.join('')}`)
         }
+        xml = unlinkSectionHf(xml, block.docxIndex)
+      }
+      const index = block.docxIndex
+      if (index !== null) {
+        const leadingOpaque = (opaqueBefore.get(index) ?? []).join('')
+        const trailingOpaque = (opaqueAfter.get(index) ?? []).join('')
+        if (leadingOpaque || trailingOpaque) xml = leadingOpaque + xml + trailingOpaque
       }
       parts.push(xml)
     }
   }
 
   let newDocumentXml =
-    documentXml.slice(0, bodyInnerStart) + parts.join('') + documentXml.slice(bodyInnerEnd)
+    documentXml.slice(0, bodyContentStart) +
+    balanceFieldChars(parts.join('')) +
+    documentXml.slice(bodyContentEnd)
 
   // every ref-less body sectPr picks up the new header/footer references
   // (the trailing sectPr already received them above and is skipped by the
@@ -1048,7 +1356,8 @@ export async function saveDocx(
     options.protection !== undefined ||
     options.writeProtection !== undefined ||
     options.removePersonalInfo !== undefined ||
-    options.evenAndOddHeaders !== undefined
+    options.evenAndOddHeaders !== undefined ||
+    options.mirrorMargins !== undefined
   ) {
     const file = zip.file(settingsPath)
     let xml: string
@@ -1092,6 +1401,10 @@ export async function saveDocx(
       xml = applyEvenAndOddHeaders(xml, options.evenAndOddHeaders)
       touched = true
     }
+    if (options.mirrorMargins !== undefined) {
+      xml = applySettingsFlag(xml, 'w:mirrorMargins', options.mirrorMargins)
+      touched = true
+    }
     if (touched) settingsXml = xml
   }
 
@@ -1120,7 +1433,8 @@ export async function saveDocx(
     numberingIsNew ||
     notesParts.some((p) => p.isNew) ||
     sourcesPart?.isNew ||
-    themePart?.isNew
+    themePart?.isNew ||
+    customPropertiesIsNew
   if (hasNewParts) {
     const file = zip.file(contentTypesPath)
     if (file) {
@@ -1184,6 +1498,9 @@ export async function saveDocx(
         )
       }
       if (themePart?.isNew) addOverride(`/${THEME_PART_PATH}`, THEME_CONTENT_TYPE)
+      if (customPropertiesIsNew) {
+        addOverride(`/${CUSTOM_PROPERTIES_PATH}`, CUSTOM_PROPERTIES_CONTENT_TYPE)
+      }
     }
   }
 
@@ -1203,10 +1520,14 @@ export async function saveDocx(
       out.file(name, newDocumentXml, { date: entry.date })
     } else if (hfPart) {
       out.file(name, hfPart.xml, { date: entry.date })
+    } else if (hfRelsOut.has(name)) {
+      out.file(name, hfRelsOut.get(name)!, { date: entry.date })
     } else if (name === relsPath && relsChanged && relsXml) {
       out.file(name, relsXml, { date: entry.date })
     } else if (name === contentTypesPath && contentTypesXml !== null) {
       out.file(name, contentTypesXml, { date: entry.date })
+    } else if (name === rootRelsPath && rootRelsXml !== null) {
+      out.file(name, rootRelsXml, { date: entry.date })
     } else if (name === settingsPath && settingsXml !== null) {
       out.file(name, settingsXml, { date: entry.date })
     } else if (name === commentsPath && commentsXml !== null) {
@@ -1215,6 +1536,8 @@ export async function saveDocx(
       out.file(name, commentsExtXml, { date: entry.date })
     } else if (name === numberingPath && numberingXmlOut !== null) {
       out.file(name, numberingXmlOut, { date: entry.date })
+    } else if (numberingRelsOut && name === numberingRelsOut.path) {
+      out.file(name, numberingRelsOut.xml, { date: entry.date })
     } else if (name === stylesPath && stylesXmlOut !== null) {
       out.file(name, stylesXmlOut, { date: entry.date })
     } else if (notesParts.some((p) => p.path === name)) {
@@ -1223,6 +1546,8 @@ export async function saveDocx(
       out.file(name, sourcesPart.xml, { date: entry.date })
     } else if (themePart && name === THEME_PART_PATH) {
       out.file(name, themePart.xml, { date: entry.date })
+    } else if (name === CUSTOM_PROPERTIES_PATH && customPropertiesXml !== null) {
+      out.file(name, customPropertiesXml, { date: entry.date })
     } else if (name === CORE_PROPS_PATH && coreXmlOut !== null) {
       out.file(name, coreXmlOut, { date: entry.date })
     } else if (options.partXml && options.partXml[name] !== undefined) {
@@ -1239,6 +1564,9 @@ export async function saveDocx(
   for (const part of hfParts) {
     if (!zip.file(part.path)) out.file(part.path, part.xml)
   }
+  for (const [path, xml] of hfRelsOut) {
+    if (!zip.file(path)) out.file(path, xml)
+  }
   if (relsChanged && relsXml && !zip.file(relsPath)) {
     out.file(relsPath, relsXml)
   }
@@ -1250,6 +1578,9 @@ export async function saveDocx(
   }
   if (numberingIsNew && numberingXmlOut !== null) {
     out.file(numberingPath, numberingXmlOut)
+  }
+  if (numberingRelsOut?.isNew) {
+    out.file(numberingRelsOut.path, numberingRelsOut.xml)
   }
   if (stylesXmlOut !== null && !zip.file(stylesPath)) {
     out.file(stylesPath, stylesXmlOut)
@@ -1284,6 +1615,9 @@ export async function saveDocx(
   if (themePart?.isNew) {
     out.file(THEME_PART_PATH, themePart.xml)
   }
+  if (customPropertiesIsNew && customPropertiesXml !== null) {
+    out.file(CUSTOM_PROPERTIES_PATH, customPropertiesXml)
+  }
   await cleanupDocxOwnedResources(out, docPath)
   if (scrubPersonalInfo) await scrubPersonalMetadata(out)
   return out.generateAsync({
@@ -1293,18 +1627,96 @@ export async function saveDocx(
   })
 }
 
+function insertBeforeClosingTag(xml: string, content: string): string {
+  const close = xml.lastIndexOf('</')
+  return close === -1 ? xml + content : xml.slice(0, close) + content + xml.slice(close)
+}
+
 /**
  * A comment-list edit is authoritative. Remove body markers for ids no longer
  * present even when their paragraphs were copied through as original XML.
  */
+function opaqueMarkupEnd(xml: string, start: number): number | null {
+  if (xml.startsWith('<!--', start)) {
+    const at = xml.indexOf('-->', start + 4)
+    return at === -1 ? xml.length : at + 3
+  }
+  if (xml.startsWith('<![CDATA[', start)) {
+    const at = xml.indexOf(']]>', start + 9)
+    return at === -1 ? xml.length : at + 3
+  }
+  if (xml.startsWith('<?', start)) {
+    const at = xml.indexOf('?>', start + 2)
+    return at === -1 ? xml.length : at + 2
+  }
+  if (!xml.startsWith('<!', start)) return null
+  let quote = ''
+  let subsetDepth = 0
+  for (let index = start + 2; index < xml.length; index += 1) {
+    const character = xml[index]
+    if (quote) {
+      if (character === quote) quote = ''
+    } else if (character === '"' || character === "'") {
+      quote = character
+    } else if (character === '[') {
+      subsetDepth += 1
+    } else if (character === ']') {
+      subsetDepth = Math.max(0, subsetDepth - 1)
+    } else if (character === '>' && subsetDepth === 0) {
+      return index + 1
+    }
+  }
+  return xml.length
+}
+
+function xmlTagEnd(xml: string, start: number): number {
+  let quote = ''
+  for (let index = start + 1; index < xml.length; index += 1) {
+    const character = xml[index]
+    if (quote) {
+      if (character === quote) quote = ''
+    } else if (character === '"' || character === "'") {
+      quote = character
+    } else if (character === '>') {
+      return index + 1
+    }
+  }
+  return xml.length
+}
+
 function removeDeletedCommentMarkers(xml: string, liveIds: Set<string>): string {
-  return xml.replace(
-    /<w:comment(?:RangeStart|RangeEnd|Reference)\b[^>]*(?:\/\s*>|>\s*<\/w:comment(?:RangeStart|RangeEnd|Reference)\s*>)/g,
-    (tag) => {
-      const id = /\bw:id\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(tag)
-      return id && !liveIds.has(id[1] ?? id[2]) ? '' : tag
-    },
-  )
+  let out = ''
+  let cursor = 0
+  while (cursor < xml.length) {
+    const start = xml.indexOf('<', cursor)
+    if (start === -1) return out + xml.slice(cursor)
+    out += xml.slice(cursor, start)
+    const opaqueEnd = opaqueMarkupEnd(xml, start)
+    if (opaqueEnd !== null) {
+      out += xml.slice(start, opaqueEnd)
+      cursor = opaqueEnd
+      continue
+    }
+    const end = xmlTagEnd(xml, start)
+    const tag = xml.slice(start, end)
+    const match = /^<w:(commentRangeStart|commentRangeEnd|commentReference)\b/.exec(tag)
+    const id = /\bw:id\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(tag)
+    if (match && id && !liveIds.has(id[1] ?? id[2])) {
+      const name = match[1]!
+      if (tag.endsWith('/>')) {
+        cursor = end
+        continue
+      }
+      const close = new RegExp(`^\\s*</w:${name}\\s*>`).exec(xml.slice(end))
+      if (close) {
+        cursor = end + close[0].length
+        continue
+      }
+    }
+    out += tag
+    cursor = end
+  }
+  return out
 }
 
 /**
@@ -1317,6 +1729,7 @@ function removeDeletedCommentMarkers(xml: string, liveIds: Set<string>): string 
 function withWatermarkNs(openTag: string): string {
   let out = openTag
   for (const ns of [
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"',
     'xmlns:v="urn:schemas-microsoft-com:vml"',
     'xmlns:o="urn:schemas-microsoft-com:office:office"',
     'xmlns:w10="urn:schemas-microsoft-com:office:word"',
@@ -1332,7 +1745,7 @@ function withWatermarkNs(openTag: string): string {
  * everything else (paragraph formatting/tables/logos/fields) byte-identical. Returns
  * null when the root tag cannot be recognized so the caller falls back to a full rebuild.
  */
-function patchWatermarkInPart(originalXml: string, watermark: string | null): string | null {
+function patchWatermarkInPart(originalXml: string, watermarkXml: string): string | null {
   const open = /<w:hdr[^>]*>/.exec(originalXml)?.[0]
   if (!open) return null
   const openIdx = originalXml.indexOf(open)
@@ -1340,18 +1753,16 @@ function patchWatermarkInPart(originalXml: string, watermark: string | null): st
   if (closeIdx < 0) return null
   const prefix = originalXml.slice(0, openIdx)
   const inner = originalXml.slice(openIdx + open.length, closeIdx)
-  const kept = splitXmlChildren(inner).filter(
-    (c) => !(c.name === 'w:p' && c.xml.includes('<v:textpath')),
-  )
-  const wm = watermark ? watermarkParagraphXml(watermark) : ''
-  const rootOpen = watermark ? withWatermarkNs(open) : open
-  return `${prefix}${rootOpen}${wm}${kept.map((c) => c.xml).join('')}</w:hdr>`
+  const kept = splitXmlChildren(inner).filter((c) => !isWatermarkChild(c))
+  const rootOpen = watermarkXml ? withWatermarkNs(open) : open
+  return `${prefix}${rootOpen}${watermarkXml}${kept.map((c) => c.xml).join('')}</w:hdr>`
 }
 
+/** `watermarkXml`: undefined keeps the part's own watermark child, '' drops it, otherwise replaces it */
 function headerFooterPartXml(
   kind: 'header' | 'footer',
   hf: HeaderFooter,
-  watermark: string | null = null,
+  watermarkXml: string | undefined = undefined,
   originalXml: string | null = null,
 ): string {
   const root = kind === 'header' ? 'w:hdr' : 'w:ftr'
@@ -1382,8 +1793,11 @@ function headerFooterPartXml(
     )
     let pageEmitted = !hf.pageNumber || hasPageMark
     content = hf.paras
-      // table-row paragraphs are display-only: the part's original w:tbl bytes are kept below
-      .filter((para) => !para.cells)
+      // table rows and still-empty drawing-only lines are display-only: the
+      // part's original w:tbl / drawing paragraph bytes are kept below. Text
+      // typed into such a line, or a rebuild without the original part, is
+      // written out like any paragraph.
+      .filter((para) => !para.cells && !(para.lineOnly && originalXml && para.runs.length === 0))
       .map((para) => {
         // the parsed format, not just w:jc: hand-building it here dropped w:bidi and wrote
         // the visual align back as the logical one, flipping RTL headers to LTR
@@ -1435,13 +1849,12 @@ function headerFooterPartXml(
     }
     content = `<w:p><w:pPr><w:jc w:val="center"/></w:pPr>${runs.join('')}</w:p>`
   }
-  const watermarkXml = kind === 'header' && watermark ? watermarkParagraphXml(watermark) : ''
-  const body = `${watermarkXml}${content}`
+  const body = `${watermarkXml ?? ''}${content}`
   // Surgical merge: non-paragraph children of the original part (tables/sdt) and
   // paragraphs containing images/objects (logos etc., which are not in the text-paragraph
   // model) keep their original bytes; only the set of text paragraphs is replaced as a
-  // whole at the position of the first text paragraph. The watermark paragraph
-  // (v:textpath) is the exception — it is regenerated from watermarkXml.
+  // whole at the position of the first text paragraph. The watermark child is kept
+  // verbatim unless watermarkXml replaces or drops it.
   if (originalXml) {
     const open = new RegExp(`<${root}[^>]*>`).exec(originalXml)?.[0]
     const closeIdx = originalXml.lastIndexOf(`</${root}>`)
@@ -1449,9 +1862,9 @@ function headerFooterPartXml(
       const openIdx = originalXml.indexOf(open)
       const children = splitXmlChildren(originalXml.slice(openIdx + open.length, closeIdx))
       const isProtectedPara = (xml: string) =>
-        /<w:drawing[\s>]|<w:pict[\s>]|<w:object[\s>]/.test(xml) && !xml.includes('<v:textpath')
+        /<w:drawing[\s>]|<w:pict[\s>]|<w:object[\s>]/.test(xml)
       const isTextPara = (c: { name: string; xml: string }) =>
-        c.name === 'w:p' && !isProtectedPara(c.xml)
+        c.name === 'w:p' && !isWatermarkChild(c) && !isProtectedPara(c.xml)
       if (children.some((c) => !isTextPara(c))) {
         const parts: string[] = []
         let injected = false
@@ -1461,8 +1874,8 @@ function headerFooterPartXml(
               parts.push(body)
               injected = true
             }
-          } else if (c.name === 'w:p' && c.xml.includes('<v:textpath')) {
-            // Drop the old watermark paragraph (body already carries the regenerated watermarkXml)
+          } else if (isWatermarkChild(c) && watermarkXml !== undefined) {
+            // superseded by the watermark in body (or removed)
           } else {
             parts.push(c.xml)
           }
@@ -1559,7 +1972,8 @@ function buildCommentsExtendedXml(comments: CommentInfo[]): string {
 /** Aligned with parseComments' textOf: each w:p's w:t text, '\n' between paragraphs */
 function commentPlainText(commentXml: string): string {
   const paras: string[] = []
-  const pRe = /<w:p[\s>][\s\S]*?<\/w:p>|<w:p\/>/g
+  // the self-closing form first: the open-to-close alternative would swallow it
+  const pRe = /<w:p(?:\s[^>]*)?\/>|<w:p[\s>][\s\S]*?<\/w:p>/g
   let p: RegExpExecArray | null
   while ((p = pRe.exec(commentXml)) !== null) {
     const texts: string[] = []
@@ -1656,38 +2070,17 @@ function mapXmlStartTags(xml: string, rewrite: (tag: string) => string): string 
     if (start < 0) return out + xml.slice(cursor)
     out += xml.slice(cursor, start)
 
-    const specialEnd = xml.startsWith('<!--', start)
-      ? '-->'
-      : xml.startsWith('<![CDATA[', start)
-        ? ']]>'
-        : xml.startsWith('<?', start)
-          ? '?>'
-          : null
-    if (specialEnd !== null) {
-      const at = xml.indexOf(specialEnd, start + 2)
-      if (at < 0) return out + xml.slice(start)
-      const end = at + specialEnd.length
-      out += xml.slice(start, end)
-      cursor = end
+    const opaqueEnd = opaqueMarkupEnd(xml, start)
+    if (opaqueEnd !== null) {
+      out += xml.slice(start, opaqueEnd)
+      cursor = opaqueEnd
       continue
     }
 
-    let quote = ''
-    let end = start + 1
-    for (; end < xml.length; end += 1) {
-      const char = xml[end]!
-      if (quote) {
-        if (char === quote) quote = ''
-      } else if (char === '"' || char === "'") {
-        quote = char
-      } else if (char === '>') {
-        break
-      }
-    }
-    if (end >= xml.length) return out + xml.slice(start)
-    const tag = xml.slice(start, end + 1)
+    const end = xmlTagEnd(xml, start)
+    const tag = xml.slice(start, end)
     out += tag.startsWith('</') || tag.startsWith('<!') ? tag : rewrite(tag)
-    cursor = end + 1
+    cursor = end
   }
   return out
 }
@@ -1818,13 +2211,23 @@ async function scrubPersonalMetadata(zip: JSZip): Promise<void> {
 }
 
 /** set or remove <w:titlePg/> ("different first page"), before w:docGrid per schema order */
-function applyTitlePg(sectPrXml: string, on: boolean): string {
-  let xml = sectPrXml.replace(/<w:titlePg[^>]*\/>/, '')
-  if (on) {
-    if (/<w:docGrid/.test(xml)) xml = xml.replace(/<w:docGrid/, '<w:titlePg/><w:docGrid')
-    else xml = xml.replace(/<\/w:sectPr>/, '<w:titlePg/></w:sectPr>')
-  }
-  return xml
+/** drop a sectPr's header/footer reference of one variant (default also covers Word's odd and untyped) */
+export function removeHfReference(
+  sectXml: string,
+  kind: 'header' | 'footer',
+  variant: 'default' | 'first' | 'even',
+): string {
+  return sectXml.replace(new RegExp(`<w:${kind}Reference\\b[^>]*/>`, 'g'), (tag) => {
+    const type = /w:type="([^"]+)"/.exec(tag)?.[1]
+    const isDefault = type === undefined || type === 'default' || type === 'odd'
+    return (variant === 'default' ? isDefault : type === variant) ? '' : tag
+  })
+}
+
+/** set or remove an on/off settings flag right after the settings root opens */
+function applySettingsFlag(xml: string, tag: string, on: boolean): string {
+  const out = xml.replace(new RegExp(`<${tag}(?=[\\s/>])[^>]*/>`), '')
+  return on ? out.replace(/(<w:settings[^>]*>)/, `$1<${tag}/>`) : out
 }
 
 /** set or remove <w:evenAndOddHeaders/> right after the settings root opens */
