@@ -542,6 +542,10 @@ if (updateUrl) {
       channel: 'latest',
     },
   ]
+} else if (process.env.GENOFFICE_PUBLISH_NONE === '1') {
+  // standalone release binaries (.github/workflows/release.yml): no update feed,
+  // and no repository auto-detection (it yields a null publisher on CI checkouts)
+  config.publish = null
 }
 
 // CI's "-c.extraMetadata.version=..." CLI override deep-merges with this block,
