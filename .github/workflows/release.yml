@@ -1,0 +1,118 @@
+name: Release
+
+# Builds the Word edition for Windows, Linux and macOS and publishes the
+# binaries to a GitHub Release named after apps/shell/package.json's version
+# (tag v<version>). A version that already has a release is skipped, so bump
+# the version to ship a new one. Every file is attached as-is:
+#   Windows  GenOffice-Word-<v>-windows-x64.exe        (portable, no installer)
+#   Linux    GenOffice-Word-<v>-linux-x86_64.AppImage  (chmod +x and run)
+#   macOS    GenOffice-Word-<v>-macos-arm64.dmg        (ad-hoc signed, not notarized)
+
+on:
+  push:
+    branches: [lileapo-docx]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      exists: ${{ steps.meta.outputs.exists }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(node -p "require('./apps/shell/package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::release v$version already exists, nothing to build"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: version
+    if: needs.version.outputs.exists != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            args: --win portable --x64 '-c.portable.artifactName=GenOffice-Word-${version}-windows-x64.${ext}'
+            file: apps/shell/release/*.exe
+          - os: ubuntu-22.04
+            args: --linux AppImage --x64 '-c.appImage.artifactName=GenOffice-Word-${version}-linux-x86_64.${ext}'
+            file: apps/shell/release/*.AppImage
+          - os: macos-14
+            args: --mac dmg --arm64 -c.mac.identity=- -c.mac.notarize=false -c.dmg.sign=false '-c.dmg.artifactName=GenOffice-Word-${version}-macos-arm64.${ext}'
+            file: apps/shell/release/*.dmg
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      # .npmrc reads it for the GitHub Packages engines (optional dependencies)
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run notices && npm run build:all
+
+      - name: Package
+        working-directory: apps/shell
+        shell: bash
+        run: npx electron-builder ${{ matrix.args }} --publish never
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.os }}
+          path: ${{ matrix.file }}
+          if-no-files-found: error
+          retention-days: 3
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ls -l dist
+          gh release create "v$VERSION" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "GenOffice Word v$VERSION" \
+            --notes "GenOffice Word edition v$VERSION ($GITHUB_SHA). Windows: portable .exe; Linux: AppImage (chmod +x); macOS (Apple Silicon): dmg, ad-hoc signed and not notarized — right-click → Open on first launch."

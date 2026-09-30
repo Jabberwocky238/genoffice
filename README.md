@@ -192,46 +192,16 @@ colors.
 
 ## Download
 
-| Platform                             | Requirements                                          | Download                                                                                  |
-| ------------------------------------ | ----------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| **macOS** — Apple Silicon (arm64)    | macOS 11+                                             | [Latest `.dmg` (arm64)](https://github.com/genspark-ai/genoffice/releases/latest)         |
-| **macOS** — Intel (x64)              | macOS 11+                                             | [Latest `.dmg` (x64)](https://github.com/genspark-ai/genoffice/releases/latest)           |
-| **Windows** (x64, most PCs)          | Windows 10+, Intel/AMD                                | [Latest `-x64.exe` installer](https://github.com/genspark-ai/genoffice/releases/latest)   |
-| **Windows** on Arm (ARM64)           | Windows 11 on Arm (Snapdragon X and similar)          | [Latest `-arm64.exe` installer](https://github.com/genspark-ai/genoffice/releases/latest) |
-| **Linux** — Debian / Ubuntu          | x86_64, glibc 2.34+ (Ubuntu 22.04 or newer)           | [Latest `.deb`](https://github.com/genspark-ai/genoffice/releases/latest)                 |
-| **Linux** — Fedora / RHEL / openSUSE | x86_64, glibc 2.34+ (Fedora 35+, RHEL 9+, Leap 15.6+) | [Latest `.rpm`](https://github.com/genspark-ai/genoffice/releases/latest)                 |
-| **Linux** — other distributions      | x86_64, glibc 2.34+, FUSE 2                           | [Latest `.AppImage`](https://github.com/genspark-ai/genoffice/releases/latest)            |
+Every version of `apps/shell/package.json` is built by
+[`.github/workflows/release.yml`](.github/workflows/release.yml) and published
+as release `v<version>` on the [Releases](../../releases) page, one plain file
+per platform:
 
-All builds of this edition come from the `lileapo-docx` branch.
-Older versions are on the [Releases](https://github.com/genspark-ai/genoffice/releases) page.
-
-<details>
-<summary><b>Installing on Linux</b></summary>
-
-The deb installs with apt — it pulls in the dependencies and adds GenOffice
-to the applications menu:
-
-```bash
-sudo apt install ./genoffice_<version>_amd64.deb
-```
-
-On Fedora / RHEL-family / openSUSE, install the rpm instead:
-
-```bash
-sudo dnf install ./genoffice-<version>.x86_64.rpm     # Fedora / RHEL family
-sudo zypper install ./genoffice-<version>.x86_64.rpm  # openSUSE
-```
-
-The AppImage runs in place: install the FUSE 2 runtime
-(`sudo apt install libfuse2`; on Ubuntu 24.04 the package is `libfuse2t64`),
-make the file executable, then run it:
-
-```bash
-chmod +x GenOffice-<version>.AppImage
-./GenOffice-<version>.AppImage
-```
-
-</details>
+| Platform                | File                                       | How to run                                                      |
+| ----------------------- | ------------------------------------------ | --------------------------------------------------------------- |
+| **Windows** x64         | `GenOffice-Word-<v>-windows-x64.exe`       | Portable, no installer: double-click                            |
+| **Linux** x86_64        | `GenOffice-Word-<v>-linux-x86_64.AppImage` | `chmod +x` and run (needs FUSE 2, e.g. `libfuse2`)              |
+| **macOS** Apple Silicon | `GenOffice-Word-<v>-macos-arm64.dmg`       | Ad-hoc signed, not notarized: right-click → Open the first time |
 
 ## How it works
 
