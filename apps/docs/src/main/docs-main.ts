@@ -3603,7 +3603,7 @@ const TWIPS_PER_INCH = 1440
 
 // ---- AI settings + chat proxy (main process avoids renderer CORS) ----
 // provider metadata, settings defaults/migration, and per-provider streaming/chat
-// implementations live in @genoffice/ai-provider, shared with apps/sheets.
+// implementations live in @genoffice/ai-provider.
 
 const SETTINGS_PATH = () => userDataPath('ai-settings.json')
 
@@ -3611,8 +3611,7 @@ const activeAiStreams = new Map<string, AbortController>()
 
 /**
  * AI settings + chat/stream proxy handlers. Split out so the shell can
- * register them exactly once for all window types (docs, sheets, home) —
- * sheets' standalone AI handlers use the same channel names.
+ * register them exactly once for all window types (docs, home).
  */
 export function registerAiIpc(): void {
   app.once('before-quit', shutdownCodexAppServers)

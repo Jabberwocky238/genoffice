@@ -31,8 +31,11 @@
   Push "$INSTDIR\resources\cli"
   Call GenOfficeAddToUserPath
   !insertmacro GenOfficeRegisterShellNew "docx" "Word Document"
-  !insertmacro GenOfficeRegisterShellNew "xlsx" "Excel Workbook"
-  !insertmacro GenOfficeRegisterShellNew "pptx" "PowerPoint Presentation"
+  ; a Word-only build over a full-suite install: drop the old Excel/PowerPoint entries
+  Push $0
+  !insertmacro GenOfficeUnregisterShellNew "xlsx" "Excel Workbook"
+  !insertmacro GenOfficeUnregisterShellNew "pptx" "PowerPoint Presentation"
+  Pop $0
   !insertmacro UPDATEFILEASSOC
 !macroend
 

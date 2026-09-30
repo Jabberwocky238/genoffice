@@ -13,7 +13,7 @@ describe('resolveOutput', () => {
     writeFileSync(input, 'source')
     const ctx = { cwd: dir, env: { ...process.env, GENOFFICE_ALLOWED_ROOTS: '' } }
     // `--out=` is an empty value, not an absent flag
-    const args = parseArgs(['slides', 'apply', 'deck.pptx', '--ops', 'ops.json', '--out='])
+    const args = parseArgs(['docs', 'apply', 'a.docx', '--ops', 'ops.json', '--out='])
     const out = flagString(args, 'out')
     expect(out).toBe('')
     // the fallback is the input file, so accepting '' would overwrite the source

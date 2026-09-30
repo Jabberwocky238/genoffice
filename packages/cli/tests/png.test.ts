@@ -1,6 +1,6 @@
 import { PNG } from 'pngjs'
 import { describe, expect, it } from 'vitest'
-import { contactSheet, cropPng } from '../src/formats/png'
+import { contactSheet } from '../src/formats/png'
 
 function solid(width: number, height: number, rgb: [number, number, number]): Buffer {
   const png = new PNG({ width, height })
@@ -14,14 +14,6 @@ function solid(width: number, height: number, rgb: [number, number, number]): Bu
 }
 
 describe('png helpers', () => {
-  it('crops with padding and clamps to the image', () => {
-    const { png, rect } = cropPng(solid(100, 80, [10, 20, 30]), { x: 90, y: 5, w: 20, h: 10 }, 8)
-    expect(rect).toEqual({ x: 82, y: 0, w: 18, h: 23 })
-    const out = PNG.sync.read(png)
-    expect([out.width, out.height]).toEqual([18, 23])
-    expect(Array.from(out.data.slice(0, 4))).toEqual([10, 20, 30, 255])
-  })
-
   it('lays pages out row-major on a white sheet', () => {
     const pages = [1, 2, 3].map((page) => ({ page, png: solid(200, 100, [0, 0, 0]) }))
     const sheet = contactSheet(pages, 2, 50)

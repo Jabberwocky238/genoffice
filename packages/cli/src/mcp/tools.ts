@@ -1,7 +1,6 @@
 import { z } from 'zod'
 import type { CommandRegistry, OptionDef } from '../registry'
 import type { McpMode } from './run'
-import { READ_UNITS } from '../length-units'
 import type { JsonSchema } from '../op-catalog'
 import type { TypedKey, TypedSchemas } from './op-schemas'
 
@@ -91,7 +90,7 @@ export const TOOLS: ToolSpec[] = [
     command: 'info',
     readOnly: true,
     description:
-      'Metadata and a structure summary of a document (docx, xlsx, pptx, pdf, md, html, csv): page or slide count, sheets, block count, size. Runs locally.',
+      'Metadata and a structure summary of a document (docx, pdf, md, html): page count, block count, size. Runs locally.',
     positionals: [{ key: 'file', description: 'path of the document' }],
     options: ['password'],
   },
@@ -99,9 +98,9 @@ export const TOOLS: ToolSpec[] = [
     name: 'convert',
     command: 'convert',
     description:
-      'Convert a document to another format with the GenOffice engines (pdf, docx, xlsx, pptx, md, html, csv; the `to` description lists the routes). Targets that need layout (to pdf, docx to html, html to docx) start a hidden GenOffice process for 1-6 s. Output defaults to the input name with the new extension.',
+      'Convert a document to another format with the GenOffice engines (pdf, docx, md, html; the `to` description lists the routes). Targets that need layout (docx to pdf or html) start a hidden GenOffice process for 1-6 s. Output defaults to the input name with the new extension.',
     positionals: [{ key: 'file', description: 'path of the source document' }],
-    options: ['to', 'out', 'force', 'password', 'sheet'],
+    options: ['to', 'out', 'force', 'password'],
   },
   {
     name: 'create_docx',
@@ -128,78 +127,15 @@ export const TOOLS: ToolSpec[] = [
     ],
   },
   {
-    name: 'create_xlsx',
-    command: 'create',
-    description:
-      'Create a new workbook from data: a 2-D array of cell values, { "sheets": [{ "name", "rows" }] } for several sheets, or a .csv/.json file. Strings starting with "=" are formulas. Give exactly one of data or from. Formatting, charts and more sheets afterwards: sheet_apply.',
-    fixed: ['--type', 'xlsx'],
-    options: [
-      {
-        key: 'data',
-        option: 'from',
-        kind: OPS_JSON,
-        typed: 'xlsx-data',
-        description: 'rows as a 2-D array, or { "sheets": [{ "name", "rows" }] }',
-      },
-      { key: 'from', description: 'path of a .csv or .json file to build from' },
-      'header',
-      'decimal',
-      { key: 'out', description: 'output .xlsx path (required)', required: true },
-      'force',
-    ],
-  },
-  {
     name: 'create_pdf',
     command: 'create',
     description:
-      'Print a document (md, html, docx, xlsx, pptx) to a new PDF with the GenOffice renderer, in a hidden GenOffice process.',
+      'Print a .docx to a new PDF with the GenOffice renderer, in a hidden GenOffice process.',
     fixed: ['--type', 'pdf'],
     options: [
       { key: 'from', description: 'path of the document to print', required: true },
       { key: 'out', description: 'output .pdf path (required)', required: true },
       'force',
-    ],
-  },
-  {
-    name: 'create_pptx',
-    command: 'create',
-    images: true,
-    description:
-      'Create a .pptx in one call from ops on a blank one-slide deck, or from a deck spec (pages of px-positioned text, shapes and images on a 1280x720 canvas; guide slides spec). This is the path for a short deck (up to about 5 slides) and whenever the user gives concrete content and no design brief: write the ops or the spec directly, then slides_render to look. Set render=true to get the slide PNGs back in the same call and audit=true for the geometry findings; otherwise run slides_render and slides_audit after. The staged deck_start / deck_page / deck_build flow is for longer or design-sensitive presentations a person will present. Give exactly one of ops or spec.',
-    fixed: ['--type', 'pptx'],
-    options: [
-      {
-        key: 'ops',
-        kind: OPS_JSON,
-        typed: 'slides-op-names',
-        description: 'JSON array of slides ops, the same objects slides_apply takes (guide slides)',
-      },
-      {
-        key: 'spec',
-        kind: OPS_JSON,
-        typed: 'object',
-        description: 'a deck spec object { "pages": [...] } (guide slides spec)',
-      },
-      {
-        key: 'spec_dir',
-        option: 'spec',
-        description:
-          'path of a directory of one-page spec files taken in name order (the deck_* tools write one)',
-      },
-      'outline',
-      { key: 'out', description: 'output .pptx path (required)', required: true },
-      'force',
-      {
-        key: 'render',
-        kind: 'boolean',
-        description:
-          'render one PNG per slide after writing and return them as images (detail.previews); starts a hidden GenOffice process for a few seconds',
-      },
-      {
-        key: 'audit',
-        kind: 'boolean',
-        description: 'include the geometry audit of the built deck under detail.audit',
-      },
     ],
   },
   {
@@ -265,9 +201,9 @@ export const TOOLS: ToolSpec[] = [
     name: 'merge',
     command: 'merge',
     description:
-      'Fill {{key}} placeholders in a .docx, .pptx or .xlsx template with values from a JSON object and write the result to out (nested objects flatten to dotted keys; whitespace inside the braces is tolerated; a whole-cell placeholder in xlsx takes the value type). The result lists used_keys, unused_keys and unresolved_placeholders with their location (block / slide + element / sheet + cell) and reason (no_key; split_placeholder when the template stores the braces across differently formatted runs; unreachable_nested inside a nested pptx group); strict makes an unresolved placeholder an error. ' +
+      'Fill {{key}} placeholders in a .docx template with values from a JSON object and write the result to out (nested objects flatten to dotted keys; whitespace inside the braces is tolerated). The result lists used_keys, unused_keys and unresolved_placeholders with their block location and reason (no_key; split_placeholder when the template stores the braces across differently formatted runs); strict makes an unresolved placeholder an error. ' +
       GUI_OPEN,
-    positionals: [{ key: 'file', description: 'path of the template (.docx, .pptx or .xlsx)' }],
+    positionals: [{ key: 'file', description: 'path of the template (.docx)' }],
     options: [
       {
         key: 'data',
@@ -292,156 +228,17 @@ export const TOOLS: ToolSpec[] = [
     options: ['page', 'range', 'password', 'full', 'max-chars'],
   },
   {
-    name: 'sheet_read',
-    command: 'sheet',
-    verb: 'read',
-    readOnly: true,
-    description:
-      'Cells of one worksheet as raw values (0.25, date serials) with formulas keyed by A1 address, plus sheet features (panes, filter, charts, tables). Defaults to the active sheet and up to 500x100 cells; the result says when it truncated. stats for counts and the sheet list, formats for styling, column widths and row heights, where to list only cells of one kind.',
-    positionals: [{ key: 'file', description: 'path of the .xlsx' }],
-    options: ['sheet', 'range', 'cols', 'max-rows', 'where', 'stats', 'formats'],
-  },
-  {
-    name: 'sheet_apply',
-    command: 'sheet',
-    verb: 'apply',
-    description:
-      'Edit an .xlsx: cells sets values, formulas and styles by address; ops runs the workbook DSL (formatting, charts, images, tables, freeze panes, filters, conditional formats, validation, hyperlinks, notes, page setup, protection, defined names, sheet order; guide sheets). Give exactly one of cells or ops. ' +
-      READ_THEN_APPLY +
-      'Ops run in order, each seeing the previous result; structural ops (rows, columns, sheets) need their own batch. ' +
-      GUI_OPEN,
-    positionals: [{ key: 'file', description: 'path of the .xlsx' }],
-    options: [
-      'sheet',
-      {
-        key: 'cells',
-        kind: OPS_JSON,
-        typed: 'cells',
-        description:
-          'JSON array of { "cell": "B2", "sheet"?, "value"? | "formula"?, "style"? }; style takes the format fields of the format_range op',
-      },
-      {
-        key: 'ops',
-        kind: OPS_JSON,
-        typed: 'sheets-ops',
-        description: 'JSON array of workbook DSL ops',
-      },
-      'dry-run',
-      'best-effort',
-      'stop-on-error',
-      'out',
-      'force',
-    ],
-  },
-  {
-    name: 'sheet_check',
-    command: 'sheet',
-    verb: 'check',
-    readOnly: true,
-    description:
-      'Consistency checks on an .xlsx: formula errors, formulas not evaluated, missing sheet references, broken defined names, chart references, number overflow; one finding per issue.',
-    positionals: [{ key: 'file', description: 'path of the .xlsx' }],
-  },
-  {
-    name: 'slides_read',
-    command: 'slides',
-    verb: 'read',
-    readOnly: true,
-    description:
-      'Structure of a .pptx: slides s_<n> with their elements e_* (kind, text preview, EMU geometry), tables and with full the whole text and speaker notes. The ids are what slides_apply ops target; ids of edited or created elements change, so read again before a second batch. layouts lists the master layouts for addSlideWithLayout.',
-    positionals: [{ key: 'file', description: 'path of the .pptx' }],
-    options: ['slide', 'full', 'layouts', 'max-chars', { key: 'units', choices: READ_UNITS }],
-  },
-  {
-    name: 'slides_apply',
-    command: 'slides',
-    verb: 'apply',
-    description:
-      'Edit a .pptx with a batch of ops (setText, addElement, addPicture, deleteElement, setTransform, addSlide ...; guide slides). ' +
-      READ_THEN_APPLY +
-      "setText runs inherit the element's first run style unless a field is set. Ops run in order; a later op may target a slide an earlier op added. Atomic by default. After the edit, slides_audit for overflow and slides_render to look. " +
-      GUI_OPEN,
-    positionals: [{ key: 'file', description: 'path of the .pptx' }],
-    options: [
-      {
-        key: 'ops',
-        kind: OPS_JSON,
-        typed: 'slides-ops',
-        description: 'JSON array of ops; target is { "slide": <index|"s_n">, "el"?: "e_*" }',
-        required: true,
-      },
-      'dry-run',
-      'best-effort',
-      'stop-on-error',
-      'isolation',
-      'out',
-      'force',
-    ],
-  },
-  {
-    name: 'slides_audit',
-    command: 'slides',
-    verb: 'audit',
-    readOnly: true,
-    description:
-      'Layout audit of a .pptx: text overflow, out-of-bounds or fully off-slide elements, overlaps and stretched pictures (box aspect off the cropped source aspect by more than 5%) per slide, with the element ids and a suggested setTransform op for slides_apply. Heuristic glyph widths; confirm with slides_render.',
-    positionals: [{ key: 'file', description: 'path of the .pptx' }],
-    options: ['slide'],
-  },
-  {
-    name: 'slides_render',
-    command: 'slides',
-    verb: 'render',
-    readOnly: true,
-    images: true,
-    description:
-      'One PNG per slide (960x540 at scale 1 for 16:9), written to a directory and returned as images so you can look at the pages. Starts a hidden GenOffice process (a few seconds). Use after building or editing a deck; slide renders one page.',
-    positionals: [{ key: 'file', description: 'path of the .pptx' }],
-    options: [
-      { key: 'out', description: 'directory for the PNGs (required)', required: true },
-      'slide',
-      'scale',
-    ],
-  },
-  {
-    name: 'slides_check',
-    command: 'slides',
-    verb: 'check',
-    readOnly: true,
-    description:
-      'Check a deck-flow file on disk: an outline.json (core hook and page plan) or one page spec, which is checked against outline.json and style.md beside it or one folder up. The deck_* tools call this for you; use it directly when the files were written by other means.',
-    positionals: [{ key: 'file', description: 'path of outline.json or a page .json' }],
-    options: ['outline', 'page'],
-  },
-  {
-    name: 'slides_replace',
-    command: 'slides',
-    verb: 'replace',
-    description:
-      'Rebuild one slide of a .pptx from a one-page spec file on disk (a deck the staged flow built); the other slides keep their ids and content. deck_replace does the same from an inline page.',
-    positionals: [{ key: 'file', description: 'path of the .pptx' }],
-    options: [
-      { key: 'slide', kind: 'integer', description: '0-based slide to rebuild', required: true },
-      { key: 'spec', description: 'path of the one-page spec file', required: true },
-      'outline',
-      'out',
-      'force',
-    ],
-  },
-  {
     name: 'render',
     command: 'render',
     readOnly: true,
     images: true,
     description:
-      'One PNG per page of a document (docx, xlsx, pptx, pdf, md, html) as the GenOffice renderer lays it out, written to a directory and returned as images. Starts a hidden GenOffice process. page renders one page; grid adds a contact sheet of every page.',
+      'One PNG per page of a document (docx, pdf) as the GenOffice renderer lays it out, written to a directory and returned as images. Starts a hidden GenOffice process. page renders one page; grid adds a contact sheet of every page.',
     positionals: [{ key: 'file', description: 'path of the document' }],
     options: [
       { key: 'out', description: 'directory for the PNGs (required)', required: true },
       'page',
       'scale',
-      'el',
-      'pad',
       'grid',
       'cols',
       'tile',
@@ -453,16 +250,15 @@ export const TOOLS: ToolSpec[] = [
     readOnly: true,
     plainText: true,
     description:
-      'The op reference an agent reads before writing ops: guide("docs"), guide("sheets") or guide("slides") list the groups; topic narrows to one group or one op. guide("slides", "design") is the staged deck workflow and guide("slides", "spec") the outline and page spec format (deck_start returns both). Also available as genoffice://guide/* resources.',
+      'The op reference an agent reads before writing ops: guide("docs") lists the groups; topic narrows to one group or one op. Also available as genoffice://guide/* resources.',
     positionals: [
-      { key: 'domain', description: 'slides | docs | sheets' },
+      { key: 'domain', description: 'docs' },
       {
         key: 'topic',
-        description: 'a group, an op name, or for slides: design | spec',
+        description: 'a group or an op name',
         optional: true,
       },
     ],
-    options: ['index'],
   },
   {
     name: 'capabilities',
@@ -505,9 +301,9 @@ export const TOOLS: ToolSpec[] = [
     command: 'open',
     localOnly: true,
     description:
-      'Open a document in the GenOffice app for the user (starts the app if needed), optionally selecting a slide, element, block, range or page. Only when the user asks to see the file: an open tab makes later *_apply calls refuse to write.',
+      'Open a document in the GenOffice app for the user (starts the app if needed), optionally selecting a block. Only when the user asks to see the file: an open tab makes later *_apply calls refuse to write.',
     positionals: [{ key: 'file', description: 'path of the document' }],
-    options: ['slide', 'el', 'block', 'range', 'sheet', 'page'],
+    options: ['block'],
   },
   {
     name: 'selection',
@@ -515,7 +311,7 @@ export const TOOLS: ToolSpec[] = [
     localOnly: true,
     readOnly: true,
     description:
-      "What the user currently has selected in the GenOffice editor showing this file: slide + element ids, a block range with its text, a sheet range, or a pdf page. The user's own pointer for 'this one' / 'here'; needs the file open in the app.",
+      "What the user currently has selected in the GenOffice editor showing this file: a block range with its text. The user's own pointer for 'this one' / 'here'; needs the file open in the app.",
     positionals: [{ key: 'file', description: 'path of the document open in GenOffice' }],
   },
 ]

@@ -7,7 +7,7 @@
 /// and DOM listeners see real OS drops — paths never cross contextBridge.
 ///
 /// Ownership contract with page-level drop zones: a zone that handles its own
-/// file drops (AI attachment panels, slides image insert) cancels the event
+/// file drops (AI attachment panels) cancels the event
 /// before it bubbles here (`defaultPrevented`), and this bridge stays out of
 /// the way. Text/media drags without OS files are untouched.
 import { ipcRenderer, webUtils } from 'electron'
@@ -16,12 +16,13 @@ export const DROP_OPEN_CHANNEL = 'app:open-dropped-files'
 
 /** Extensions routed by apps/shell routeDocumentPath — keep in sync there and
  *  with OPEN_DIALOG_EXTENSIONS / OPEN_LOCAL_EXTENSIONS on the home screen. */
-export const OPENABLE_DOC_RE = /\.(docx|xlsx|xlsm|xls|csv|tsv|pptx|pdf|md|markdown|html|htm)$/i
+export const OPENABLE_DOC_RE = /\.(docx|pdf)$/i
 
 /** Recognized-but-unsupported formats: kept in the sent payload so the shell
  *  can show its "not supported" dialog instead of dropping them silently.
  *  Mirrors UNSUPPORTED_DOC_RE in apps/shell/src/main/index.ts. */
-export const KNOWN_UNSUPPORTED_DOC_RE = /\.(doc|rtf|odt|ppt|pps|odp|ods|xlsb|pages|key|numbers)$/i
+export const KNOWN_UNSUPPORTED_DOC_RE =
+  /\.(doc|rtf|odt|xlsx|xlsm|xls|xlsb|csv|tsv|pptx|ppt|pps|odp|ods|md|markdown|html|htm|pages|key|numbers)$/i
 
 /** upper bound on how many files one drop may ask to open */
 const MAX_DROPPED_FILES = 20

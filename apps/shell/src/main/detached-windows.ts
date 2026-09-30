@@ -8,16 +8,11 @@ import {
   setActiveDocsResolver,
   teardownDocsRenderer,
 } from '../../../docs/src/main/docs-main'
-import {
-  requestSheetsClose,
-  setActiveSheetsWebContents,
-  sheetsPendingEditCount,
-} from '../../../sheets/src/main/sheets-main'
 import { canonicalPath } from './tab-manager'
 import type { OpenDocumentTab, TabKind } from '../shared/tabs-api'
 
 /**
- * Detached editor windows ("Open in New Window" on a docs/sheets tab): the
+ * Detached editor windows ("Open in New Window" on a docs tab): the
  * tab's live WebContentsView is reparented into its own BrowserWindow, so the
  * document — including unsaved edits — moves without a reload. The window uses
  * the native frame (the shell's tab strip is the drag surface in tab mode;
@@ -61,7 +56,6 @@ function bringToFront(win: BrowserWindow): void {
 
 const DEFAULT_SIZE: Record<string, { width: number; height: number }> = {
   docs: { width: 1360, height: 900 },
-  sheets: { width: 1440, height: 900 },
 }
 
 export function isDetachedEditorWindow(win: BrowserWindow): boolean {
@@ -138,12 +132,7 @@ export async function detachedOpenDocuments(): Promise<OpenDocumentTab[]> {
   for (const [wcId, rec] of detached) {
     if (rec.window.isDestroyed()) continue
     const wc = rec.view.webContents
-    const dirty =
-      rec.kind === 'sheets'
-        ? sheetsPendingEditCount(wcId) > 0
-        : rec.kind === 'docs'
-          ? await docsQueryDirty(wc)
-          : false
+    const dirty = rec.kind === 'docs' ? await docsQueryDirty(wc) : false
     // the dirty query yielded: the window may have closed meanwhile
     if (rec.window.isDestroyed()) continue
     out.push({
@@ -253,7 +242,6 @@ export function createDetachedEditorWindow(options: {
   win.on('focus', () => {
     if (kind === 'docs')
       setActiveDocsResolver(() => (view.webContents.isDestroyed() ? null : view.webContents))
-    if (kind === 'sheets') setActiveSheetsWebContents(view.webContents)
     applyMenuFor(kind)
   })
 
@@ -263,9 +251,7 @@ export function createDetachedEditorWindow(options: {
     event.preventDefault()
     void (async () => {
       let proceed = true
-      if (kind === 'sheets' && sheetsPendingEditCount(wcId) > 0) {
-        proceed = await requestSheetsClose(view.webContents, win)
-      } else if (kind === 'docs' && (await docsQueryDirty(view.webContents))) {
+      if (kind === 'docs' && (await docsQueryDirty(view.webContents))) {
         proceed = await requestDocsClose(view.webContents, win)
       }
       if (proceed) tearDown()

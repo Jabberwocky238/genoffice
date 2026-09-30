@@ -7,11 +7,10 @@ import { parseArgs } from '../src/args'
 import { parseTarget } from '../src/commands/open'
 import { controlEndpoint, controlRequest } from '../src/control'
 import type { ControlReply } from '../src/control-protocol'
-import { CliError } from '../src/result'
 import { run } from './helpers'
 
 const REPO = resolve(__dirname, '../../..')
-const PPTX = join(REPO, 'packages/pptx-engine/tests/fixtures/01_standard_business.pptx')
+const OTHER = join(REPO, 'apps/docs/tests/pagination-corpus/docx/02-chinese-long-docgrid.docx')
 const DOCX = join(REPO, 'apps/docs/tests/pagination-corpus/docx/01-simple-english.docx')
 
 const servers: Server[] = []
@@ -53,39 +52,14 @@ async function fakeShell(
 describe('open targets', () => {
   const target = (argv: string[], file: string) => parseTarget(parseArgs(argv), file)
 
-  it('maps flags to one target per file type', () => {
-    expect(target([], '/d.pptx')).toBeUndefined()
-    expect(target(['--slide', '2', '--el', 'e_7'], '/d.pptx')).toEqual({
-      kind: 'slide',
-      slide: 2,
-      el: 'e_7',
-    })
+  it('maps --block to a block target on a Word document', () => {
+    expect(target([], '/d.docx')).toBeUndefined()
     expect(target(['--block', '4'], '/d.docx')).toEqual({ kind: 'block', block: 4 })
-    expect(target(['--range', 'Data!B2:D5'], '/d.xlsx')).toEqual({
-      kind: 'range',
-      range: 'Data!B2:D5',
-    })
-    expect(target(['--range', 'B2', '--sheet', 'Q1'], '/d.xlsx')).toEqual({
-      kind: 'range',
-      range: 'B2',
-      sheet: 'Q1',
-    })
-    expect(target(['--page', '3'], '/d.pdf')).toEqual({ kind: 'page', page: 3 })
   })
 
-  it('refuses a flag that belongs to another file type and bad numbers', () => {
-    expect(() => target(['--block', '1'], '/d.pptx')).toThrow(CliError)
-    expect(() => target(['--slide', '-1'], '/d.pptx')).toThrow(/integer >= 0/)
-    expect(() => target(['--page', '0'], '/d.pdf')).toThrow(/integer >= 1/)
-    expect(() => target(['--el', 'e_1'], '/d.pptx')).toThrow(/--el needs --slide/)
-    expect(() => target(['--page', '1'], '/notes.md')).toThrow(/pptx, docx, xlsx and pdf/)
-  })
-
-  it('takes a slide target on every presentation extension and nothing that merely looks like one', () => {
-    for (const ext of ['.pptx', '.pptm', '.ppsx', '.potx']) {
-      expect(target(['--slide', '0'], `/d${ext}`), ext).toEqual({ kind: 'slide', slide: 0 })
-    }
-    expect(() => target(['--slide', '0'], '/d.pptxm')).toThrow(/pptx, docx, xlsx and pdf/)
+  it('refuses bad numbers and targets on other file types', () => {
+    expect(() => target(['--block', '-1'], '/d.docx')).toThrow(/integer >= 0/)
+    expect(() => target(['--block', '1'], '/notes.md')).toThrow(/supported for docx/)
   })
 })
 
@@ -123,21 +97,21 @@ describe('control endpoint', () => {
 })
 
 describe('open / selection through the control channel', () => {
-  it('open --slide asks the running shell instead of spawning the app', async () => {
+  it('open --block asks the running shell instead of spawning the app', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'genoffice-ctl-'))
     const shell = await fakeShell(dir, () => ({
       ok: true,
-      result: { slide: 1, element: 'e_3', type: 'text' },
+      result: { blocks: [1, 1] },
     }))
-    const r = await run(['open', PPTX, '--slide', '1', '--el', 'e_3', '--json'], { env: shell.env })
+    const r = await run(['open', DOCX, '--block', '1', '--json'], { env: shell.env })
     expect(r.code).toBe(0)
     expect(r.json()).toMatchObject({
       status: 'ok',
-      summary: expect.stringContaining('element e_3 on slide 1'),
-      detail: { slide: 1, element: 'e_3', gui_pid: process.pid },
+      summary: expect.stringContaining('block 1'),
+      detail: { blocks: [1, 1], gui_pid: process.pid },
     })
     expect(shell.requests).toEqual([
-      { cmd: 'open', path: PPTX, target: { kind: 'slide', slide: 1, el: 'e_3' } },
+      { cmd: 'open', path: DOCX, target: { kind: 'block', block: 1 } },
     ])
   })
 
@@ -146,18 +120,18 @@ describe('open / selection through the control channel', () => {
     const shell = await fakeShell(dir, () => ({
       ok: false,
       error: {
-        reason: 'target_not_found',
-        message: 'no element e_9 on slide 0',
-        detail: { available: ['e_1', 'e_2'] },
+        reason: 'out_of_range',
+        message: 'no block 99',
+        detail: { valid_range: '0-3' },
       },
     }))
-    const r = await run(['open', PPTX, '--slide', '0', '--el', 'e_9', '--json'], { env: shell.env })
+    const r = await run(['open', DOCX, '--block', '99', '--json'], { env: shell.env })
     expect(r.code).toBe(1)
     expect(r.json()).toMatchObject({
       status: 'error',
-      error: 'target_not_found',
-      detail: { available: ['e_1', 'e_2'] },
-      suggestion: expect.stringContaining('slides read'),
+      error: 'out_of_range',
+      detail: { valid_range: '0-3' },
+      suggestion: expect.stringContaining('0-3'),
     })
   })
 
@@ -181,7 +155,7 @@ describe('open / selection through the control channel', () => {
       summary: 'block 2: Second paragraph',
       detail: { blocks: [2, 2], text: 'Second paragraph' },
     })
-    const notOpen = await run(['selection', PPTX, '--json'], { env: shell.env })
+    const notOpen = await run(['selection', OTHER, '--json'], { env: shell.env })
     expect(notOpen.code).toBe(2)
     expect(notOpen.json()).toMatchObject({
       error: 'file_not_open_in_gui',

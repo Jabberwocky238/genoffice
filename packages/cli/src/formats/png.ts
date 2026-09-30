@@ -1,31 +1,5 @@
 import { PNG } from 'pngjs'
 
-export interface PxRect {
-  x: number
-  y: number
-  w: number
-  h: number
-}
-
-/** Crop a PNG to `rect` grown by `pad` on each side, clamped to the image. */
-export function cropPng(png: Buffer, rect: PxRect, pad = 0): { png: Buffer; rect: PxRect } {
-  const src = PNG.sync.read(png)
-  const x0 = clamp(Math.floor(rect.x - pad), 0, src.width - 1)
-  const y0 = clamp(Math.floor(rect.y - pad), 0, src.height - 1)
-  const x1 = clamp(Math.ceil(rect.x + rect.w + pad), x0 + 1, src.width)
-  const y1 = clamp(Math.ceil(rect.y + rect.h + pad), y0 + 1, src.height)
-  const out = new PNG({ width: x1 - x0, height: y1 - y0 })
-  for (let y = y0; y < y1; y++) {
-    src.data.copy(
-      out.data,
-      (y - y0) * out.width * 4,
-      (y * src.width + x0) * 4,
-      (y * src.width + x1) * 4,
-    )
-  }
-  return { png: PNG.sync.write(out), rect: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } }
-}
-
 export interface GridTile {
   page: number
   x: number
@@ -106,8 +80,4 @@ function downscaleInto(src: PNG, dst: PNG, dx: number, dy: number, w: number, h:
       dst.data[o + 3] = 255
     }
   }
-}
-
-function clamp(v: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, v))
 }

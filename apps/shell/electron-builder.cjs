@@ -62,10 +62,7 @@ const includeMacX64 = process.env.GENOFFICE_MAC_X64 === '1'
 
 // GENOFFICE_WIN_ARM64=1 — package the Windows ARM64 installer instead of x64.
 // CI runs it as a second electron-builder pass (own BUILD_DIR) after the
-// unchanged x64 pass, so the two never share an output dir or a sidecar path:
-// the sidecar comes from the matching cargo target dir and is checked to
-// exist at beforePack because electron-builder exits 0 on a missing
-// extraResources source (Sheets would ship dead on every ARM install).
+// unchanged x64 pass, so the two never share an output dir.
 const winArm64 = process.env.GENOFFICE_WIN_ARM64 === '1'
 // 7-Zip packs ARM64 executables with its ARM64 branch filter, which the NSIS
 // install-time extractor (Nsis7z) cannot decode: it silently skips
@@ -74,8 +71,6 @@ if (winArm64 && !process.env.ELECTRON_BUILDER_7Z_FILTER) {
   process.env.ELECTRON_BUILDER_7Z_FILTER = 'BCJ'
 }
 const winArch = winArm64 ? 'arm64' : 'x64'
-const winSidecarTarget = winArm64 ? 'aarch64-pc-windows-msvc' : 'x86_64-pc-windows-gnu'
-const WIN_SIDECAR = `../sheets/native/xlsx-engine/target/${winSidecarTarget}/release/xlsx-sidecar.exe`
 
 function assertExtraResourceSources() {
   for (const rel of [
@@ -84,7 +79,6 @@ function assertExtraResourceSources() {
     '../../node_modules/ws',
     '../../node_modules/electron/dist/LICENSES.chromium.html',
     '../../node_modules/@embedpdf/pdfium/dist/pdfium.wasm',
-    '../pdf/node_modules/harfbuzzjs/hb-subset.wasm',
   ]) {
     if (!existsSync(join(__dirname, rel))) {
       throw new Error(
@@ -174,43 +168,14 @@ function assertUniversalVisionOcr() {
 // one means that module's build did not run or failed. electron-builder only
 // logs "file source doesn't exist" for an absent extraResources source and
 // still exits 0, so without this the installer launches normally and is simply
-// missing that editor — it surfaces only when a user opens the tab.
+// missing the editor — it surfaces only when a user opens the tab.
 //
 // Runs from the beforePack hook, not at module load: gen-third-party-notices
 // requires this config to read extraResources, and the dist:* scripts run
 // notices before build:all, when the out dirs legitimately don't exist yet.
-// When the mac build packages BOTH arches (GENOFFICE_MAC_X64=1) its
-// extraResources entry is a single path shared by the two packs, so the
-// sidecar there must be a lipo fat binary — a host-arch-only build (the plain
-// `native:build` dev path) would silently ship an arm64 sidecar inside the
-// Intel dmg, where every workbook open fails. Runs from beforePack, dual-arch
-// mac packs only.
-function assertUniversalSidecar() {
-  const sidecar = join(__dirname, '../sheets/native/xlsx-engine/target/release/xlsx-sidecar')
-  if (!existsSync(sidecar)) {
-    throw new Error(
-      `mac extraResources source missing: ${sidecar} (run "npm run native:build:universal -w @genoffice/sheets" first)`,
-    )
-  }
-  const archs = execFileSync('lipo', ['-archs', sidecar], { encoding: 'utf8' }).trim().split(/\s+/)
-  for (const want of ['x86_64', 'arm64']) {
-    if (!archs.includes(want)) {
-      throw new Error(
-        `xlsx-sidecar is [${archs.join(', ')}] but both mac arch packages ship it — ` +
-          'run "npm run native:build:universal -w @genoffice/sheets" before packaging mac',
-      )
-    }
-  }
-}
-
 function assertModuleTreesPresent() {
   for (const rel of [
     '../docs/out',
-    '../sheets/out',
-    '../slides/out',
-    '../pdf/out',
-    '../markdown/out',
-    '../html/out',
     '../../packages/cli/dist/genoffice.cjs',
     '../../packages/cli/dist/node_modules/jsdom',
   ]) {
@@ -319,35 +284,11 @@ const config = {
       from: '../docs/out',
       to: 'modules/docs',
     },
-    {
-      from: '../sheets/out',
-      to: 'modules/sheets',
-    },
-    {
-      from: '../slides/out',
-      to: 'modules/slides',
-    },
-    {
-      from: '../pdf/out',
-      to: 'modules/pdf',
-    },
-    {
-      from: '../markdown/out',
-      to: 'modules/markdown',
-    },
-    {
-      from: '../html/out',
-      to: 'modules/html',
-    },
-    // PDF text editing engines: the bundled main resolves these under
-    // Resources/wasm when node_modules is absent (apps/pdf/src/main/wasm-path.ts)
+    // PDF → Word import engine: the bundled main resolves it under
+    // Resources/wasm when node_modules is absent (apps/shell/src/main/pdfium-wasm.ts)
     {
       from: '../../node_modules/@embedpdf/pdfium/dist/pdfium.wasm',
       to: 'wasm/pdfium.wasm',
-    },
-    {
-      from: '../pdf/node_modules/harfbuzzjs/hb-subset.wasm',
-      to: 'wasm/hb-subset.wasm',
     },
     // platform system-OCR helpers for scanned-page recovery (each exists only
     // on its own build platform; electron-builder skips absent sources and the
@@ -366,7 +307,7 @@ const config = {
     },
     // genoffice command line: runs on the app binary with ELECTRON_RUN_AS_NODE (as
     // the gsk CLI above already does), so the RunAsNode fuse must stay enabled.
-    // Layout (Resources/cli next to wasm/, native/, ocr/) is what
+    // Layout (Resources/cli next to wasm/, ocr/) is what
     // packages/cli/src/resources.ts expects.
     {
       from: '../../packages/cli/dist/genoffice.cjs',
@@ -390,7 +331,7 @@ const config = {
       from: '../../skills/genoffice/SKILL.md',
       to: 'cli/skills/genoffice/SKILL.md',
     },
-    // runtime deps the genoffice bundle leaves external (jsdom for the Word/Markdown
+    // runtime deps the genoffice bundle leaves external (jsdom for the Word
     // paths); collected by packages/cli/collect-deps.mjs during its build
     {
       from: '../../packages/cli/dist/node_modules',
@@ -425,86 +366,6 @@ const config = {
       icon: 'docx',
       mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     },
-    {
-      ext: 'xlsx',
-      name: 'Excel Workbook',
-      description: 'Excel Workbook',
-      role: 'Editor',
-      icon: 'xlsx',
-      mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    },
-    {
-      ext: 'xlsm',
-      name: 'Excel Macro-Enabled Workbook',
-      role: 'Editor',
-      icon: 'xlsx',
-      mimeType: 'application/vnd.ms-excel.sheet.macroEnabled.12',
-    },
-    {
-      ext: 'pptx',
-      name: 'PowerPoint Presentation',
-      description: 'PowerPoint Presentation',
-      role: 'Editor',
-      icon: 'pptx',
-      mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-    },
-    {
-      ext: 'xls',
-      name: 'Excel 97-2003 Workbook',
-      role: 'Editor',
-      icon: 'xlsx',
-      mimeType: 'application/vnd.ms-excel',
-    },
-    {
-      ext: 'csv',
-      name: 'CSV Document',
-      role: 'Editor',
-      icon: 'xlsx',
-      mimeType: 'text/csv',
-    },
-    {
-      // opens as a converted copy and saves as .xlsx (genoffice#1146)
-      ext: 'tsv',
-      name: 'TSV Document',
-      role: 'Editor',
-      icon: 'xlsx',
-      mimeType: 'text/tab-separated-values',
-    },
-    {
-      ext: 'pdf',
-      name: 'PDF Document',
-      role: 'Editor',
-      icon: 'pdf',
-      mimeType: 'application/pdf',
-    },
-    {
-      ext: 'md',
-      name: 'Markdown Document',
-      role: 'Editor',
-      icon: 'md',
-      mimeType: 'text/markdown',
-    },
-    {
-      ext: 'markdown',
-      name: 'Markdown Document',
-      role: 'Editor',
-      icon: 'md',
-      mimeType: 'text/markdown',
-    },
-    {
-      ext: 'html',
-      name: 'HTML Document',
-      role: 'Editor',
-      icon: 'html',
-      mimeType: 'text/html',
-    },
-    {
-      ext: 'htm',
-      name: 'HTML Document',
-      role: 'Editor',
-      icon: 'html',
-      mimeType: 'text/html',
-    },
   ],
   npmRebuild: false,
   mac: {
@@ -514,7 +375,7 @@ const config = {
     // electron-builder's default arch-less names (GenOffice-<v>.dmg /
     // GenOffice-<v>-mac.zip). Both zips land in one latest-mac.yml and
     // electron-updater picks by process.arch. Dual-arch packs ship the same
-    // lipo fat xlsx-sidecar (see assertUniversalSidecar above).
+    // lipo fat vision-ocr helper (see assertUniversalVisionOcr above).
     target: [
       { target: 'dmg', arch: includeMacX64 ? ['arm64', 'x64'] : ['arm64'] },
       { target: 'zip', arch: includeMacX64 ? ['arm64', 'x64'] : ['arm64'] },
@@ -525,12 +386,6 @@ const config = {
     entitlements: 'build/entitlements.mac.plist',
     entitlementsInherit: 'build/entitlements.mac.plist',
     notarize: true,
-    extraResources: [
-      {
-        from: '../sheets/native/xlsx-engine/target/release/xlsx-sidecar',
-        to: 'native/xlsx-sidecar',
-      },
-    ],
   },
   win: {
     target: [
@@ -541,22 +396,12 @@ const config = {
     ],
     extraResources: [
       {
-        from: WIN_SIDECAR,
-        to: 'native/xlsx-sidecar.exe',
-      },
-      {
         from: 'build/shell-new',
         to: 'shell-new',
-        filter: ['*.docx', '*.xlsx', '*.pptx'],
+        filter: ['*.docx'],
       },
     ],
   },
-  // Unlike win (which cross-compiles the sidecar to an explicit target
-  // triple), linux takes it from cargo's host-native target/release/ — the
-  // same source mac uses. So no `arch` is pinned here: electron-builder
-  // defaults to the build host's architecture, which is the only one the
-  // sidecar was actually built for. Packaging arm64 on an x64 host, or the
-  // reverse, needs a matching `cargo build --target` first.
   linux: {
     // AppImage (self-contained, any distro) + deb (apt install, pulls in the
     // GTK/NSS runtime deps) + rpm (dnf/zypper install on Fedora / RHEL /
@@ -596,12 +441,6 @@ const config = {
     // match the "genoffice" WM_CLASS the window actually reports — and X11
     // compares case-sensitively, so the taskbar shows an unlinked window.
     syncDesktopName: true,
-    extraResources: [
-      {
-        from: '../sheets/native/xlsx-engine/target/release/xlsx-sidecar',
-        to: 'native/xlsx-sidecar',
-      },
-    ],
   },
   // Same "@genoffice/shell" problem as executableName above: the default deb
   // artifact name derives from package.json "name", and the scope's "/" makes
@@ -654,13 +493,7 @@ const config = {
     assertModuleTreesPresent()
     ensureCliBundleCarriesAppVersion()
     if (context.electronPlatformName === 'darwin' && includeMacX64) {
-      assertUniversalSidecar()
       assertUniversalVisionOcr()
-    }
-    if (context.electronPlatformName === 'win32' && !existsSync(join(__dirname, WIN_SIDECAR))) {
-      throw new Error(
-        `win extraResources source missing: ${WIN_SIDECAR} (cargo build --target ${winSidecarTarget} first)`,
-      )
     }
   },
   dmg: {
@@ -671,14 +504,13 @@ const config = {
 
 // Windows in-package code signing. Security features that judge every PE
 // individually (Smart App Control, WDAC/AppLocker, AV heuristics) block
-// unsigned child processes — the unsigned xlsx-sidecar.exe died with
-// "spawn UNKNOWN" on such machines even though the installer itself was
-// signed. When CI exports GENOFFICE_WIN_SIGN_MODE ("test" = alpha
+// unsigned child processes, which die with "spawn UNKNOWN" on such machines
+// even though the installer itself is signed. When CI exports GENOFFICE_WIN_SIGN_MODE ("test" = alpha
 // self-signed PFX, "production" = DigiCert KeyLocker — the two modes of
 // scripts/win-sign.cjs, whose env-var contract applies here too), every
 // binary electron-builder signs for win (GenOffice.exe, the NSIS
 // uninstaller, and the installer) goes through that script. The static
-// extraResources binaries (xlsx-sidecar.exe, win-ocr.exe) are signed by the
+// extraResources binaries (win-ocr.exe) are signed by the
 // workflow before packaging since electron-builder does not sign
 // extraResources. Unset (local / fork builds) keeps the old behavior:
 // electron-builder has no signing config and packages everything unsigned.

@@ -2,16 +2,12 @@
 import { mkdir, writeFile } from 'node:fs/promises'
 import JSZip from 'jszip'
 import { buildBlankDocx } from '../packages/docx-engine/src/blank'
-import { createBlankPptx } from '../packages/pptx-engine/src/blank'
-import { blankXlsxBuffer } from '../packages/xlsx-gateway/src/gateway/csv-import'
 
 async function main() {
   const output = new URL('../apps/shell/build/shell-new/', import.meta.url)
   await mkdir(output, { recursive: true })
   const templates = {
     docx: await buildBlankDocx(),
-    xlsx: await blankXlsxBuffer(),
-    pptx: await createBlankPptx(),
   }
   for (const [ext, bytes] of Object.entries(templates)) {
     const zip = await JSZip.loadAsync(bytes)

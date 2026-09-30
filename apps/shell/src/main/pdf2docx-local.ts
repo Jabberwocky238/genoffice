@@ -1,9 +1,9 @@
 /**
- * Local PDF → Word conversion for the shell's pdf tabs (pdf2docx P4).
- * Loads the shared PDFium wasm with the same lazy-singleton pattern as
- * apps/pdf/src/main/text-edit.ts and runs the pure @genoffice/pdf2docx
- * pipeline in the main process. Imported by relative path (like the other
- * sibling app modules) so the bundled shell main carries the package inline.
+ * Local PDF → Word conversion: a PDF opened in the shell is converted to a
+ * .docx and opened in the Word editor. Loads the PDFium wasm lazily as a
+ * singleton and runs the pure @genoffice/pdf2docx pipeline in the main
+ * process. Imported by relative path so the bundled shell main carries the
+ * package inline.
  */
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -14,7 +14,7 @@ import {
   createVisionOcrEngine,
   createWindowsOcrEngine,
 } from '../../../../packages/pdf2docx/src/ocr-vision'
-import { pdfiumWasmPath } from '../../../pdf/src/main/wasm-path'
+import { pdfiumWasmPath } from './pdfium-wasm'
 
 export type { ConvertResult, PageResult } from '../../../../packages/pdf2docx/src'
 export { PdfLoadError } from '../../../../packages/pdf2docx/src'
@@ -53,8 +53,7 @@ function ensureOcrEngine(): OcrEngine | null {
 let pdfiumPromise: Promise<PdfiumModule> | null = null
 
 /** Load the wasm bytes ourselves: the bundled main process must not rely on
- *  the package's own file resolution (see apps/pdf text-edit.ts). Exported so
- *  the pptx exporter (pdf2pptx-local.ts) shares the same wasm singleton. */
+ *  the package's own file resolution (see pdfium-wasm.ts). */
 export function ensurePdfium(): Promise<PdfiumModule> {
   pdfiumPromise ??= (async () => {
     const { init } = (await import('@embedpdf/pdfium')) as unknown as {
@@ -65,8 +64,7 @@ export function ensurePdfium(): Promise<PdfiumModule> {
     const wasmBinary = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength)
     // thisProgram: emscripten's synthetic environ writes process.argv[1] via
     // ASCII-asserting stringToAscii; a document path with CJK characters handed
-    // to the packaged app by a Windows file association aborts init (same fix
-    // as apps/pdf/src/main/text-edit.ts loadPdfium)
+    // to the packaged app by a Windows file association aborts init
     const wrapped = (await init({ wasmBinary, thisProgram: 'genoffice-pdf' })) as {
       pdfium?: unknown
     }

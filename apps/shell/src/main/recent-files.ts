@@ -59,11 +59,8 @@ export function normalizeRecentQuery(
 
 /** sidebar filter keys that stand for a family of extensions, not one exact ext */
 export const EXT_FAMILY: Record<string, readonly string[]> = {
-  // delimited text belongs to the sheets family: Home's own FILTER_FAMILY and
-  // the shell's open routing both treat .csv/.tsv as spreadsheets, so a
-  // sidebar filtered on "xlsx" must page them in too (csv was missing here).
-  xlsx: ['xlsx', 'xlsm', 'xls', 'csv', 'tsv'],
-  html: ['html', 'htm'],
+  // mirrors Home's FILTER_FAMILY: legacy .doc files sit under the Docs filter
+  docx: ['docx', 'doc'],
 }
 
 /** Family-aware extension match for sidebar filters (recents and starred share it). */

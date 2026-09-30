@@ -98,15 +98,15 @@ describe('package limits', () => {
 
   it('refuses too many parts without reading the directory', async () => {
     const entries = Array.from({ length: 10001 }, (_, i) => ({ name: `p/${i}.xml` }))
-    const many = file('many.xlsx', rawZip(entries))
+    const many = file('many.docx', rawZip(entries))
     expect(readZipDirectory(many, 10000)).toEqual({ count: 10001, entries: [] })
-    const r = (await run(['sheet', 'read', many, '--json'])).json()
+    const r = (await run(['docs', 'read', many, '--json'])).json()
     expect(r).toMatchObject({ error: 'resource_limit' })
     expect(r.detail).toMatchObject({ entries: 10001, limit: 10000 })
 
     const hostile = rawZip([{ name: 'a.xml' }], true)
     hostile.writeBigUInt64LE(50_000_000n, hostile.length - 22 - 20 - 56 + 32)
-    expect(readZipDirectory(file('hostile.pptx', hostile), 10000)).toEqual({
+    expect(readZipDirectory(file('hostile.docx', hostile), 10000)).toEqual({
       count: 50_000_000,
       entries: [],
     })
@@ -165,24 +165,24 @@ describe('package limits', () => {
 
   it('refuses oversized parts and totals', async () => {
     const part = file(
-      'big.xlsx',
-      rawZip([{ name: 'xl/worksheets/sheet1.xml', compressed: 100 * MB, uncompressed: 300 * MB }]),
+      'big.docx',
+      rawZip([{ name: 'word/document.xml', compressed: 200 * MB, uncompressed: 600 * MB }]),
     )
-    expect((await run(['info', part, '--json'])).json()).toMatchObject({
+    expect((await run(['docs', 'read', part, '--json'])).json()).toMatchObject({
       error: 'resource_limit',
-      detail: { entry: 'xl/worksheets/sheet1.xml', limit: 256 * MB },
+      detail: { entry: 'word/document.xml', limit: 512 * MB },
     })
     const total = file(
-      'total.pptx',
+      'total.docx',
       rawZip(
         Array.from({ length: 4 }, (_, i) => ({
-          name: `ppt/media/${i}.bin`,
+          name: `word/media/${i}.bin`,
           compressed: 400 * MB,
           uncompressed: 400 * MB,
         })),
       ),
     )
-    expect((await run(['slides', 'read', total, '--json'])).json()).toMatchObject({
+    expect((await run(['docs', 'read', total, '--json'])).json()).toMatchObject({
       error: 'resource_limit',
       detail: { bytes: 1600 * MB },
     })

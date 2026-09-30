@@ -39,14 +39,11 @@ test.describe('home file search', () => {
     mkdirSync(join(root, 'Finance'))
     writeFileSync(join(root, 'Finance', 'quarterly-plan.docx'), await minimalDocx(HAN_BODY))
     writeFileSync(
-      join(root, 'meeting-notes.md'),
-      '# Notes\n\nDiscussed the annual budget review.\n',
+      join(root, 'meeting-notes.docx'),
+      await minimalDocx('Discussed the annual budget review.'),
     )
-    writeFileSync(
-      join(root, 'landing.html'),
-      '<html><body><h1>Launch</h1><p>Budget approved.</p></body></html>',
-    )
-    writeFileSync(join(root, 'unrelated.md'), 'nothing to see here')
+    writeFileSync(join(root, 'landing.docx'), await minimalDocx('Budget approved.'))
+    writeFileSync(join(root, 'unrelated.docx'), await minimalDocx('nothing to see here'))
   })
 
   test.afterEach(() => {
@@ -64,12 +61,12 @@ test.describe('home file search', () => {
       const box = page.locator('.file-search input')
       await expect(box).toBeVisible()
 
-      // content match across two formats; the index fills in the background
+      // content match across two files; the index fills in the background
       await box.fill('budget')
       const rows = page.locator('.search-row')
       await expect(rows).toHaveCount(2, { timeout: 30_000 })
-      await expect(page.locator('.search-name', { hasText: 'meeting-notes.md' })).toBeVisible()
-      await expect(page.locator('.search-name', { hasText: 'landing.html' })).toBeVisible()
+      await expect(page.locator('.search-name', { hasText: 'meeting-notes.docx' })).toBeVisible()
+      await expect(page.locator('.search-name', { hasText: 'landing.docx' })).toBeVisible()
       await expect(page.locator('.search-snippet .search-hit').first()).toHaveText(/budget/i)
       await expect(page.locator('.recents-heading .file-count')).toHaveText('2 results')
 
@@ -89,7 +86,7 @@ test.describe('home file search', () => {
       await box.fill('quart')
       await expect(rows).toHaveCount(1)
       await expect(page.locator('.search-name .search-hit')).toHaveText('quart')
-      await page.locator('.filter-pill', { hasText: 'Markdown' }).click()
+      await page.locator('.filter-pill', { hasText: 'PDF' }).click()
       await expect(page.locator('.search-results .empty-hint')).toContainText('quart')
       await page.locator('.filter-pill', { hasText: 'All' }).click()
       await expect(rows).toHaveCount(1)

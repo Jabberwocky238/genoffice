@@ -4,8 +4,8 @@ import { renameSync, unlinkSync, writeFileSync } from 'node:fs'
 /**
  * userData/open-documents.json: the files the running shell has open in tabs,
  * for other processes — the genoffice CLI refuses to rewrite a document in place
- * while the editor shows it, since the editor would either warn at its next
- * save (docs, sheets) or silently overwrite the change (slides). Rewritten on
+ * while the editor shows it, since the editor would warn about the change at
+ * its next save. Rewritten on
  * every tab change, emptied at startup, removed on quit; the pid lets a reader
  * ignore a registry left behind by a crash.
  */

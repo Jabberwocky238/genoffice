@@ -57,19 +57,6 @@ export function pdfiumWasmPath(): string {
   throw new Error('pdfium.wasm not found (set GENOFFICE_PDFIUM_WASM)')
 }
 
-export function xlsxSidecarPath(): string | null {
-  if (process.env.XLSX_SIDECAR_PATH) return process.env.XLSX_SIDECAR_PATH
-  const executable = process.platform === 'win32' ? 'xlsx-sidecar.exe' : 'xlsx-sidecar'
-  const packaged = packagedResourcesDir()
-  const candidates = [
-    ...(packaged ? [join(packaged, 'native', executable)] : []),
-    ...(repoRoot()
-      ? [join(repoRoot()!, 'apps/sheets/native/xlsx-engine/target/release', executable)]
-      : []),
-  ]
-  return candidates.find((p) => existsSync(p)) ?? null
-}
-
 export function ocrHelperPath(): string | null {
   const helper = process.platform === 'darwin' ? 'vision-ocr' : 'win-ocr.exe'
   const packaged = packagedResourcesDir()

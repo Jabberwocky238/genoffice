@@ -8,7 +8,7 @@
  *   text-layout 2.3 text layout (wrapping/line spacing/autofit/vertical alignment)
  *   build-slide aggregation: Slide → RenderTree (fidelity is locked at this layer; unit-testable without canvas)
  *
- * The Konva adapter (drawing the RenderTree) is added when apps/slides gets a frontend; not in this package.
+ * Drawing the RenderTree onto a canvas is left to the consumer; not in this package.
  */
 export * from './coords'
 export * from './render-tree'

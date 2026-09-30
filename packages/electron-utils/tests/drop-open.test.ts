@@ -127,20 +127,20 @@ describe('partitionDropPayload', () => {
   })
 
   it('ignores non-string entries, whitespace-only strings, and duplicates', () => {
-    const result = partitionDropPayload([' a.docx ', 'a.docx', 42, null, '', '  ', 'b.xlsx'])
-    expect(result.supported).toEqual(['a.docx', 'b.xlsx'])
+    const result = partitionDropPayload([' a.docx ', 'a.docx', 42, null, '', '  ', 'b.pdf'])
+    expect(result.supported).toEqual(['a.docx', 'b.pdf'])
     expect(result.unsupportedExts).toEqual([])
   })
 
   it('classifies openable extensions case-insensitively', () => {
-    const result = partitionDropPayload(['REPORT.DOCX', 'data.CSV', 'notes.MarkDown'])
-    expect(result.supported).toEqual(['REPORT.DOCX', 'data.CSV', 'notes.MarkDown'])
+    const result = partitionDropPayload(['REPORT.DOCX', 'scan.Pdf'])
+    expect(result.supported).toEqual(['REPORT.DOCX', 'scan.Pdf'])
   })
 
-  it('treats a dropped .tsv as openable, not as unsupported', () => {
-    const result = partitionDropPayload(['/data/variants.tsv', '/x/y.TSV'])
-    expect(result.supported).toEqual(['/data/variants.tsv', '/x/y.TSV'])
-    expect(result.unsupportedExts).toEqual([])
+  it('reports the other office formats as unsupported in a Word-only build', () => {
+    const result = partitionDropPayload(['/data/variants.tsv', '/x/y.XLSX', '/d.pptx', '/n.md'])
+    expect(result.supported).toEqual([])
+    expect(result.unsupportedExts).toEqual(['tsv', 'xlsx', 'pptx', 'md'])
   })
 
   it('collects known-unsupported extensions uniquely, first-seen order', () => {
@@ -155,8 +155,8 @@ describe('partitionDropPayload', () => {
   })
 
   it('keeps the original order so the last file wins activation', () => {
-    const result = partitionDropPayload(['/a.docx', '/b/c.csv', '/d.md'])
-    expect(result.supported).toEqual(['/a.docx', '/b/c.csv', '/d.md'])
+    const result = partitionDropPayload(['/a.docx', '/b/c.pdf', '/d.docx'])
+    expect(result.supported).toEqual(['/a.docx', '/b/c.pdf', '/d.docx'])
   })
 })
 

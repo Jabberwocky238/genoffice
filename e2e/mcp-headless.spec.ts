@@ -4,8 +4,6 @@ import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { parseDocx } from '@genoffice/docx-engine'
-import { openPptx } from '@genoffice/pptx-engine'
-import JSZip from 'jszip'
 import http, { createServer } from 'node:http'
 
 /**
@@ -57,7 +55,7 @@ function postMcp(
 }
 
 test.describe('MCP headless generation', () => {
-  test('spawns the bundled CLI to create docx/pptx/xlsx', async () => {
+  test('spawns the bundled CLI to create and read a docx', async () => {
     test.setTimeout(120_000)
     const port = await freePort()
     const outDir = await mkdtemp(join(tmpdir(), 'genoffice-mcp-headless-'))
@@ -124,30 +122,6 @@ test.describe('MCP headless generation', () => {
       const read = await call('read_docx', { path: docxPath })
       expect(String(read.text)).toContain('Title')
       expect(String(read.text)).toContain('Body paragraph')
-
-      // create_pptx → a real 2-slide deck
-      const pptxPath = join(outDir, 'headless.pptx')
-      await call('create_pptx', {
-        title: 'Deck',
-        outline: '# One\n- a\n\n# Two\n- b',
-        path: pptxPath,
-      })
-      const deck = await openPptx(new Uint8Array(await readFile(pptxPath)))
-      expect(deck.deck.slides).toHaveLength(2)
-
-      // create_xlsx → numeric cells survive the CLI's gateway write
-      const xlsxPath = join(outDir, 'headless.xlsx')
-      await call('create_xlsx', {
-        title: 'Book',
-        data: [
-          ['Item', 'Qty'],
-          ['Widget', 12],
-        ],
-        path: xlsxPath,
-      })
-      const zip = await JSZip.loadAsync(await readFile(xlsxPath))
-      const sheetXml = await zip.file('xl/worksheets/sheet1.xml')!.async('string')
-      expect(sheetXml).toContain('<v>12</v>')
     } finally {
       await closeAndSaveVideo(launched, 'mcp-headless')
     }

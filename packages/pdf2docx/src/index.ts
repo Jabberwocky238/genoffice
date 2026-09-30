@@ -7,9 +7,7 @@
  * Pure-function package: bytes in, bytes out. The caller owns wasm setup —
  * initialize @embedpdf/pdfium (`init({ wasmBinary })` + `_PDFiumExt_Init()`)
  * and pass the module in; nothing here touches Electron or the filesystem.
- *
- * P25 adds a second output format: convertPdfToPptx (rebuild-pptx/) shares
- * the extract→analyze pipeline (pipeline.ts) and rebuilds slides instead.
+
  */
 import { extractIrDocument, isScannedDocument, type ConvertOptions } from './pipeline'
 import type { PageResult } from './pipeline'
@@ -26,8 +24,6 @@ export * as rebuild from './rebuild'
 export type { ConvertOptions, PageResult, IrDocument } from './pipeline'
 export { extractIrDocument } from './pipeline'
 export type { OcrEngine, OcrLine, OcrChar } from './ocr'
-export { convertPdfToPptx, type ConvertPptxResult } from './rebuild-pptx'
-export { convertPdfToXlsx, type ConvertXlsxResult } from './rebuild-xlsx'
 
 export interface ConvertResult {
   docx: Uint8Array

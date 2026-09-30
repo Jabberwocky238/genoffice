@@ -8,7 +8,7 @@
 /// default-deny window.open handler.
 ///
 /// Apps that intentionally route window.open links to the system browser
-/// (docs/slides/pdf via safeExternalUrl) install their own handler on
+/// (docs via safeExternalUrl) install their own handler on
 /// specific webContents after creation; that replaces the default-deny
 /// handler for those contents only.
 import type { App } from 'electron'

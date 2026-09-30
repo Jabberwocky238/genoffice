@@ -1,9 +1,9 @@
 import { loadCatalog } from '../commands/guide'
-import type { GuideDomain, JsonSchema, OpCatalog, OpEntry } from '../op-catalog'
+import type { JsonSchema, OpCatalog, OpEntry } from '../op-catalog'
 
 /**
  * Typed `ops` schemas for the MCP tools, built from the catalog `guide <domain> --json`
- * prints (the sheets zod schema, the docs op registry, the pptx-ops signatures), so the
+ * prints (the docs op registry and tool schemas), so the
  * schema a client sees and the ops `apply` accepts come from one source. Every client
  * loads every tool schema into the model context, so the output is compact: per op the
  * `op` literal, its fields with type and required, one short description. Nothing here
@@ -246,9 +246,6 @@ function arraySchema(text: string): JsonSchema {
 /** The target forms are spelled out once, in the ops parameter description, not per op. */
 const TARGET: JsonSchema = { type: 'object' }
 
-/** Groups whose ops act on the whole deck or pick their own page; the others address target.slide (+ el). */
-const SLIDES_TARGET_OPTIONAL = new Set(['deck', 'slide'])
-
 function variant(
   entry: OpEntry,
   fields: ParsedFields,
@@ -263,7 +260,7 @@ function variant(
   return out
 }
 
-function sheetsVariant(entry: OpEntry): JsonSchema {
+function schemaVariant(entry: OpEntry): JsonSchema {
   const schema = compactSchema(entry.schema ?? { type: 'object' })
   const { op: _op, ...properties } = schema.properties ?? {}
   const required = (schema.required ?? []).filter((k) => k !== 'op')
@@ -271,7 +268,7 @@ function sheetsVariant(entry: OpEntry): JsonSchema {
 }
 
 function docsVariant(entry: OpEntry): JsonSchema {
-  if (entry.schema) return sheetsVariant(entry)
+  if (entry.schema) return schemaVariant(entry)
   const [body] = topGroups(entry.signature)
   const parsed = body === undefined ? { properties: {}, required: [] } : parseSignatureFields(body)
   const fields: ParsedFields = { properties: {}, required: [] }
@@ -287,119 +284,23 @@ function docsVariant(entry: OpEntry): JsonSchema {
   return variant(entry, fields, shortDescription(entry.note))
 }
 
-function slidesVariant(entry: OpEntry): JsonSchema {
-  const groups = topGroups(entry.signature).map(parseSignatureFields)
-  const fields: ParsedFields = { properties: { target: TARGET }, required: [] }
-  if (!SLIDES_TARGET_OPTIONAL.has(entry.group)) fields.required.push('target')
-  for (const g of groups) {
-    for (const [key, schema] of Object.entries(g.properties)) {
-      if (key === 'target' || fields.properties[key]) continue
-      fields.properties[key] = schema
-      if (groups.length === 1 && g.required.includes(key)) fields.required.push(key)
-    }
-  }
-  return variant(entry, fields, shortDescription(slidesSummary(entry)))
-}
-
-/** The first sentence of the op's prose, before any field table or example. */
-function slidesSummary(entry: OpEntry): string | undefined {
-  const note = / — (.+)$/.exec(entry.signature)?.[1]
-  const paragraph = (entry.doc ?? '').trim().split(/\n\s*\n/)[0]
-  const prose = paragraph && !/^[|`#]/.test(paragraph) ? paragraph : undefined
-  const sentence = prose ? /^(.+?\.)(\s|$)/s.exec(prose.replace(/\s+/g, ' '))?.[1] : undefined
-  return sentence ?? prose ?? note
-}
-
-/** Op names only: the compact form `create_pptx` advertises, pointing at `slides_apply` for the fields. */
-export function opNamesSchema(catalog: OpCatalog): JsonSchema {
-  const names = catalog.ops.filter((e) => e.available !== false).map((e) => e.op)
-  return {
-    type: 'array',
-    items: { type: 'object', properties: { op: { enum: names } }, required: ['op'] },
-  }
-}
-
 /** `{ type: "array", items: { anyOf: [one object per callable op] } }` for a loaded catalog. */
 export function opsSchemaFromCatalog(catalog: OpCatalog): JsonSchema {
-  const build =
-    catalog.domain === 'sheets'
-      ? sheetsVariant
-      : catalog.domain === 'docs'
-        ? docsVariant
-        : slidesVariant
-  const items = catalog.ops.filter((e) => e.available !== false).map(build)
+  const items = catalog.ops.filter((e) => e.available !== false).map(docsVariant)
   return { type: 'array', items: { anyOf: items } }
 }
 
-export async function opsSchemaFor(domain: GuideDomain): Promise<JsonSchema> {
-  return opsSchemaFromCatalog(await loadCatalog(domain))
+export async function opsSchemaFor(): Promise<JsonSchema> {
+  return opsSchemaFromCatalog(await loadCatalog())
 }
 
-const SCALAR: JsonSchema = {
-  anyOf: [{ type: 'string' }, { type: 'number' }, { type: 'boolean' }, { type: 'null' }],
-}
-
-/** `sheet_apply` cells: `{ cell, sheet?, value? | formula?, style? }`; style is format_range's format object. */
-export function cellsSchema(): JsonSchema {
-  return {
-    type: 'array',
-    items: {
-      type: 'object',
-      properties: {
-        cell: { type: 'string' },
-        sheet: { type: 'string' },
-        value: SCALAR,
-        formula: { type: 'string' },
-        style: { type: 'object' },
-      },
-      required: ['cell'],
-    },
-  }
-}
-
-/** `create_xlsx` data: a 2-D array of cell values or `{ sheets: [{ name, rows }] }`. */
-export function xlsxDataSchema(): JsonSchema {
-  const rows: JsonSchema = { type: 'array', items: { type: 'array', items: SCALAR } }
-  return {
-    anyOf: [
-      rows,
-      {
-        type: 'object',
-        properties: {
-          sheets: {
-            type: 'array',
-            items: {
-              type: 'object',
-              properties: { name: { type: 'string' }, rows },
-              required: ['name', 'rows'],
-            },
-          },
-        },
-        required: ['sheets'],
-      },
-    ],
-  }
-}
-
-export type TypedKey =
-  'docs-ops' | 'sheets-ops' | 'slides-ops' | 'slides-op-names' | 'cells' | 'xlsx-data' | 'object'
+export type TypedKey = 'docs-ops' | 'object'
 
 export type TypedSchemas = Record<TypedKey, JsonSchema>
 
 /** Every typed parameter schema the tool table refers to; the catalogs load once per process. */
 export async function loadTypedSchemas(): Promise<TypedSchemas> {
-  const [docs, sheets, slides] = await Promise.all(
-    (['docs', 'sheets', 'slides'] as const).map(loadCatalog),
-  )
-  return {
-    'docs-ops': opsSchemaFromCatalog(docs),
-    'sheets-ops': opsSchemaFromCatalog(sheets),
-    'slides-ops': opsSchemaFromCatalog(slides),
-    'slides-op-names': opNamesSchema(slides),
-    cells: cellsSchema(),
-    'xlsx-data': xlsxDataSchema(),
-    object: { type: 'object' },
-  }
+  return { 'docs-ops': await opsSchemaFor(), object: { type: 'object' } }
 }
 
 const FORBIDDEN = ['const', '$ref', '$defs', 'definitions', '$schema', 'oneOf', 'not', 'format']

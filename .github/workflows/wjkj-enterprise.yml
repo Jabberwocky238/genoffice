@@ -30,16 +30,6 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch, 2026-07
-        with:
-          toolchain: stable
-
-      - name: Cache cargo (xlsx-sidecar)
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          workspaces: apps/sheets/native/xlsx-engine
-
       - name: Install dependencies
         run: npm ci
 
@@ -52,14 +42,6 @@ jobs:
 
       - name: Build applications
         run: npm run notices && npm run build:all
-
-      - name: Stage Windows xlsx sidecar
-        shell: pwsh
-        run: |
-          $source = 'apps/sheets/native/xlsx-engine/target/release/xlsx-sidecar.exe'
-          $destination = 'apps/sheets/native/xlsx-engine/target/x86_64-pc-windows-gnu/release'
-          New-Item -ItemType Directory -Force -Path $destination | Out-Null
-          Copy-Item $source "$destination/xlsx-sidecar.exe"
 
       - name: Package Windows application
         run: npm run dist:win -w @genoffice/shell
@@ -99,17 +81,6 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch, 2026-07
-        with:
-          toolchain: stable
-          targets: x86_64-apple-darwin,aarch64-apple-darwin
-
-      - name: Cache cargo (xlsx-sidecar)
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          workspaces: apps/sheets/native/xlsx-engine
-
       - name: Install dependencies
         run: npm ci
 
@@ -117,8 +88,8 @@ jobs:
         id: metadata
         run: echo "version=$(node -p "require('./apps/shell/package.json').version")" >> "$GITHUB_OUTPUT"
 
-      - name: Build applications and universal sidecar
-        run: npm run notices && npm run build:all && npm run native:build:universal -w @genoffice/sheets
+      - name: Build applications
+        run: npm run notices && npm run build:all
 
       - name: Package macOS application
         run: npm run dist:mac -w @genoffice/shell

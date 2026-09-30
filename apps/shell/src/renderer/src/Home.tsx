@@ -2,11 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { DragEvent as ReactDragEvent, ReactElement } from 'react'
 import logoLockup from './assets/genoffice-logo.svg'
 import iconDocx from './assets/file-docx.svg'
-import iconXlsx from './assets/file-xlsx.svg'
-import iconPptx from './assets/file-pptx.svg'
 import iconPdf from './assets/file-pdf.svg'
-import iconMd from './assets/file-md.svg'
-import iconHtml from './assets/file-html.svg'
 import type {
   AccountStatus,
   CloudProjectKind,
@@ -55,21 +51,14 @@ const GREET_ASK_KEYS = [
 
 const FILE_ICONS: Record<string, string> = {
   docx: iconDocx,
-  xlsx: iconXlsx,
-  xlsm: iconXlsx,
-  pptx: iconPptx,
   pdf: iconPdf,
-  md: iconMd,
-  markdown: iconMd,
-  html: iconHtml,
-  htm: iconHtml,
 }
 
 /* Formats the open-local card advertises. Too long for the card at any window
    width, so it ellipsizes and a hover ScreenTip carries the full list. Keep in
-   sync with the main-process open-dialog filter (OPEN_DIALOG_EXTENSIONS). */
-const OPEN_LOCAL_EXTENSIONS =
-  '.docx / .xlsx / .xlsm / .xls / .csv / .tsv / .pptx / .pdf / .md / .html'
+   sync with the main-process open-dialog filter (OPEN_DIALOG_EXTENSIONS); a .pdf
+   opens by converting it to Word. */
+const OPEN_LOCAL_EXTENSIONS = '.docx / .pdf'
 
 /** drag payload of home file/folder rows (JSON array of absolute paths) */
 const DRAG_PATHS_MIME = 'application/x-genoffice-paths'
@@ -233,20 +222,12 @@ function crumbsOf(root: FolderRoot, dir: string): Array<{ path: string; name: st
 const FILTERS: { key: string; label: StringKey }[] = [
   { key: 'all', label: 'filterAll' },
   { key: 'docx', label: 'filterDocs' },
-  { key: 'xlsx', label: 'filterSheets' },
-  { key: 'pptx', label: 'filterSlides' },
   { key: 'pdf', label: 'filterPdf' },
-  { key: 'md', label: 'filterMd' },
-  { key: 'html', label: 'filterHtml' },
 ]
 
 /** sidebar filter keys that stand for a family of extensions (mirrors recent-files.ts) */
 const FILTER_FAMILY: Record<string, readonly string[]> = {
   docx: ['docx', 'doc'],
-  xlsx: ['xlsx', 'xlsm', 'xls', 'csv', 'tsv'],
-  pptx: ['pptx', 'ppt'],
-  md: ['md', 'markdown'],
-  html: ['html', 'htm'],
 }
 
 function matchesFilter(entry: RecentEntry, filter: string): boolean {
@@ -1007,16 +988,8 @@ function AccountEntry({
 
 // ── Cloud (Genspark web) projects view ──────────────────
 
-/** kind filter segments; labels shared with the recents type filter */
-const CLOUD_FILTERS = [
-  { key: 'all', label: 'filterAll' },
-  { key: 'docs', label: 'filterDocs' },
-  { key: 'sheets', label: 'filterSheets' },
-  { key: 'slides', label: 'filterSlides' },
-] as const satisfies readonly { key: 'all' | CloudProjectKind; label: StringKey }[]
-
 /** module kind → file icon extension */
-const CLOUD_KIND_EXT: Record<string, string> = { docs: 'docx', sheets: 'xlsx', slides: 'pptx' }
+const CLOUD_KIND_EXT: Record<CloudProjectKind, string> = { docs: 'docx' }
 
 /** rows revealed per "load more" step; purely client-side over the local snapshot */
 const CLOUD_REVEAL_STEP = 100
@@ -1028,7 +1001,6 @@ function CloudProjectsView() {
   const [loading, setLoading] = useState(true)
   const [syncing, setSyncing] = useState(false)
   const [loginWaiting, setLoginWaiting] = useState(false)
-  const [kind, setKind] = useState<'all' | CloudProjectKind>('all')
   const [query, setQuery] = useState('')
   const [sort, setSort] = useState<'recent' | 'oldest'>('recent')
   const [sortMenuOpen, setSortMenuOpen] = useState(false)
@@ -1087,19 +1059,14 @@ function CloudProjectsView() {
     })
   }
 
-  const changeKind = (k: 'all' | CloudProjectKind) => {
-    if (k === kind) return
-    setKind(k)
-    setRevealed(CLOUD_REVEAL_STEP)
-  }
-
   const openProject = (projectUrl: string) => {
     void window.aiOffice.openCloudProject?.(projectUrl)
   }
 
   // filter / search / sort are all local over the snapshot — no requests
   const q = query.trim().toLowerCase()
-  let list = snapshot?.projects.filter((proj) => kind === 'all' || proj.kind === kind) ?? []
+  // only Word (docs) projects: the other Genspark project kinds have no editor here
+  let list = snapshot?.projects.filter((proj) => proj.kind === 'docs') ?? []
   if (q) list = list.filter((proj) => proj.title.toLowerCase().includes(q))
   if (sort === 'oldest') list = [...list].reverse()
   const visible = list.slice(0, revealed)
@@ -1116,7 +1083,7 @@ function CloudProjectsView() {
             data-tip-place="right"
             onClick={() => openProject(proj.projectUrl)}
           >
-            <FileBadge ext={CLOUD_KIND_EXT[proj.kind] ?? ''} size={24} />
+            <FileBadge ext={proj.kind === 'other' ? '' : CLOUD_KIND_EXT[proj.kind]} size={24} />
             <span className="cloud-row-main">
               <span className="cloud-row-title">{proj.title || t('untitled')}</span>
               <svg
@@ -1177,9 +1144,7 @@ function CloudProjectsView() {
     if (list.length === 0) {
       return (
         <p className="empty proj-empty">
-          <span className="empty-hint">
-            {t(q ? 'cloudNoResults' : kind === 'all' ? 'cloudEmpty' : 'emptyFiltered')}
-          </span>
+          <span className="empty-hint">{t(q ? 'cloudNoResults' : 'cloudEmpty')}</span>
         </p>
       )
     }
@@ -1261,19 +1226,6 @@ function CloudProjectsView() {
           <p className="cloud-subtitle">{t('cloudSubtitle')}</p>
           {snapshot?.available && (
             <div className="cloud-controls">
-              <div className="cloud-seg" role="tablist" aria-label={t('filterAria')}>
-                {CLOUD_FILTERS.map((f) => (
-                  <button
-                    key={f.key}
-                    className={kind === f.key ? 'active' : ''}
-                    role="tab"
-                    aria-selected={kind === f.key}
-                    onClick={() => changeKind(f.key)}
-                  >
-                    {t(f.label)}
-                  </button>
-                ))}
-              </div>
               <button
                 className={`cloud-refresh-btn${syncing ? ' syncing' : ''}`}
                 data-tip={t('cloudRefresh')}
@@ -2086,36 +2038,6 @@ export function Home() {
       title: t('newDoc'),
       sub: '.docx',
       action: () => window.aiOffice.newDoc(newFileOpts),
-    },
-    {
-      ext: 'xlsx',
-      title: t('newSheet'),
-      sub: '.xlsx',
-      action: () => window.aiOffice.newSheet(newFileOpts),
-    },
-    {
-      ext: 'pptx',
-      title: t('newSlide'),
-      sub: '.pptx',
-      action: () => window.aiOffice.newSlide(newFileOpts),
-    },
-    {
-      ext: 'md',
-      title: t('newMarkdown'),
-      sub: '.md',
-      action: () => window.aiOffice.newMarkdown(newFileOpts),
-    },
-    {
-      ext: 'html',
-      title: t('newHtml'),
-      sub: '.html',
-      action: () => window.aiOffice.newHtml(newFileOpts),
-    },
-    {
-      ext: 'pdf',
-      title: t('newPdf'),
-      sub: '.pdf',
-      action: () => window.aiOffice.newPdf(newFileOpts),
     },
   ]
 

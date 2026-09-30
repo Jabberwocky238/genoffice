@@ -39,10 +39,6 @@ function stubExporters(): { exporters: HeadlessExporters; calls: string[] } {
     calls,
     exporters: {
       docs: make('docs'),
-      sheets: make('sheets'),
-      slides: make('slides'),
-      markdown: make('markdown'),
-      html: make('html'),
     },
   }
 }
@@ -59,10 +55,10 @@ describe('validateHeadlessPaths', () => {
   })
 
   it('rejects a target the input module does not render as bad args (exit 1)', () => {
-    const fs = fsWith(['/docs/a.docx', '/decks/a.pptx', '/out'])
-    expect(
-      validateHeadlessPaths(request('/decks/a.pptx', '/out/a.docx', 'docx'), fs),
-    ).toMatchObject({ ok: false, code: 1, message: expect.stringContaining('pdf') })
+    const fs = fsWith(['/docs/a.docx', '/out'])
+    expect(validateHeadlessPaths(request('/docs/a.docx', '/out/a.docx', 'docx'), fs)).toMatchObject(
+      { ok: false, code: 1, message: expect.stringContaining('pdf') },
+    )
     expect(validateHeadlessPaths(request('/docs/a.docx', '/out/a.html', 'html'), fs)).toMatchObject(
       { ok: true, module: 'docs' },
     )
@@ -102,25 +98,27 @@ describe('runHeadlessExport', () => {
   it('calls the module that owns the extension and reports success', async () => {
     const { exporters, calls } = stubExporters()
     const outcome = await runHeadlessExport(
-      request('/decks/a.pptx'),
+      request('/docs/a.docx'),
       exporters,
-      fsWith(['/decks/a.pptx', '/out', '/out/a.pdf']),
+      fsWith(['/docs/a.docx', '/out', '/out/a.pdf']),
     )
-    expect(calls).toEqual(['slides:/decks/a.pptx->/out/a.pdf:pdf'])
-    expect(outcome).toEqual({ ok: true, input: '/decks/a.pptx', outPath: '/out/a.pdf' })
+    expect(calls).toEqual(['docs:/docs/a.docx->/out/a.pdf:pdf'])
+    expect(outcome).toEqual({ ok: true, input: '/docs/a.docx', outPath: '/out/a.pdf' })
   })
 
-  it.each([
-    ['/a.docx', 'docs'],
-    ['/a.xlsx', 'sheets'],
-    ['/a.pptx', 'slides'],
-    ['/a.md', 'markdown'],
-    ['/a.html', 'html'],
-  ])('routes %s to the %s exporter', async (input, module) => {
-    const { exporters, calls } = stubExporters()
-    await runHeadlessExport(request(input), exporters, fsWith([input, '/out', '/out/a.pdf']))
-    expect(calls[0]?.startsWith(`${module}:`)).toBe(true)
-  })
+  it.each(['/a.xlsx', '/a.pptx', '/a.md', '/a.html'])(
+    'refuses %s: only Word documents export headlessly',
+    async (input) => {
+      const { exporters, calls } = stubExporters()
+      const outcome = await runHeadlessExport(
+        request(input),
+        exporters,
+        fsWith([input, '/out', '/out/a.pdf']),
+      )
+      expect(calls).toEqual([])
+      expect(outcome).toMatchObject({ ok: false, code: 2 })
+    },
+  )
 
   it('turns a thrown exporter error into a conversion failure (exit 3)', async () => {
     const { exporters } = stubExporters()

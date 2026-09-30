@@ -24,21 +24,10 @@ export const selectionCommand: CommandDef = {
 
 function summarize(result: Record<string, unknown>): string {
   if (result.none) return 'nothing is selected'
-  if (Array.isArray(result.elements)) {
-    return result.elements.length
-      ? `slide ${result.slide}: ${result.elements.join(', ')}`
-      : `slide ${result.slide}, no element selected`
-  }
   if (Array.isArray(result.blocks)) {
     const [a, b] = result.blocks as number[]
     const text = typeof result.text === 'string' && result.text ? `: ${preview(result.text)}` : ''
     return (a === b ? `block ${a}` : `blocks ${a}-${b}`) + text
-  }
-  if (typeof result.range === 'string') return `${result.sheet}!${result.range}`
-  if (typeof result.page === 'number') {
-    return (
-      `page ${result.page}` + (typeof result.text === 'string' ? `: ${preview(result.text)}` : '')
-    )
   }
   return JSON.stringify(result)
 }

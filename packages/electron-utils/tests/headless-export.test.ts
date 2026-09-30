@@ -82,22 +82,14 @@ describe('parseHeadlessExportArgv', () => {
 describe('headlessModuleFor', () => {
   it.each([
     ['/x/a.docx', 'docs'],
-    ['/x/a.xlsx', 'sheets'],
-    ['/x/a.XLSM', 'sheets'],
-    ['/x/a.xls', 'sheets'],
-    ['/x/a.csv', 'sheets'],
-    ['/x/a.tsv', 'sheets'],
-    ['/x/a.pptx', 'slides'],
-    ['/x/a.md', 'markdown'],
-    ['/x/a.markdown', 'markdown'],
-    ['/x/a.html', 'html'],
-    ['/x/a.htm', 'html'],
+    ['/x/A.DOCX', 'docs'],
   ])('routes %s to %s', (path, module) => {
     expect(headlessModuleFor(path)).toBe(module)
   })
 
   it('returns null for an unsupported extension', () => {
     expect(headlessModuleFor('/x/a.pdf')).toBeNull()
+    expect(headlessModuleFor('/x/a.xlsx')).toBeNull()
     expect(headlessModuleFor('/x/a.doc')).toBeNull()
     expect(headlessModuleFor('/x/noext')).toBeNull()
   })

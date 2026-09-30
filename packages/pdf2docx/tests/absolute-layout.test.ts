@@ -5,8 +5,7 @@
  * keeps its text over a text-free render instead of becoming one bitmap.
  */
 import { describe, expect, it } from 'vitest'
-import { openPptx } from '../../pptx-engine/src/index'
-import { convertPdfToDocx, convertPdfToPptx } from '../src'
+import { convertPdfToDocx } from '../src'
 import { analyzePage } from '../src/analyze'
 import type { ExtractedPage } from '../src/extract'
 import type { PdfChar } from '../src/ir'
@@ -104,13 +103,6 @@ describe('graphics-lost page in absolute layout', () => {
     expect(page.blocks.length).toBeGreaterThan(0)
     expect(page.blocks.every((b) => b.kind === 'text')).toBe(true)
     expect(warnings.some((w) => /painted as one image behind the text/.test(w))).toBe(true)
-
-    const result = await convertPdfToPptx(pdf, { pdfium })
-    expect(result.pageResults[0]!.status).toBe('ok')
-    const opened = await openPptx(result.pptx)
-    const elements = opened.deck.slides[0]!.elements
-    expect(elements.filter((e) => e.type === 'picture').length).toBe(1)
-    expect(elements.filter((e) => e.type === 'text').length).toBeGreaterThanOrEqual(2)
   })
 })
 

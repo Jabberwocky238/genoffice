@@ -19,7 +19,7 @@ import { createMcpServer, type ServeOptions } from './server'
  *   PUT  /files/<name>   upload a file (also POST /files?name=), reply { url, name, size }
  *   GET  /files/<id>/<name>   download an upload or a tool output
  *   GET  /health
- * Each MCP session gets its own scratch directory, working directory and deck
+ * Each MCP session gets its own scratch directory, working directory and
  * state, so two clients never see each other's files. With GENOFFICE_ALLOWED_ROOTS
  * unset, the tools are confined to the server's own file store.
  */

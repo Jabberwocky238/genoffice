@@ -1,11 +1,9 @@
 import { flagBool } from '../args'
 import type { CommandDef } from '../registry'
 import { docsCatalog } from '../formats/docx'
-import { sheetCatalog, sheetGuideText } from '../formats/xlsx-catalog'
 import {
   opLines,
   renderGroups,
-  withFingerprint,
   type GuideDomain,
   type OpCatalog,
   type OpEntry,
@@ -13,23 +11,21 @@ import {
 import { CliError, EXIT, type CommandResult } from '../result'
 import { didYouMean } from '../suggest'
 
-const DOMAINS: readonly GuideDomain[] = ['slides', 'docs', 'sheets']
+const DOMAINS: readonly GuideDomain[] = ['docs']
 
 /**
- * Every op reference is generated from the definition the executor validates against (the pptx-ops
- * markdown, the sheets zod schema, the docs op registry and tool schemas), so the guide cannot
- * drift from what `apply` accepts; `--json` returns the same catalog with each op's schema.
+ * The op reference is generated from the definition the executor validates against (the docs op
+ * registry and tool schemas), so the guide cannot drift from what `apply` accepts; `--json`
+ * returns the same catalog with each op's schema.
  */
 export const guideCommand: CommandDef = {
   name: 'guide',
   summary: 'Print the op reference and design guides an agent needs before writing ops or specs.',
-  usage: 'guide <slides|docs|sheets> [group|op|design|spec] [--index] [--fingerprint]',
+  usage: 'guide docs [group|op] [--fingerprint]',
   options: [
-    { name: 'index', description: 'one-line signature of every op instead of a group guide' },
     {
       name: 'fingerprint',
-      description:
-        'only the catalog fingerprint (changes with any op or field); no domain = all three',
+      description: 'only the catalog fingerprint (changes with any op or field)',
     },
   ],
   async run(args) {
@@ -41,19 +37,15 @@ export const guideCommand: CommandDef = {
     if (!isDomain(domain)) {
       throw new CliError(
         EXIT.usage,
-        'guides available for: slides, docs, sheets',
-        { usage: 'genoffice guide slides | genoffice guide docs | genoffice guide sheets' },
+        'guides available for: docs',
+        { usage: 'genoffice guide docs' },
         {
           reason: domain === undefined ? 'missing_argument' : 'invalid_argument',
-          suggestion: 'run `genoffice guide slides|docs|sheets`',
+          suggestion: 'run `genoffice guide docs`',
         },
       )
     }
-    if (domain === 'slides' && (topic === 'design' || topic === 'spec')) {
-      const { SLIDES_GUIDES } = await import('@genoffice/pipelines/slides')
-      return { summary: SLIDES_GUIDES[topic].content }
-    }
-    const { catalog, text } = await load(domain, topic, flagBool(args, 'index'))
+    const { catalog, text } = await load()
     if (!topic) return { summary: text(), ...(json ? { detail: { ...catalog } } : {}) }
     const group = catalog.groups.find((g) => g.name === topic)
     if (group) {
@@ -95,54 +87,13 @@ interface Loaded {
 }
 
 /** The catalog `guide <domain> --json` prints; the MCP op schemas are built from the same object. */
-export async function loadCatalog(domain: GuideDomain): Promise<OpCatalog> {
-  return (await load(domain, undefined, false)).catalog
+export async function loadCatalog(): Promise<OpCatalog> {
+  return (await load()).catalog
 }
 
-async function load(
-  domain: GuideDomain,
-  topic: string | undefined,
-  index: boolean,
-): Promise<Loaded> {
-  if (domain === 'sheets') return { catalog: sheetCatalog(), text: sheetGuideText }
-  if (domain === 'docs') {
-    const { catalog, htmlRules } = await docsCatalog()
-    return { catalog, text: (group) => docsGuideText(catalog, htmlRules, group) }
-  }
-  const docs = await import('@genoffice/pptx-ops/op-docs')
-  const catalog = slidesCatalog(docs)
-  return {
-    catalog,
-    text: (group) => {
-      if (index) return docs.opSignatureIndex()
-      if (group) return docs.opGuide(group)!
-      return [
-        'Op groups (genoffice guide slides <group> prints one; genoffice guide slides <op> prints one op):',
-        docs.opGuideCatalog(),
-        '',
-        'Building a new deck: `genoffice guide slides design` (the staged workflow: style sheet, outline, one page file at a time, build, QC) and `genoffice guide slides spec` (the outline and page spec JSON for `genoffice slides check` and `genoffice create --type pptx --spec`).',
-        '',
-        'Every op: { "op": "<name>", "target": { "slide": <index|"s_n">, "el"?: "e_*" }, ...fields }.',
-        'Units are EMU (914400 per inch; suffixes in/cm/mm/pt/px accepted); font sizes are pt. `genoffice slides read <file>` lists ids and geometry.',
-        'Vocabulary:',
-        docs.opVocabulary(),
-      ].join('\n')
-    },
-  }
-}
-
-type SlidesOpDocs = typeof import('@genoffice/pptx-ops/op-docs')
-
-function slidesCatalog(docs: SlidesOpDocs): OpCatalog {
-  const ops: OpEntry[] = Object.entries(docs.OP_DOCS)
-    .filter(([, d]) => d.aiCallable !== false && !d.pending)
-    .map(([op, d]) => ({ op, group: d.group, signature: d.sig, doc: d.body, examples: d.examples }))
-  const groups = docs.OP_GROUPS.map((g) => ({
-    name: g,
-    summary: docs.OP_GUIDES[g].summary,
-    ops: ops.filter((e) => e.group === g).map((e) => e.op),
-  }))
-  return withFingerprint({ domain: 'slides', groups, ops })
+async function load(): Promise<Loaded> {
+  const { catalog, htmlRules } = await docsCatalog()
+  return { catalog, text: (group) => docsGuideText(catalog, htmlRules, group) }
 }
 
 function docsGuideText(catalog: OpCatalog, htmlRules: string, group?: string): string {
@@ -170,7 +121,7 @@ async function fingerprints(
 ): Promise<CommandResult> {
   const domains = domain ? [domain] : DOMAINS
   const out: Record<string, string> = {}
-  for (const d of domains) out[d] = (await load(d, undefined, false)).catalog.fingerprint
+  for (const d of domains) out[d] = (await load()).catalog.fingerprint
   return {
     summary: Object.entries(out)
       .map(([d, fp]) => `${d} ${fp}`)

@@ -1,8 +1,6 @@
 import { readFileSync } from 'node:fs'
 import {
   convertPdfToDocx,
-  convertPdfToPptx,
-  convertPdfToXlsx,
   extract,
   PdfLoadError,
   type OcrEngine,
@@ -180,7 +178,7 @@ function round(n: number): number {
   return Math.round(n * 100) / 100
 }
 
-export type PdfTarget = 'docx' | 'pptx' | 'xlsx'
+export type PdfTarget = 'docx'
 
 export interface PdfConvertOutcome {
   bytes: Uint8Array
@@ -201,18 +199,7 @@ export async function convertPdf(
     ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
     ...(opts.password !== undefined ? { password: opts.password } : {}),
   }
-  switch (target) {
-    case 'docx': {
-      const r = await convertPdfToDocx(bytes, convertOpts)
-      return { bytes: r.docx, pages: r.pages, warnings: r.warnings }
-    }
-    case 'pptx': {
-      const r = await convertPdfToPptx(bytes, convertOpts)
-      return { bytes: r.pptx, pages: r.pages, warnings: r.warnings }
-    }
-    case 'xlsx': {
-      const r = await convertPdfToXlsx(bytes, convertOpts)
-      return { bytes: r.xlsx, pages: r.pages, warnings: r.warnings }
-    }
-  }
+  void target
+  const r = await convertPdfToDocx(bytes, convertOpts)
+  return { bytes: r.docx, pages: r.pages, warnings: r.warnings }
 }

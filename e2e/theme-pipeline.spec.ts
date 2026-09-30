@@ -1,6 +1,6 @@
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { copyFile, mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { test, expect, type ElectronApplication, type Page } from '@playwright/test'
 import { launchShell, closeAndSaveVideo, waitForPageWithUrl } from './helpers'
 
@@ -37,19 +37,19 @@ function setTheme(page: Page, theme: 'light' | 'dark' | 'system'): Promise<void>
 test.describe('theme pipeline', () => {
   test('setTheme reaches home and editor tabs, persists across relaunch', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'genoffice-theme-'))
-    const mdPath = join(dir, 'doc.md')
-    await writeFile(mdPath, '# Doc\n\nBody.\n')
+    const docPath = join(dir, 'doc.docx')
+    await copyFile(resolve(__dirname, 'assets/justify-pagegap-fr.docx'), docPath)
 
     const launched = await launchShell({
       onboardingSeen: true,
       videoDir: 'theme-pipeline',
-      openFile: mdPath,
+      openFile: docPath,
     })
     const { app } = launched
     try {
       const shellPage = await findShellPage(app)
-      const editorPage = await waitForPageWithUrl(app, '://markdown/')
-      await expect(editorPage.locator('.doc-editor')).toBeVisible()
+      const editorPage = await waitForPageWithUrl(app, '://docs/')
+      await editorPage.waitForSelector('.ProseMirror', { timeout: 30_000 })
       expect(await themeAttr(shellPage)).toBeNull()
       expect(await themeAttr(editorPage)).toBeNull()
 

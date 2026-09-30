@@ -19,10 +19,7 @@ export interface ControlHost {
 }
 
 const TARGET_KIND_BY_TAB: Partial<Record<TabKind, ControlTarget['kind']>> = {
-  slides: 'slide',
   docs: 'block',
-  sheets: 'range',
-  pdf: 'page',
 }
 
 /**
@@ -66,18 +63,7 @@ export function controlHandler(host: ControlHost): (req: ControlRequest) => Prom
 }
 
 function flagFor(kind: ControlTarget['kind'] | undefined): string {
-  switch (kind) {
-    case 'slide':
-      return 'slide'
-    case 'block':
-      return 'block'
-    case 'range':
-      return 'range'
-    case 'page':
-      return 'page'
-    default:
-      return 'target'
-  }
+  return kind ?? 'target'
 }
 
 function fail(

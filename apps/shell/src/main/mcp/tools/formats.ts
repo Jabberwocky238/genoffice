@@ -2,27 +2,25 @@
  * Format capability registry — the MCP layer's single source of truth for
  * "which document formats each editor can open, save and export".
  *
- * The authority is the shell's own routing and each editor's Save-As dialog:
+ * The authority is the shell's own routing and the Word editor's Save-As dialog:
  *   - open routing:      apps/shell/src/main/index.ts  (routeDocumentPath,
  *                        OPEN_DIALOG_EXTENSIONS, UNSUPPORTED_DOC_RE)
- *   - save/export filters: apps/docs|sheets|slides|markdown|html/src/main/*
+ *   - save/export filters: apps/docs/src/main/*
  *
  * `editor` mirrors that matrix exactly; `mcp` is the subset this server exposes
  * today. Keeping both side by side makes the gap explicit and reviewable: MCP
  * never advertises a format it cannot actually produce, and widening it is a
  * one-line change here plus the matching driver/bridge.
  *
- * To add a family (markdown, html, pdf) or a format:
- *   1. add/complete the entry below,
- *   2. add a FamilyDriver in the family's tool module (session families), and
- *   3. register it in app-mcp.ts. Nothing else in the MCP layer needs touching.
+ * To add a format: complete the entry below and, for a new family, add a
+ * FamilyDriver and register it in app-mcp.ts.
  */
 
-/** families with a visible editing session today */
-export type SessionFamily = 'docx' | 'pptx' | 'xlsx'
+/** families with a visible editing session: the Word editor only */
+export type SessionFamily = 'docx'
 
-/** every family the app can edit, including ones MCP does not drive yet */
-export type EditorFamily = SessionFamily | 'md' | 'html' | 'pdf'
+/** every family the app can edit */
+export type EditorFamily = SessionFamily
 
 export interface McpFormats {
   /** format the headless `create_*` tool writes, when exposed */
@@ -47,10 +45,7 @@ export interface FormatFamily {
   mcp?: McpFormats
 }
 
-/**
- * The editor's format matrix. Order is presentation order: the three edit-in-place
- * families first (they have MCP sessions), then the editor-only ones.
- */
+/** The editor's format matrix. */
 export const FORMAT_FAMILIES: readonly FormatFamily[] = [
   {
     family: 'docx',
@@ -59,54 +54,6 @@ export const FORMAT_FAMILIES: readonly FormatFamily[] = [
     editorSave: ['docx'],
     editorExport: ['pdf'],
     mcp: { generate: 'docx', save: ['docx'], read: 'docx' },
-  },
-  {
-    family: 'xlsx',
-    label: 'spreadsheet',
-    // .tsv opens as a converted copy and saves as .xlsx, so it is an open-only
-    // format: it must not appear in editorSave
-    editorOpen: ['xlsx', 'xlsm', 'xls', 'csv', 'tsv'],
-    // the interactive Save As also offers .xlsm/.csv; the explicit-path save the
-    // MCP bridge uses writes .xlsx only (sheets-main.ts forces the extension),
-    // so mcp.save stays xlsx until that pipeline is widened
-    editorSave: ['xlsx', 'xlsm', 'csv'],
-    editorExport: ['pdf'],
-    mcp: { generate: 'xlsx', save: ['xlsx'] },
-  },
-  {
-    family: 'pptx',
-    label: 'presentation',
-    editorOpen: ['pptx'],
-    editorSave: ['pptx'],
-    editorExport: ['pdf'],
-    mcp: { generate: 'pptx', save: ['pptx'] },
-  },
-  // editor-only today: no MCP session/reader yet. Add an `mcp` block and a
-  // driver to expose them (kept here so the upgrade path is visible in code).
-  {
-    family: 'md',
-    label: 'Markdown document',
-    editorOpen: ['md', 'markdown'],
-    editorSave: ['md', 'markdown'],
-    editorExport: ['docx', 'pdf'],
-  },
-  {
-    family: 'html',
-    label: 'HTML page',
-    editorOpen: ['html', 'htm'],
-    editorSave: ['html', 'htm'],
-    editorExport: ['docx', 'pdf'],
-  },
-  {
-    family: 'pdf',
-    label: 'PDF document',
-    editorOpen: ['pdf'],
-    editorSave: ['pdf'],
-    // the PDF app converts on-device to the three editable formats
-    editorExport: ['docx', 'xlsx', 'pptx'],
-    // read-only by design: the pdf app is a viewer, MCP exposes text
-    // extraction only and does not drive the editor
-    mcp: { read: 'pdf' },
   },
 ]
 

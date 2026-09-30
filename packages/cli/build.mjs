@@ -1,6 +1,6 @@
 // Bundles the CLI into one CommonJS file so the packaged app can run it with
 // ELECTRON_RUN_AS_NODE (no node_modules ship with the app). Runtime assets
-// (pdfium wasm, xlsx sidecar, OCR helper) are located by src/resources.ts.
+// (pdfium wasm, OCR helper) are located by src/resources.ts.
 import { build } from 'esbuild'
 import { readFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'

@@ -131,9 +131,7 @@ function defaultSuggestion(reason: ErrorReason, detail: Record<string, unknown>)
     case 'out_of_range':
       return detail.valid_range ? `use a value in ${detail.valid_range}` : 'read the file first'
     case 'target_not_found':
-      return 'run `slides read --json` and pick an id from `available`'
-    case 'sheet_not_found':
-      return 'use one of `detail.sheets` verbatim'
+      return 'run `docs read --json` and pick a block index'
     case 'file_not_open_in_gui':
       return 'run `genoffice open <file>` first'
     default:

@@ -1,15 +1,10 @@
 import { statSync } from 'node:fs'
 import { parseDocx } from '@genoffice/docx-engine'
-import { openPptx } from '@genoffice/pptx-engine'
 import { flagString } from '../args'
-import { csvInfo } from '../formats/csv'
 import { pdfInfo } from '../formats/pdf'
-import { workbookSummary } from '../formats/xlsx'
 import { extension, readInput, resolveInput } from '../fs'
 import type { CommandDef } from '../registry'
 import { CliError, EXIT } from '../result'
-
-const EMU_PER_INCH = 914400
 
 export const infoCommand: CommandDef = {
   name: 'info',
@@ -35,18 +30,8 @@ async function describe(path: string, ext: string, password?: string): Promise<D
   switch (ext) {
     case 'docx':
       return describeDocx(path)
-    case 'pptx':
-      return describePptx(path)
-    case 'xlsx':
-    case 'xlsm':
-    case 'xls':
-    case 'xlsb':
-    case 'ods':
-      return describeWorkbook(path)
     case 'pdf':
       return describePdf(path, password)
-    case 'csv':
-      return describeCsv(path)
     case 'md':
     case 'markdown':
     case 'html':
@@ -85,46 +70,11 @@ async function describeDocx(path: string): Promise<Description> {
   }
 }
 
-async function describePptx(path: string): Promise<Description> {
-  const { deck } = await openPptx(readInput(path))
-  const elements: Record<string, number> = {}
-  for (const slide of deck.slides) {
-    for (const el of slide.elements) elements[el.type] = (elements[el.type] ?? 0) + 1
-  }
-  return {
-    headline: `${deck.slides.length} slides`,
-    fields: {
-      slides: deck.slides.length,
-      slide_size_in: {
-        width: round(deck.size.cx / EMU_PER_INCH),
-        height: round(deck.size.cy / EMU_PER_INCH),
-      },
-      element_types: elements,
-    },
-  }
-}
-
-async function describeWorkbook(path: string): Promise<Description> {
-  const wb = await workbookSummary(path)
-  return {
-    headline: `${wb.sheets.length} sheets`,
-    fields: { sheets: wb.sheets, active_sheet: wb.activeSheet, defined_names: wb.definedNames },
-  }
-}
-
 async function describePdf(path: string, password?: string): Promise<Description> {
   const info = await pdfInfo(readInput(path), password)
   return {
     headline: info.pages === null ? 'encrypted (password required)' : `${info.pages} pages`,
     fields: { ...info },
-  }
-}
-
-function describeCsv(path: string): Description {
-  const info = csvInfo(readInput(path))
-  return {
-    headline: `${info.rows} rows × ${info.columns} columns`,
-    fields: { rows: info.rows, columns: info.columns, delimiter: info.delimiter },
   }
 }
 
@@ -136,8 +86,4 @@ function describeText(path: string, ext: string): Description {
     fields.headings = lines.filter((l) => /^#{1,6}\s/.test(l)).length
   }
   return { headline: `${lines.length} lines`, fields }
-}
-
-function round(n: number): number {
-  return Math.round(n * 100) / 100
 }

@@ -5,21 +5,11 @@ import { basename, extname, isAbsolute, join, resolve } from 'node:path'
 import { assertAllowed, readInput, type PathContext } from '../fs'
 import { CliError, EXIT } from '../result'
 import { exportViaApp } from './app-export'
-import { rasterizePdf } from './slide-spec'
+import { extract } from '@genoffice/pdf2docx'
+import { loadPdfium } from './pdf'
 
 /** Documents the app can print to PDF, plus PDF itself (rasterized directly). */
-export const RENDERABLE = [
-  'pdf',
-  'docx',
-  'xlsx',
-  'xlsm',
-  'csv',
-  'pptx',
-  'md',
-  'markdown',
-  'html',
-  'htm',
-]
+export const RENDERABLE = ['pdf', 'docx']
 
 export interface RenderOptions {
   outDir: string
@@ -89,4 +79,40 @@ export async function renderToPngs(
   } finally {
     if (tmpPdf) rmSync(tmpPdf, { force: true })
   }
+}
+
+export interface RasterizedPage {
+  index: number
+  png: Uint8Array
+  width: number
+  height: number
+}
+
+export async function rasterizePdf(
+  bytes: Uint8Array,
+  scale: number,
+  only?: number,
+  range: { flag: string; oneBased: boolean } = { flag: 'slide', oneBased: false },
+): Promise<RasterizedPage[]> {
+  const m = await loadPdfium()
+  return extract.withPdfDocument(m, bytes, (doc) => {
+    const count = m._FPDF_GetPageCount(doc)
+    if (only !== undefined && (only < 0 || only >= count)) {
+      const [lo, hi] = range.oneBased ? [1, count] : [0, count - 1]
+      throw new CliError(
+        EXIT.usage,
+        `--${range.flag} out of range (${lo}-${hi})`,
+        { valid_range: [lo, hi] },
+        { reason: 'out_of_range', suggestion: `use a value between ${lo} and ${hi}` },
+      )
+    }
+    const out: RasterizedPage[] = []
+    for (let i = 0; i < count; i++) {
+      if (only !== undefined && i !== only) continue
+      const r = extract.renderPageByIndexPng(m, doc, i, scale)
+      if (!r) throw new CliError(EXIT.conversion, `could not render page ${i + 1}`)
+      out.push({ index: i, png: r.data, width: r.pixelWidth, height: r.pixelHeight })
+    }
+    return out
+  })
 }

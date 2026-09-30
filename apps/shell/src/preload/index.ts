@@ -147,21 +147,6 @@ const homeApi: HomeApi = {
   async newDoc(opts) {
     await ipcRenderer.invoke(HOME_CHANNELS.newDoc, opts)
   },
-  async newSheet(opts) {
-    await ipcRenderer.invoke(HOME_CHANNELS.newSheet, opts)
-  },
-  async newSlide(opts) {
-    await ipcRenderer.invoke(HOME_CHANNELS.newSlide, opts)
-  },
-  async newMarkdown(opts) {
-    await ipcRenderer.invoke(HOME_CHANNELS.newMarkdown, opts)
-  },
-  async newHtml(opts) {
-    await ipcRenderer.invoke(HOME_CHANNELS.newHtml, opts)
-  },
-  async newPdf(opts) {
-    await ipcRenderer.invoke(HOME_CHANNELS.newPdf, opts)
-  },
   async removeRecent(paths) {
     await ipcRenderer.invoke(HOME_CHANNELS.removeRecent, paths)
   },

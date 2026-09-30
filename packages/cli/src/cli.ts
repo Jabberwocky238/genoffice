@@ -19,9 +19,7 @@ import { mcpCommand } from './commands/mcp'
 import { openCommand } from './commands/open'
 import { pdfCommand } from './commands/pdf'
 import { renderCommand } from './commands/render'
-import { sheetCommand } from './commands/sheet'
 import { skillCommand } from './commands/skill'
-import { slidesCommand } from './commands/slides'
 import { CommandRegistry, commandHelp, type CommandContext } from './registry'
 import {
   CliError,
@@ -55,8 +53,6 @@ export function defaultRegistry(): CommandRegistry {
     .register(infoCommand)
     .register(convertCommand)
     .register(createCommand)
-    .register(slidesCommand)
-    .register(sheetCommand)
     .register(docsCommand)
     .register(mergeCommand)
     .register(pdfCommand)

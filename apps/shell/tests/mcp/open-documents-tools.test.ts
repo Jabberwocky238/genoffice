@@ -74,28 +74,25 @@ function jsonOf(result: unknown): Record<string, unknown> {
 /** a document as the tab manager reports it */
 function doc(overrides: Partial<OpenDocumentTab> & { id: string }): OpenDocumentTab {
   return {
-    kind: 'markdown',
-    title: 'notes.md',
+    kind: 'docs',
+    title: 'notes.docx',
     active: false,
     dirty: false,
     ...overrides,
   } as OpenDocumentTab
 }
 
-/** the six-open-document scenario: three the user opened, one per family edge case */
+/** four open documents: three the user opened plus an untitled draft */
 const DOCUMENTS: OpenDocumentTab[] = [
   doc({ id: 't1', kind: 'docs', title: 'one.docx', filePath: 'C:/docs/one.docx', dirty: true }),
-  doc({ id: 't2', kind: 'sheets', title: 'two.xlsx', filePath: 'C:/docs/two.xlsx' }),
+  doc({ id: 't2', kind: 'docs', title: 'two.docx', filePath: 'C:/docs/two.docx' }),
   doc({
     id: 't3',
-    kind: 'slides',
-    title: 'three.pptx',
-    filePath: 'C:/docs/three.pptx',
+    kind: 'docs',
+    title: 'three.docx',
+    filePath: 'C:/docs/three.docx',
     dirty: true,
   }),
-  doc({ id: 't4', kind: 'markdown', title: 'four.md', filePath: 'C:/docs/four.md' }),
-  doc({ id: 't5', kind: 'html', title: 'five.html', filePath: 'C:/docs/five.html' }),
-  doc({ id: 't6', kind: 'pdf', title: 'six.pdf', filePath: 'C:/docs/six.pdf' }),
   doc({ id: 't7', kind: 'docs', title: 'Untitled', dirty: true, active: true }),
 ]
 
@@ -129,35 +126,17 @@ describe('closeSavePath', () => {
   })
 
   it('falls back to the default folder for an untitled document, with its extension', () => {
-    const target = closeSavePath(DOCUMENTS[6]!, () => dir)
+    const target = closeSavePath(DOCUMENTS[3]!, () => dir)
     expect(target.startsWith(resolve(dir))).toBe(true)
     expect(target.endsWith('.docx')).toBe(true)
   })
 
   it('never hands back a path that already exists', async () => {
     const { writeFile } = await import('node:fs/promises')
-    const first = closeSavePath(DOCUMENTS[6]!, () => dir)
+    const first = closeSavePath(DOCUMENTS[3]!, () => dir)
     await writeFile(first, 'x')
     // a second untitled close must not overwrite the first
-    expect(closeSavePath(DOCUMENTS[6]!, () => dir)).not.toBe(first)
-  })
-
-  // Regression: the extension used to come from generateExtension(), which only
-  // answers for families that have a headless create_* tool — so closing an
-  // untitled html document threw instead of resolving a target. Every family
-  // must resolve its own save extension here.
-  it.each([
-    ['docs', '.docx'],
-    ['sheets', '.xlsx'],
-    ['slides', '.pptx'],
-    ['markdown', '.md'],
-    ['html', '.html'],
-    ['pdf', '.pdf'],
-  ] as const)('resolves an untitled %s document to a %s target', (kind, ext) => {
-    const untitled = doc({ id: `untitled-${kind}`, kind, title: `untitled ${kind}`, dirty: true })
-    const target = closeSavePath(untitled, () => dir)
-    expect(target.startsWith(resolve(dir))).toBe(true)
-    expect(target.endsWith(ext)).toBe(true)
+    expect(closeSavePath(DOCUMENTS[3]!, () => dir)).not.toBe(first)
   })
 })
 
@@ -183,15 +162,7 @@ describe('open_documents tool', () => {
     expect(untitled.saved).toBe(false)
     expect(untitled.active).toBe(true)
 
-    // the family vocabulary carries through for every kind
-    const types = Object.fromEntries(documents.map((d) => [d.id, d.type]))
-    expect(types).toMatchObject({
-      t2: 'spreadsheet',
-      t3: 'presentation',
-      t4: 'Markdown document',
-      t5: 'HTML page',
-      t6: 'PDF document',
-    })
+    expect(documents.every((d) => d.type === 'Word document')).toBe(true)
   })
 
   it('reads one document by path and reports its live content', async () => {
@@ -200,12 +171,12 @@ describe('open_documents tool', () => {
     const result = jsonOf(
       await client!.callTool({
         name: 'open_documents',
-        arguments: { action: 'read', target: 'C:/docs/four.md' },
+        arguments: { action: 'read', target: 'C:/docs/two.docx' },
       }),
     )
-    expect(result.id).toBe('t4')
+    expect(result.id).toBe('t2')
     expect(result.dirty).toBe(false)
-    expect(result.content).toEqual({ content: 'live:t4' })
+    expect(result.content).toEqual({ content: 'live:t2' })
     expect(read).toHaveBeenCalledTimes(1)
   })
 
@@ -222,16 +193,16 @@ describe('open_documents tool', () => {
   })
 
   it('closes with save by default, reporting where it was saved', async () => {
-    const close = vi.fn(async () => ({ savedPath: 'C:/docs/three.pptx' }))
+    const close = vi.fn(async () => ({ savedPath: 'C:/docs/three.docx' }))
     await startService(controlOf({ close }))
     const result = jsonOf(
       await client!.callTool({
         name: 'open_documents',
-        arguments: { action: 'close', target: 'C:/docs/three.pptx' },
+        arguments: { action: 'close', target: 'C:/docs/three.docx' },
       }),
     )
     expect(result.closed).toBe(true)
-    expect(result.savedTo).toBe('C:/docs/three.pptx')
+    expect(result.savedTo).toBe('C:/docs/three.docx')
     expect(close).toHaveBeenCalledWith(expect.objectContaining({ id: 't3' }), { unsaved: 'save' })
   })
 
@@ -248,16 +219,6 @@ describe('open_documents tool', () => {
       unsaved: 'discard',
     })
     expect(result.discardedUnsavedChanges).toBe(true)
-  })
-
-  it('refuses to read a PDF, naming the reason', async () => {
-    await startService(controlOf())
-    const result = await client!.callTool({
-      name: 'open_documents',
-      arguments: { action: 'read', target: 'C:/docs/six.pdf' },
-    })
-    expect(result.isError).toBe(true)
-    expect(textOf(result.content)).toContain('viewer')
   })
 
   it('lists an unknown target as an error that names what is open', async () => {
@@ -290,7 +251,7 @@ describe('open_documents tool', () => {
 
     const closed = await client!.callTool({
       name: 'open_documents',
-      arguments: { action: 'close', target: 'x.md' },
+      arguments: { action: 'close', target: 'x.docx' },
     })
     expect(closed.isError).toBe(true)
     expect(textOf(closed.content)).toContain('no document is open')

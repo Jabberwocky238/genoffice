@@ -181,16 +181,6 @@ export interface HomeApi {
   browse(): Promise<void>
   /** open a docs window at its start screen; `dir` = folder the first save should land in */
   newDoc(opts?: NewFileOpts): Promise<void>
-  /** open a sheets window */
-  newSheet(opts?: NewFileOpts): Promise<void>
-  /** open a slides tab at its start screen (open-a-pptx) */
-  newSlide(opts?: NewFileOpts): Promise<void>
-  /** open a blank markdown editor tab */
-  newMarkdown(opts?: NewFileOpts): Promise<void>
-  /** open a blank html editor tab */
-  newHtml(opts?: NewFileOpts): Promise<void>
-  /** create a blank single-page PDF in the default save folder and open it */
-  newPdf(opts?: NewFileOpts): Promise<void>
   /** drop entries from the recent list (does not touch the files) */
   removeRecent(paths: string[]): Promise<void>
   /** reveal the file in Finder / Explorer */
@@ -353,7 +343,7 @@ export interface StarPromptShow {
   docOpens: number
 }
 
-export type CloudProjectKind = 'docs' | 'sheets' | 'slides'
+export type CloudProjectKind = 'docs'
 
 /** a Genspark web project shown in the home cloud section */
 export interface CloudProjectEntry {
@@ -475,11 +465,6 @@ export const HOME_CHANNELS = {
   openPath: 'home:open-path',
   browse: 'home:browse',
   newDoc: 'home:new-doc',
-  newSheet: 'home:new-sheet',
-  newSlide: 'home:new-slide',
-  newMarkdown: 'home:new-markdown',
-  newHtml: 'home:new-html',
-  newPdf: 'home:new-pdf',
   removeRecent: 'home:remove-recent',
   revealPath: 'home:reveal-path',
   renameFile: 'home:rename-file',

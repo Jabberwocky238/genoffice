@@ -1,7 +1,6 @@
 import { statSync } from 'node:fs'
 
-/** Name characters Windows forbids (plus controls). Mirrors the PDF
-    auto-renamer set (apps/pdf/src/main/pdf-main.ts) — the Home rename gate
+/** Name characters Windows forbids (plus controls): the Home rename gate
     must reject them with a localized error instead of letting renameSync
     throw a raw OS error. */
 // eslint-disable-next-line no-control-regex -- the C0 range IS the check: Windows forbids controls in names.
@@ -42,16 +41,4 @@ export function isSameFile(a: string, b: string): boolean {
   } catch {
     return false
   }
-}
-
-/** Save As target for an open PDF, or null when the dialog was cancelled or
-    the pick resolves to the open file itself (case/symlink variants included),
-    which would otherwise copy a file onto itself. */
-export function pdfSaveAsTarget(
-  picked: { canceled: boolean; filePath?: string },
-  currentPath: string,
-): string | null {
-  if (picked.canceled || !picked.filePath) return null
-  if (picked.filePath === currentPath || isSameFile(picked.filePath, currentPath)) return null
-  return picked.filePath
 }

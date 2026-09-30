@@ -159,7 +159,7 @@ describe('genoffice mcp --http', () => {
     expect(r.json()).toMatchObject({ error: 'file_not_found' })
   })
 
-  it('keeps sessions apart: a relative deck folder is private to its session', async () => {
+  it('keeps sessions apart: a relative path is private to its session', async () => {
     const other = new Client({ name: 'other', version: '0' })
     await other.connect(
       new StreamableHTTPClientTransport(new URL(`${handle.url}/mcp`), {
@@ -167,31 +167,11 @@ describe('genoffice mcp --http', () => {
       }),
     )
     try {
-      const start = await client.callTool({
-        name: 'deck_start',
-        arguments: {
-          dir: 'deck',
-          style: '# Style\n\nPalette: #112233 on white.',
-          outline: {
-            core_hook: 'One page, kept private',
-            pages: [
-              {
-                title: 'Cover',
-                type: 'cover',
-                layout: 'cover_typography_hero',
-                brief:
-                  'Cover: the title and the one 2024 figure from the brief, source line under it.',
-                image_queries: [],
-              },
-            ],
-          },
-        },
-      })
-      const startText = (start.content as Content[])[0]!.text!
-      expect(JSON.parse(startText).status).not.toBe('error')
-      const peek = await other.callTool({ name: 'deck_build', arguments: { dir: 'deck' } })
+      const made = await call('create_docx', { markdown: '# Private', out: 'private.docx' })
+      expect(made.isError).toBe(false)
+      const peek = await other.callTool({ name: 'info', arguments: { file: 'private.docx' } })
       const peekText = (peek.content as Content[])[0]!.text!
-      expect(JSON.parse(peekText)).toMatchObject({ status: 'error', error: 'missing_argument' })
+      expect(JSON.parse(peekText)).toMatchObject({ status: 'error', error: 'file_not_found' })
     } finally {
       await other.close()
     }
@@ -240,11 +220,9 @@ describe('remote defaults', () => {
     const ctx = createContext({ cwd: tempDir(), env: process.env, log: () => {}, mode: 'http' })
     try {
       const tools = new Map(resolveTools(registry).map((t) => [t.name, t]))
-      for (const name of ['render', 'slides_render']) {
-        const args: Record<string, unknown> = { file: 'x.pptx' }
-        defaultOut(tools.get(name)!, args, ctx)
-        expect(String(args.out)).toMatch(new RegExp(`^${ctx.scratchDir}/render-`))
-      }
+      const args: Record<string, unknown> = { file: 'x.docx' }
+      defaultOut(tools.get('render')!, args, ctx)
+      expect(String(args.out)).toMatch(new RegExp(`^${ctx.scratchDir}/render-`))
       const created: Record<string, unknown> = { from: 'notes.md' }
       defaultOut(tools.get('create_pdf')!, created, ctx)
       expect(String(created.out)).toMatch(/\/notes\.pdf$/)

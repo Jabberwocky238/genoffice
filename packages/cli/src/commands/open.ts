@@ -15,27 +15,9 @@ export const openCommand: CommandDef = {
   name: 'open',
   summary:
     'Open a document in the GenOffice app (starts the app if needed); with a target, also select that spot for the user.',
-  usage:
-    'open <file> [--slide n [--el e_12] | --block n | --range [Sheet!]B2:D5 [--sheet name] | --page n]',
+  usage: 'open <file> [--block n]',
   options: [
-    { name: 'slide', value: 'n', description: 'pptx: show slide n (0-based, as in `slides read`)' },
-    {
-      name: 'el',
-      value: 'e_12',
-      description: 'pptx: select this element on --slide (ids from `slides read`)',
-    },
     { name: 'block', value: 'n', description: 'docx: select block n (0-based, as in `docs read`)' },
-    {
-      name: 'range',
-      value: 'B2:D5',
-      description: 'xlsx: select this range; `Sheet1!B2:D5` names the sheet',
-    },
-    {
-      name: 'sheet',
-      value: 'name',
-      description: 'xlsx: worksheet for --range (default: the active one)',
-    },
-    { name: 'page', value: 'n', description: 'pdf: scroll to page n (1-based)' },
   ],
   async run(args, ctx) {
     const path = resolveInput(args.positionals[0], ctx)
@@ -95,7 +77,7 @@ async function spawnApp(path: string, ctx: CommandContext): Promise<string> {
   return launch.command
 }
 
-const TARGET_FLAGS = ['slide', 'el', 'block', 'range', 'sheet', 'page'] as const
+const TARGET_FLAGS = ['block'] as const
 
 export function parseTarget(args: ParsedArgs, path: string): ControlTarget | undefined {
   const given = TARGET_FLAGS.filter((f) => args.flags[f] !== undefined)
@@ -130,52 +112,18 @@ export function parseTarget(args: ParsedArgs, path: string): ControlTarget | und
     }
     return n
   }
-  if (/^\.ppt[xm]$|^\.ppsx$|^\.potx$/.test(ext)) {
-    expect(['slide', 'el'], 'presentation')
-    if (args.flags.slide === undefined) {
-      throw new CliError(EXIT.usage, '--el needs --slide', undefined, {
-        reason: 'missing_argument',
-      })
-    }
-    const el = flagString(args, 'el')
-    return { kind: 'slide', slide: int('slide', 0), ...(el ? { el } : {}) }
-  }
   if (ext === '.docx' || ext === '.docm' || ext === '.dotx') {
     expect(['block'], 'Word document')
     return { kind: 'block', block: int('block', 0) }
   }
-  if (/^\.xls[xmb]?$|^\.csv$|^\.ods$/.test(ext)) {
-    expect(['range', 'sheet'], 'workbook')
-    const range = flagString(args, 'range')
-    if (!range) {
-      throw new CliError(EXIT.usage, '--sheet needs --range', undefined, {
-        reason: 'missing_argument',
-      })
-    }
-    const sheet = flagString(args, 'sheet')
-    return { kind: 'range', range, ...(sheet ? { sheet } : {}) }
-  }
-  if (ext === '.pdf') {
-    expect(['page'], 'PDF')
-    return { kind: 'page', page: int('page', 1) }
-  }
   throw new CliError(
     EXIT.usage,
-    `targets are supported for pptx, docx, xlsx and pdf files, not ${ext || 'this file'}`,
-    { supported: ['.pptx', '.docx', '.xlsx', '.pdf'] },
+    `targets are supported for docx files, not ${ext || 'this file'}`,
+    { supported: ['.docx'] },
     { reason: 'unsupported', suggestion: 'run `genoffice open <file>` without a target' },
   )
 }
 
 function describe(target: ControlTarget): string {
-  switch (target.kind) {
-    case 'slide':
-      return target.el ? `element ${target.el} on slide ${target.slide}` : `slide ${target.slide}`
-    case 'block':
-      return `block ${target.block}`
-    case 'range':
-      return target.sheet ? `${target.sheet}!${target.range}` : target.range
-    case 'page':
-      return `page ${target.page}`
-  }
+  return `block ${target.block}`
 }

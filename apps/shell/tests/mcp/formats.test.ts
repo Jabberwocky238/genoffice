@@ -8,51 +8,20 @@ import {
 } from '../../src/main/mcp/tools/formats'
 
 /**
- * The format registry is the MCP layer's single source of truth for what each
- * editor can open/save/export vs. what this server exposes. These tests pin the
- * matrix to the shell routing and the per-editor Save-As dialogs so a drift is
+ * The format registry is the MCP layer's single source of truth for what the
+ * Word editor can open/save/export vs. what this server exposes. These tests pin
+ * the matrix to the shell routing and the editor's Save-As dialog so a drift is
  * caught here rather than in a live session.
  */
 
 describe('format registry', () => {
-  it('mirrors the shell open routing for the mcp-driven families', () => {
+  it('mirrors the shell open routing for the Word editor', () => {
     expect(formatFamily('docx').editorOpen).toEqual(['docx'])
-    expect(formatFamily('xlsx').editorOpen).toEqual(['xlsx', 'xlsm', 'xls', 'csv', 'tsv'])
-    expect(formatFamily('pptx').editorOpen).toEqual(['pptx'])
+    expect(FORMAT_FAMILIES.map((f) => f.family)).toEqual(['docx'])
   })
 
-  it('keeps .tsv open-only: it converts on open and saves as .xlsx', () => {
-    const sheet = formatFamily('xlsx')
-    expect(sheet.editorOpen).toContain('tsv')
-    expect(sheet.editorSave).not.toContain('tsv')
-    expect(sheet.mcp?.save).not.toContain('tsv')
-  })
-
-  it('keeps the editor-only families (md/html) without an mcp block', () => {
-    for (const family of ['md', 'html'] as const) {
-      expect(formatFamily(family).mcp).toBeUndefined()
-    }
-    // the three edit-in-place families carry full mcp blocks; pdf is read-only
-    expect(FORMAT_FAMILIES.filter((f) => f.mcp).map((f) => f.family)).toEqual([
-      'docx',
-      'xlsx',
-      'pptx',
-      'pdf',
-    ])
-  })
-
-  it('exposes pdf as read-only until MCP drives the editor', () => {
-    const pdf = formatFamily('pdf')
-    expect(pdf.mcp).toEqual({ read: 'pdf' })
-    expect(pdf.mcp?.save).toBeUndefined()
-    expect(pdf.mcp?.generate).toBeUndefined()
-  })
-
-  it('records the editor export capabilities even where mcp cannot reach them', () => {
+  it('records the editor export capabilities', () => {
     expect(formatFamily('docx').editorExport).toEqual(['pdf'])
-    expect(formatFamily('md').editorExport).toEqual(['docx', 'pdf'])
-    expect(formatFamily('html').editorExport).toEqual(['docx', 'pdf'])
-    expect(formatFamily('pdf').editorExport).toEqual(['docx', 'xlsx', 'pptx'])
   })
 
   it('never advertises an mcp save format the editor cannot write', () => {
@@ -65,8 +34,6 @@ describe('format registry', () => {
 
   it('reports labels for guided errors', () => {
     expect(familyLabel('docx')).toBe('Word document')
-    expect(familyLabel('xlsx')).toBe('spreadsheet')
-    expect(familyLabel('pptx')).toBe('presentation')
     expect(() => familyLabel('nope' as never)).toThrow(/unknown format family/)
   })
 })
@@ -74,35 +41,33 @@ describe('format registry', () => {
 describe('withSaveExtension', () => {
   it('keeps a correct family extension, case-insensitively', () => {
     expect(withSaveExtension('docx', 'C:/x/Report.DOCX')).toBe('C:/x/Report.DOCX')
-    expect(withSaveExtension('xlsx', '/tmp/books.xlsx')).toBe('/tmp/books.xlsx')
-    expect(withSaveExtension('pptx', '/tmp/deck.pptx')).toBe('/tmp/deck.pptx')
   })
 
   it('appends the family extension when the path has none', () => {
     expect(withSaveExtension('docx', '/tmp/report')).toBe('/tmp/report.docx')
-    expect(withSaveExtension('xlsx', '/tmp/books')).toBe('/tmp/books.xlsx')
-    expect(withSaveExtension('pptx', '/tmp/deck')).toBe('/tmp/deck.pptx')
   })
 
   it('rejects a mismatched extension rather than silently rewriting it', () => {
-    expect(() => withSaveExtension('xlsx', '/tmp/report.docx')).toThrow(
-      /spreadsheet session must be saved as \.xlsx \(got "\.docx"\)/,
+    expect(() => withSaveExtension('docx', '/tmp/report.pdf')).toThrow(
+      /Word document session must be saved as \.docx \(got "\.pdf"\)/,
     )
-    expect(() => withSaveExtension('pptx', '/tmp/deck.pdf')).toThrow(/must be saved as \.pptx/)
   })
 })
 
 describe('capabilityReport', () => {
-  it('exposes editor truth alongside the mcp subset for every family', () => {
+  it('exposes editor truth alongside the mcp subset', () => {
     const report = capabilityReport()
-    expect(report.map((r) => r.family)).toEqual(['docx', 'xlsx', 'pptx', 'md', 'html', 'pdf'])
-    const docx = report.find((r) => r.family === 'docx')!
+    expect(report.map((r) => r.family)).toEqual(['docx'])
+    const docx = report[0]
     expect(docx.editor.open).toEqual(['docx'])
     expect(docx.editor.export).toEqual(['pdf'])
     expect(docx.mcp).toEqual({ generate: 'docx', save: ['docx'], read: 'docx' })
-    // editor-only family carries no mcp key
-    expect(report.find((r) => r.family === 'md')!.mcp).toBeUndefined()
-    // pdf is the read-only family
-    expect(report.find((r) => r.family === 'pdf')!.mcp).toEqual({ read: 'pdf' })
+  })
+
+  it('hides the headless generate format while generation is off', () => {
+    expect(capabilityReport({ generating: false })[0].mcp).toEqual({
+      save: ['docx'],
+      read: 'docx',
+    })
   })
 })

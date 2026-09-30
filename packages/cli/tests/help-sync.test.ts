@@ -72,26 +72,18 @@ const SKILL_COMMAND_OMISSIONS = new Map([['install-cli', 'host setup, not a docu
  */
 const README_FENCE_OPTION_OMISSIONS = new Set([
   'password',
-  'layouts',
   'max-chars',
   'best-effort',
   'stop-on-error',
-  'isolation',
-  'max-rows',
-  'where',
-  'stats',
   'styles',
   'sections',
   'fields',
   'notes',
   'track',
   'author',
-  'index',
-  'fingerprint',
   'size',
   'ref',
   'model',
-  'block',
 ])
 
 /**

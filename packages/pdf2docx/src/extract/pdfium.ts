@@ -1,7 +1,6 @@
 /**
  * Emscripten module surface this package calls into (raw FPDF_* exports +
- * heap access). Same pattern as apps/pdf/src/main/text-edit.ts: the wasm is
- * initialized by the CALLER (`init({ wasmBinary })` + `_PDFiumExt_Init()`);
+ * heap access). The wasm is initialized by the CALLER (`init({ wasmBinary })` + `_PDFiumExt_Init()`);
  * this package never touches the filesystem. Signatures follow
  * @embedpdf/pdfium@2.15 dist/index.d.ts (verified against its export list).
  */

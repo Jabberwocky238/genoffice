@@ -67,39 +67,15 @@ describe('atomic export destinations', () => {
     expect(`${pdf}${image}${html}${merged}`).not.toMatch(/writeFile(?:Sync)?\(filePath/)
   })
 
-  it('publishes Sheets PDF exports through a temporary file', () => {
-    const source = read('apps/sheets/src/main/pdf-export.ts')
-    const pdf = section(
-      source,
-      'export async function exportPdf',
-      'export async function printWorkbook',
-    )
-
-    expect(pdf).toContain('await atomicWriteFile(selection.filePath, pdf)')
-    expect(pdf).not.toContain('writeFile(selection.filePath')
-  })
-
-  it('publishes Shell PDF conversions through a temporary file', () => {
+  it('publishes the PDF → Word conversion through a temporary file', () => {
     const source = read('apps/shell/src/main/index.ts')
     const docx = section(
       source,
-      'async function exportPdfAsDocxLocal',
-      'async function exportPdfAsPptxLocal',
-    )
-    const pptx = section(
-      source,
-      'async function exportPdfAsPptxLocal',
-      'async function exportPdfAsXlsxLocal',
-    )
-    const xlsx = section(
-      source,
-      'async function exportPdfAsXlsxLocal',
-      'ipcMain.handle(PDF_CHANNELS.convertOffice',
+      'async function convertPdfAndOpen',
+      'function openThirdPartyNotices',
     )
 
     expect(docx).toContain('await atomicWriteFile(picked.filePath, result.docx)')
-    expect(pptx).toContain('await atomicWriteFile(picked.filePath, result.pptx)')
-    expect(xlsx).toContain('await atomicWriteFile(picked.filePath, result.xlsx)')
-    expect(`${docx}${pptx}${xlsx}`).not.toMatch(/writeFileSync\(picked\.filePath/)
+    expect(docx).not.toMatch(/writeFileSync\(picked\.filePath/)
   })
 })

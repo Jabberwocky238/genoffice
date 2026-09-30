@@ -1,10 +1,22 @@
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
+import { join, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { auditLogPath } from '../src/audit'
 import { redactArgv } from '../src/cli'
 import { allowedRoots, realizedPath } from '../src/fs'
 import { run, tempDir } from './helpers'
+
+const DOCX = resolve(
+  __dirname,
+  '../../../apps/docs/tests/pagination-corpus/docx/01-simple-english.docx',
+)
 
 const env = (over: Record<string, string>) => ({
   ...process.env,
@@ -21,129 +33,85 @@ describe('GENOFFICE_ALLOWED_ROOTS', () => {
   it('refuses inputs and outputs outside the roots (exit 2, roots in detail)', async () => {
     const inside = tempDir()
     const outside = tempDir()
-    const csv = join(outside, 'a.csv')
-    writeFileSync(csv, 'x,y\n1,2\n')
+    const md = join(outside, 'a.md')
+    writeFileSync(md, '# x\n\ny\n')
     const e = env({ GENOFFICE_ALLOWED_ROOTS: inside })
-    const read = await run(['info', csv, '--json'], { env: e })
+    const read = await run(['info', md, '--json'], { env: e })
     expect(read.code).toBe(2)
     expect(read.json().message).toContain('refusing to read')
     expect(read.json().detail.allowed_roots).toEqual([realizedPath(inside)])
 
-    writeFileSync(join(inside, 'b.csv'), 'x,y\n1,2\n')
+    writeFileSync(join(inside, 'b.md'), '# x\n\ny\n')
     const write = await run(
-      [
-        'convert',
-        join(inside, 'b.csv'),
-        '--to',
-        'xlsx',
-        '--out',
-        join(outside, 'b.xlsx'),
-        '--json',
-      ],
+      ['convert', join(inside, 'b.md'), '--to', 'html', '--out', join(outside, 'b.html'), '--json'],
       { env: e },
     )
     expect(write.code).toBe(2)
     expect(write.json().message).toContain('refusing to write')
-    expect(existsSync(join(outside, 'b.xlsx'))).toBe(false)
+    expect(existsSync(join(outside, 'b.html'))).toBe(false)
 
     const ok = await run(
       [
         'convert',
-        join(inside, 'b.csv'),
+        join(inside, 'b.md'),
         '--to',
-        'xlsx',
+        'html',
         '--out',
-        join(inside, 'sub/b.xlsx'),
+        join(inside, 'sub/b.html'),
         '--json',
       ],
       { env: e },
     )
     expect(ok.code).toBe(0)
-    expect(existsSync(join(inside, 'sub/b.xlsx'))).toBe(true)
+    expect(existsSync(join(inside, 'sub/b.html'))).toBe(true)
   })
 
   it.skipIf(process.platform === 'win32')('follows symlinks before comparing', async () => {
     const inside = tempDir()
     const outside = tempDir()
-    writeFileSync(join(outside, 'real.csv'), 'x\n1\n')
-    symlinkSync(join(outside, 'real.csv'), join(inside, 'link.csv'))
+    writeFileSync(join(outside, 'real.md'), '# x\n')
+    symlinkSync(join(outside, 'real.md'), join(inside, 'link.md'))
     mkdirSync(join(inside, 'escape-dir'))
     symlinkSync(outside, join(inside, 'escape'), 'dir')
     const e = env({ GENOFFICE_ALLOWED_ROOTS: inside })
-    expect((await run(['info', join(inside, 'link.csv'), '--json'], { env: e })).code).toBe(2)
-    writeFileSync(join(inside, 'b.csv'), 'x\n1\n')
+    expect((await run(['info', join(inside, 'link.md'), '--json'], { env: e })).code).toBe(2)
+    writeFileSync(join(inside, 'b.md'), '# x\n')
     const viaLink = await run(
-      [
-        'convert',
-        join(inside, 'b.csv'),
-        '--to',
-        'xlsx',
-        '--out',
-        join(inside, 'escape/new/b.xlsx'),
-      ],
+      ['convert', join(inside, 'b.md'), '--to', 'html', '--out', join(inside, 'escape/new/b.html')],
       { env: e },
     )
     expect(viaLink.code).toBe(2)
-    expect(realizedPath(join(inside, 'escape/new/b.xlsx'))).toBe(
-      join(realizedPath(outside), 'new/b.xlsx'),
+    expect(realizedPath(join(inside, 'escape/new/b.html'))).toBe(
+      join(realizedPath(outside), 'new/b.html'),
     )
   })
 
   it('keeps names that merely start with ".." inside the root', async () => {
     const inside = tempDir()
     mkdirSync(join(inside, '..hidden'))
-    writeFileSync(join(inside, '..hidden', 'a.csv'), 'x\n1\n')
+    writeFileSync(join(inside, '..hidden', 'a.md'), '# x\n')
     const e = env({ GENOFFICE_ALLOWED_ROOTS: inside })
-    expect(
-      (await run(['info', join(inside, '..hidden', 'a.csv'), '--json'], { env: e })).code,
-    ).toBe(0)
-  })
-
-  it('applies to image files referenced from slide ops', async () => {
-    const inside = tempDir()
-    const outside = tempDir()
-    writeFileSync(join(outside, 'pic.png'), Buffer.from('89504e470d0a1a0a', 'hex'))
-    const ops = join(inside, 'ops.json')
-    writeFileSync(
-      ops,
-      JSON.stringify([{ op: 'addPicture', target: { slide: 0 }, bytes: join(outside, 'pic.png') }]),
+    expect((await run(['info', join(inside, '..hidden', 'a.md'), '--json'], { env: e })).code).toBe(
+      0,
     )
-    const e = env({ GENOFFICE_ALLOWED_ROOTS: inside })
-    const r = await run(
-      ['create', '--type', 'pptx', '--ops', ops, '--out', join(inside, 'deck.pptx'), '--json'],
-      { env: e },
-    )
-    expect(r.code).toBe(2)
-    expect(r.json().message).toContain('refusing to read')
   })
 
   it('does not create the output folder on a dry run', async () => {
     const dir = tempDir()
-    const table = join(dir, 't.json')
-    writeFileSync(
-      table,
-      JSON.stringify([
-        ['a', 'b'],
-        [1, 2],
-      ]),
-    )
-    const xlsx = join(dir, 't.xlsx')
-    expect(
-      (await run(['create', '--type', 'xlsx', '--from', table, '--out', xlsx], { env: env({}) }))
-        .code,
-    ).toBe(0)
+    const docx = join(dir, 't.docx')
+    copyFileSync(DOCX, docx)
     const ops = join(dir, 'ops.json')
-    writeFileSync(ops, JSON.stringify([{ op: 'set_range', range: 'A1', values: [['z']] }]))
+    writeFileSync(ops, JSON.stringify([{ op: 'findReplace', find: 'a', replace: 'b' }]))
     const r = await run(
       [
-        'sheet',
+        'docs',
         'apply',
-        xlsx,
+        docx,
         '--ops',
         ops,
         '--dry-run',
         '--out',
-        join(dir, 'new-dir/out.xlsx'),
+        join(dir, 'new-dir/out.docx'),
         '--json',
       ],
       { env: env({}) },
@@ -155,11 +123,11 @@ describe('GENOFFICE_ALLOWED_ROOTS', () => {
   it('accepts several roots separated by the platform delimiter', async () => {
     const a = tempDir()
     const b = tempDir()
-    writeFileSync(join(b, 'a.csv'), 'x\n1\n')
+    writeFileSync(join(b, 'a.md'), '# x\n')
     const e = env({
       GENOFFICE_ALLOWED_ROOTS: [a, b].join(process.platform === 'win32' ? ';' : ':'),
     })
-    expect((await run(['info', join(b, 'a.csv'), '--json'], { env: e })).code).toBe(0)
+    expect((await run(['info', join(b, 'a.md'), '--json'], { env: e })).code).toBe(0)
   })
 })
 
@@ -190,12 +158,12 @@ describe('audit log', () => {
   it('appends one line per executed command, success or failure', async () => {
     const dir = tempDir()
     const log = join(dir, 'nested/audit.jsonl')
-    const csv = join(dir, 'a.csv')
-    writeFileSync(csv, 'x,y\n1,2\n')
+    const md = join(dir, 'a.md')
+    writeFileSync(md, '# x\n\ny\n')
     const e = { ...process.env, GENOFFICE_AUDIT_LOG: log }
-    expect((await run(['info', csv, '--json'], { env: e })).code).toBe(0)
-    expect((await run(['convert', csv, '--to', 'xlsx', '--json'], { env: e })).code).toBe(0)
-    expect((await run(['info', join(dir, 'missing.csv'), '--json'], { env: e })).code).toBe(2)
+    expect((await run(['info', md, '--json'], { env: e })).code).toBe(0)
+    expect((await run(['convert', md, '--to', 'html', '--json'], { env: e })).code).toBe(0)
+    expect((await run(['info', join(dir, 'missing.md'), '--json'], { env: e })).code).toBe(2)
     expect((await run(['help', 'info'], { env: e })).code).toBe(0)
     const lines = readFileSync(log, 'utf-8')
       .trim()
@@ -206,12 +174,12 @@ describe('audit log', () => {
       command: 'info',
       status: 'ok',
       code: 0,
-      argv: ['info', csv, '--json'],
+      argv: ['info', md, '--json'],
     })
     expect(lines[1]).toMatchObject({
       command: 'convert',
       status: 'ok',
-      output_path: join(dir, 'a.xlsx'),
+      output_path: join(dir, 'a.html'),
     })
     expect(lines[2]).toMatchObject({ command: 'info', status: 'error', code: 2 })
     expect(typeof lines[0].ts).toBe('string')

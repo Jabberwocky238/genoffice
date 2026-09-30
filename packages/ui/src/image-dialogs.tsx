@@ -1,6 +1,6 @@
 /**
  * Picture pixel-edit dialogs shared by the office apps: remove background (tolerance cutout)
- * and crop. Ported from apps/pdf ImageDialogs (itself a port of docs' PictureDialogs); apps
+ * and crop. A port of docs' PictureDialogs; apps
  * pass their own strings through `labels` and import `image-dialogs.css` for the chrome.
  *
  * Both take the source as a data URL and hand back a base64 PNG (no data: prefix).

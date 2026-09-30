@@ -1,11 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import type { OpCatalog } from '../src/op-catalog'
 import {
   compactSchema,
   DESCRIPTION_CHARS,
   forbiddenConstructs,
-  opNamesSchema,
-  opsSchemaFromCatalog,
   parseSignatureFields,
   shortDescription,
 } from '../src/mcp/op-schemas'
@@ -126,59 +123,5 @@ describe('forbiddenConstructs', () => {
         },
       }),
     ).toEqual(['$.a.type[]', '$.b.const', '$.c.$ref', '$.d.anyOf[0].oneOf', '$.e.enum'])
-  })
-})
-
-describe('opsSchemaFromCatalog', () => {
-  const catalog: OpCatalog = {
-    domain: 'slides',
-    fingerprint: 'x',
-    groups: [],
-    ops: [
-      {
-        op: 'setText',
-        group: 'text',
-        signature: '{paragraphs:[{runs:[{text,bold?}],align?}]} (group children: add group)',
-        doc: 'Replaces the text. More prose that is dropped.\n\n| Field | Type |',
-      },
-      { op: 'moveSlide', group: 'slide', signature: '{to} — 0-based destination index', doc: '' },
-      { op: 'hidden', group: 'slide', signature: '{}', available: false, reason: 'ui only' },
-    ],
-  }
-
-  it('emits one discriminated variant per callable op with target and a one-line description', () => {
-    const schema = opsSchemaFromCatalog(catalog)
-    expect(schema.type).toBe('array')
-    const variants = schema.items!.anyOf!
-    expect(variants.map((v) => v.properties!.op)).toEqual([
-      { enum: ['setText'] },
-      { enum: ['moveSlide'] },
-    ])
-    expect(variants[0]).toMatchObject({
-      required: ['op', 'target', 'paragraphs'],
-      description: 'Replaces the text.',
-    })
-    expect(variants[0]!.properties!.paragraphs).toEqual({
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          runs: {
-            type: 'array',
-            items: { type: 'object', properties: { text: {}, bold: {} }, required: ['text'] },
-          },
-          align: {},
-        },
-        required: ['runs'],
-      },
-    })
-    expect(variants[1]).toMatchObject({
-      required: ['op', 'to'],
-      description: '0-based destination index',
-    })
-    expect(forbiddenConstructs(schema)).toEqual([])
-    expect(opNamesSchema(catalog).items!.properties!.op).toEqual({
-      enum: ['setText', 'moveSlide'],
-    })
   })
 })

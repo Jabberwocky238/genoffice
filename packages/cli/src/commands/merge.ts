@@ -1,7 +1,6 @@
-import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 import { basename } from 'node:path'
-import { columnLabel } from '@genoffice/xlsx-gateway/domain/cell-address'
 import { flagBool, flagString } from '../args'
 import {
   applyDocOps,
@@ -12,24 +11,13 @@ import {
   saveDocument,
   type OpenDocument,
 } from '../formats/docx'
-import {
-  applyOps,
-  describeDeck,
-  openDeck,
-  saveDeck,
-  type ElementSummary,
-  type SlideSummary,
-} from '../formats/pptx'
-import { readSheet, workbookSummary, writeWorkbook } from '../formats/xlsx'
-import { runWorkbookDsl } from '../formats/xlsx-dsl'
 import { extension, readInput, resolveInput, resolveOutput, writeOutput } from '../fs'
 import { readOpsStream } from '../ops-input'
-import type { OpenedPptx } from '@genoffice/pptx-engine'
 import type { CommandContext, CommandDef } from '../registry'
 import { CliError, EXIT, type CommandResult } from '../result'
 
 const PLACEHOLDER = /\{\{\s*([\w.-]+)\s*\}\}/g
-const FORMATS = ['docx', 'pptx', 'xlsx'] as const
+const FORMATS = ['docx'] as const
 type Format = (typeof FORMATS)[number]
 
 type Scalar = string | number | boolean | null
@@ -49,7 +37,7 @@ interface Unresolved extends Omit<Hit, 'reason'> {
 
 interface Merged {
   found: Hit[]
-  /** text of every location holding a placeholder before the fill, and after it where a rescan is possible (docx, pptx) */
+  /** text of every location holding a placeholder before the fill, and after it */
   before: Map<string, string>
   after?: Map<string, string>
   write(): Promise<void>
@@ -57,10 +45,8 @@ interface Merged {
 
 export const mergeCommand: CommandDef = {
   name: 'merge',
-  summary:
-    'Fill {{key}} placeholders in a .docx, .pptx or .xlsx template with values from a JSON object.',
-  usage:
-    'merge <template.docx|pptx|xlsx> --data <json-file|inline-json|-> --out <path> [--force] [--strict]',
+  summary: 'Fill {{key}} placeholders in a .docx template with values from a JSON object.',
+  usage: 'merge <template.docx> --data <json-file|inline-json|-> --out <path> [--force] [--strict]',
   options: [
     {
       name: 'data',
@@ -87,7 +73,7 @@ export const mergeCommand: CommandDef = {
         EXIT.usage,
         `cannot merge .${format} templates`,
         { supported: [...FORMATS] },
-        { reason: 'unsupported', suggestion: 'pass a .docx, .pptx or .xlsx template' },
+        { reason: 'unsupported', suggestion: 'pass a .docx template' },
       )
     }
     const { values, ignored } = readData(flagString(args, 'data'), ctx)
@@ -268,8 +254,6 @@ type Merge = (path: string, values: Values, output: string, ctx: CommandContext)
 
 const MERGE: Record<Format, Merge> = {
   docx: mergeDocx,
-  pptx: mergePptx,
-  xlsx: mergeXlsx,
 }
 
 /**
@@ -292,7 +276,6 @@ function sentinelOps(
 ): ReplaceOp[] {
   const keys = new Map(provided.map((h) => [h.placeholder, h.key]))
   const distinct = [...keys.keys()]
-  // plain ASCII: the pptx engine drops private-use characters
   const tag = randomBytes(6).toString('hex')
   const sentinel = (i: number) => `[[goff-${tag}-${i}]]`
   const replace = (find: string, replace: string): ReplaceOp => ({
@@ -381,123 +364,5 @@ async function mergeDocx(path: string, values: Values, output: string): Promise<
     return { found, before: texts, after, write: async () => writeOutput(output, bytes) }
   } finally {
     closeDocument(doc)
-  }
-}
-
-function scanDeck(opened: OpenedPptx): {
-  found: Hit[]
-  notes: SlideSummary[]
-  texts: Map<string, string>
-} {
-  const found: Hit[] = []
-  const notes: SlideSummary[] = []
-  const texts = new Map<string, string>()
-  const record = (location: Hit['location'], text: string, reason?: Hit['reason']) => {
-    const inText = hits(text)
-    if (!inText.length) return
-    texts.set(locKey(location), text)
-    for (const h of inText) found.push({ ...h, location, ...(reason ? { reason } : {}) })
-  }
-  // deck findReplace rewrites top-level elements and a group's direct text children only
-  const walk = (slide: string, el: ElementSummary, depth: number) => {
-    const reachable = depth === 0 || (depth === 1 && (el.type === 'text' || el.type === 'shape'))
-    record(
-      { slide, element: el.id ?? el.type },
-      el.text ?? '',
-      reachable ? undefined : 'unreachable_nested',
-    )
-    for (const child of el.children ?? []) walk(slide, child, depth + 1)
-  }
-  for (const page of describeDeck(opened, undefined, true).pages) {
-    for (const el of page.elements) walk(page.id, el, 0)
-    if (hits(page.notes ?? '').length) notes.push(page)
-    record({ slide: page.id, notes: true }, page.notes ?? '')
-  }
-  return { found, notes, texts }
-}
-
-/** deck-wide findReplace covers text, shapes, tables and groups; notes are rewritten with setNotes */
-async function mergePptx(path: string, values: Values, output: string): Promise<Merged> {
-  const source = readInput(path)
-  const opened = await openDeck(source)
-  const { found, notes, texts } = scanDeck(opened)
-  const provided = found.filter((h) => values.has(h.key) && !h.location.notes && !h.reason)
-  let changed = false
-  for (const op of sentinelOps(provided, values)) {
-    if (applyOps(opened, [op], { isolation: 'per_op' }).applied) changed = true
-  }
-  for (const page of notes) {
-    const text = substitute(page.notes!, values)
-    if (text === page.notes) continue
-    const r = applyOps(opened, [{ op: 'setNotes', target: { slide: page.index }, text }], {
-      isolation: 'per_op',
-    })
-    changed ||= r.applied
-  }
-  const after = changed ? scanDeck(opened).texts : texts
-  const bytes = changed ? await saveDeck(opened) : source
-  return { found, before: texts, after, write: async () => writeOutput(output, bytes) }
-}
-
-/**
- * One typed set_cell per placeholder cell: a cell that is exactly one
- * placeholder takes the value's own type (a number stays a number), every
- * other cell gets its substituted text, marked literal so a value starting
- * with "=" is not turned into a formula. Plain set_cell ops are not subject
- * to the DSL's range-expansion cap, so any sheet size works.
- */
-async function mergeXlsx(
-  path: string,
-  values: Values,
-  output: string,
-  ctx: CommandContext,
-): Promise<Merged> {
-  const found: Hit[] = []
-  const before = new Map<string, string>()
-  const ops: Record<string, unknown>[] = []
-  for (const sheet of (await workbookSummary(path)).sheets) {
-    if (!sheet.rows || !sheet.columns) continue
-    const range = `A1:${columnLabel(sheet.columns - 1)}${sheet.rows}`
-    const read = await readSheet(path, { sheet: sheet.name, range })
-    read.rows.forEach((row, r) =>
-      row.forEach((value, c) => {
-        const address = `${columnLabel(c)}${r + 1}`
-        if (typeof value !== 'string' || read.formulas[address]) return
-        const inCell = hits(value)
-        if (!inCell.length) return
-        const location = { sheet: sheet.name, cell: address }
-        before.set(locKey(location), value)
-        for (const h of inCell) found.push({ ...h, location })
-        if (!inCell.some((h) => values.has(h.key))) return
-        const whole = inCell.length === 1 && value.trim() === inCell[0]!.placeholder
-        const typed = whole ? values.get(inCell[0]!.key)! : undefined
-        ops.push(
-          whole && typeof typed !== 'string'
-            ? { op: 'set_cell', sheet: sheet.name, address, value: typed }
-            : {
-                op: 'set_cell',
-                sheet: sheet.name,
-                address,
-                value: substitute(value, values),
-                type: 'text',
-              },
-        )
-      }),
-    )
-  }
-  return {
-    found,
-    before,
-    write: async () => {
-      if (!ops.length) return writeOutput(output, readInput(path))
-      const source = readFileSync(path)
-      const r = await runWorkbookDsl(source, ops, undefined, ctx, { sourcePath: path })
-      await writeWorkbook(source, r.edits, output, {
-        plan: r.sheetPlan,
-        structuralOps: r.structuralOps,
-        renames: r.renames,
-        gateway: r.gateway,
-      })
-    },
   }
 }

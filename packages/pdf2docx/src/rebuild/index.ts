@@ -1,7 +1,6 @@
 /**
- * Rebuild layer: IR pages → docx-engine SaveBlock[] → .docx bytes, following
- * the exportDocxBytes() pattern from apps/markdown (buildBlankDocx → parseDocx
- * → saveDocx). Unit conventions per docx-engine: lengths in twips (pt × 20),
+ * Rebuild layer: IR pages → docx-engine SaveBlock[] → .docx bytes
+ * (buildBlankDocx → parseDocx → saveDocx). Unit conventions per docx-engine: lengths in twips (pt × 20),
  * font sizes in half-points, image display sizes in CSS px (pt × 96/72).
  */
 // relative import (not the @genoffice/docx-engine package name): in a git

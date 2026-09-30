@@ -21,9 +21,6 @@ packages/*/src/vendor/
 rsWordParser/
 rsWordLayout/
 
-# LLM prompt text: prettier rewrites *_* markers and list indentation, changing what the model reads.
-apps/slides/src/renderer/ai/prompts/*.md
-
 # In-page extractor fragments: concatenated into one function body, kept verbatim.
 packages/html2docx/src/browser/
 

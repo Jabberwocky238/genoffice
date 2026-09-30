@@ -19,12 +19,8 @@ export interface ControlEndpoint {
   token: string
 }
 
-/** Where to put the caret / selection in an open document; one kind per file type. */
-export type ControlTarget =
-  | { kind: 'slide'; slide: number; el?: string }
-  | { kind: 'block'; block: number }
-  | { kind: 'range'; sheet?: string; range: string }
-  | { kind: 'page'; page: number }
+/** Where to put the caret / selection in an open Word document. */
+export type ControlTarget = { kind: 'block'; block: number }
 
 export type ControlRequest =
   { cmd: 'open'; path: string; target?: ControlTarget } | { cmd: 'selection'; path: string }
@@ -37,7 +33,6 @@ export interface ControlEnvelope {
 export type ControlErrorReason =
   | 'target_not_found'
   | 'out_of_range'
-  | 'sheet_not_found'
   | 'invalid_argument'
   | 'unsupported'
   | 'file_not_found'

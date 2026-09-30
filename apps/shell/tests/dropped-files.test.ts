@@ -33,8 +33,8 @@ describe('handleDroppedFiles', () => {
 
   it('opens every supported path and reveals the shell', () => {
     const deps = fakeDeps()
-    handleDroppedFiles(['/tmp/a.docx', '/tmp/b.xlsx'], deps)
-    expect(deps.opened).toEqual(['/tmp/a.docx', '/tmp/b.xlsx'])
+    handleDroppedFiles(['/tmp/a.docx', '/tmp/b.pdf'], deps)
+    expect(deps.opened).toEqual(['/tmp/a.docx', '/tmp/b.pdf'])
     expect(deps.revealed).toHaveBeenCalledOnce()
     expect(deps.warned).toEqual([])
   })

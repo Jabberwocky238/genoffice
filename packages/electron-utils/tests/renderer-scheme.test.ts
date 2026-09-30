@@ -4,22 +4,20 @@ import { rendererUrl, resolveRendererFile } from '../src/renderer-scheme'
 
 describe('rendererUrl', () => {
   it('builds the scheme URL with the query when no dev server is configured', () => {
-    expect(rendererUrl(undefined, 'sheets', { mode: 'tab' })).toBe(
-      'genoffice-app://sheets/index.html?mode=tab',
+    expect(rendererUrl(undefined, 'docs', { mode: 'tab' })).toBe(
+      'genoffice-app://docs/index.html?mode=tab',
     )
     expect(rendererUrl(undefined, 'docs')).toBe('genoffice-app://docs/index.html')
   })
 
   it('appends the query to a dev URL that already carries params', () => {
-    expect(rendererUrl('http://localhost:5174/?x=1', 'sheets', { mode: 'tab' })).toBe(
+    expect(rendererUrl('http://localhost:5174/?x=1', 'docs', { mode: 'tab' })).toBe(
       'http://localhost:5174/?x=1&mode=tab',
     )
   })
 
   it('throws a descriptive error for a malformed dev URL', () => {
-    expect(() => rendererUrl(':::', 'sheets')).toThrow(
-      'Invalid dev URL for renderer "sheets": ":::"',
-    )
+    expect(() => rendererUrl(':::', 'docs')).toThrow('Invalid dev URL for renderer "docs": ":::"')
     expect(() => rendererUrl('', 'docs')).toThrow('Invalid dev URL for renderer "docs": ""')
   })
 

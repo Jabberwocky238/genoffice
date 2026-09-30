@@ -7,9 +7,9 @@ const SYNC_PAGE = 100
 /** bound on sync cost for huge accounts (10 requests) */
 const MAX_PROJECTS = 1000
 
-const KINDS: readonly CloudProjectKind[] = ['docs', 'sheets', 'slides']
+const KINDS: readonly CloudProjectKind[] = ['docs']
 
-/** 'slides_agent_git' / 'docs_agent' / 'sheets_agent_new' → module kind */
+/** 'docs_agent' → module kind; every other project type is 'other' */
 export function kindFromType(type: string): CloudProjectKind | 'other' {
   return KINDS.find((k) => type.startsWith(k)) ?? 'other'
 }

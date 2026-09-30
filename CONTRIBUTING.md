@@ -22,13 +22,14 @@ directly on this repository as usual.
 
 ## Repository layout
 
-- `apps/*` — the seven Electron apps (docs, sheets, slides, pdf, markdown, html, shell).
-  Each app is an npm workspace with its own `src/main` (Electron main
-  process), `src/renderer` (React UI), and `tests/`.
+- `apps/*` — the two Electron modules: `docs` (the Word editor) and `shell`
+  (the tabbed host and home screen). Each is an npm workspace with its own
+  `src/main` (Electron main process), `src/renderer` (React UI), and `tests/`.
 - `packages/*` — pure TypeScript engine and shared packages (no Electron
-  dependency, unit-tested): docx/pptx engines, AI agent core, providers,
+  dependency, unit-tested): docx engine, AI agent core, providers,
   i18n, UI kit.
-- `apps/sheets/native/xlsx-engine` — Rust xlsx engine (runs as a sidecar process) for xlsx import/export.
+- `rsWordParser/`, `rsWordLayout/` — the Rust Word parser and layout engines
+  (git submodules), consumed through `ee/rsWordParser`.
 
 ## Engine packages
 
@@ -37,18 +38,17 @@ All pure TypeScript, no Electron dependency, unit-tested (except the UI kit):
 - `packages/docx-engine` — docx parsing → block tree (with `docxIndex`
   anchors and passthrough), OOXML fragment generation, byte-level paragraph
   patching.
-- `packages/pptx-engine` / `packages/pptx-render` — pptx model and rendering.
+- `packages/pptx-engine` / `packages/pptx-render` — DrawingML shape geometry and
+  text layout the Word editor reuses for shapes.
 - `packages/pdf2docx` — local PDF → DOCX conversion: PDFium character-level
-  extraction, pure-geometry layout analysis, rebuild through `docx-engine`;
-  the same analysis drives the PDF app's PowerPoint and Excel exports.
+  extraction, pure-geometry layout analysis, rebuild through `docx-engine`.
 - `packages/html2docx` — local HTML → DOCX conversion: the page is rendered in
   the app's own Chromium, reduced in-browser to a document intent tree, and
   written as native OOXML with the `docx` library; only visuals with no Word
-  counterpart are screenshotted. Drives the HTML app's Export as Word.
+  counterpart are screenshotted. Converts `w:altChunk` HTML inside Word files.
 - `packages/file-parse` — text extraction for AI attachments (office formats,
   text formats).
-- `packages/agent-core` — the AI agent loop and skill composition shared by
-  every app.
+- `packages/agent-core` — the AI agent loop and skill composition.
 - `packages/ai-provider` — provider abstraction and streaming for the model
   backends.
 - `packages/ai-search` — Genspark auth + web/image search tools.
@@ -74,8 +74,7 @@ editor didn't touch survives the round trip untouched.
 
 ## Getting started
 
-Prerequisites: Node 22+, npm 10+, and a Rust toolchain (`cargo` on PATH,
-needed only for the sheets xlsx sidecar).
+Prerequisites: Node 22+ and npm 10+.
 
 ```bash
 npm install
@@ -133,17 +132,6 @@ repository:
 BUILD_DIR=/tmp/genoffice-release npm run dist:mac
 ```
 
-`dist:win` additionally expects the xlsx sidecar at the MinGW cross-compilation
-path. Building on Windows leaves it under the MSVC target instead, so stage it
-first:
-
-```bash
-cargo build --release --target x86_64-pc-windows-gnu   # from apps/sheets/native/xlsx-engine
-```
-
-or copy an existing `target/release/xlsx-sidecar.exe` to
-`target/x86_64-pc-windows-gnu/release/`.
-
 ## Environment variables
 
 None are required — the apps run with all of these unset. They exist for
@@ -155,10 +143,8 @@ testing and local overrides:
 | `GENOFFICE_USER_DATA`                                                                             | Override the Electron userData directory (test isolation)                        |
 | `GENOFFICE_LANG`                                                                                  | Force the UI language instead of following the OS locale                         |
 | `GENOFFICE_FAKE_UPDATE`                                                                           | Exercise the updater UI without a real release feed                              |
-| `GENOFFICE_CLOUD_SLIDE`, `GENOFFICE_CLOUD_SLIDE_TIER`                                             | Route slide generation through the cloud endpoint                                |
 | `GSK_API_KEY`, `GSK_CLI_PATH`                                                                     | Genspark credentials / CLI location for the built-in AI provider                 |
 | `AI_SEARCH_DISABLE_GSK`, `SERPER_API_KEY`, `SERPLY_API_KEY`, `TAVILY_API_KEY`, `PARALLEL_API_KEY` | Disable the gsk search backend / supply a Serper, Serply, Tavily or Parallel key |
-| `XLSX_SIDECAR_PATH`, `XLSX_OPEN_PATH`, `XLSX_DEBUG_PORT`                                          | Point at a locally built xlsx sidecar and its debug port                         |
 | `*_DEV_PORT`, `*_RENDERER_URL`                                                                    | Per-app Vite dev server ports and renderer URLs (set by `npm run dev`)           |
 
 AI features degrade rather than break without credentials: requests surface an
@@ -185,11 +171,11 @@ free Search MCP, then DuckDuckGo).
 ## Commit and PR guidelines
 
 - Small, focused commits with imperative English subject lines
-  (e.g. `fix docx table border round-trip`, `add slides chart legend parsing`).
+  (e.g. `fix docx table border round-trip`, `add docx chart legend parsing`).
 - A PR should explain _why_ the change is needed, and mention which of the
   checks above you ran.
 - File format fidelity is the core product promise: for changes touching
-  open/save paths (docx/xlsx/pptx), include a round-trip test proving
+  open/save paths (docx), include a round-trip test proving
   untouched content survives byte-for-byte.
 
 ## Reporting bugs and requesting features

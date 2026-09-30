@@ -11,7 +11,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { launchShell, closeAndSaveVideo, screenshotPath } from './helpers'
+import { launchShell, closeAndSaveVideo, screenshotPath, waitForPageWithUrl } from './helpers'
 
 /**
  * Home "Folders" panel: the tree over the default save folder, the folder
@@ -26,8 +26,8 @@ test.describe('home folders panel', () => {
     mkdirSync(join(root, 'Clients', 'Contracts'), { recursive: true })
     mkdirSync(join(root, 'Personal'))
     writeFileSync(join(root, 'report.docx'), 'x')
-    writeFileSync(join(root, 'notes.md'), '# notes')
-    writeFileSync(join(root, 'Clients', 'Contracts', 'deal.md'), '# deal')
+    writeFileSync(join(root, 'notes.docx'), '# notes')
+    writeFileSync(join(root, 'Clients', 'Contracts', 'deal.docx'), '# deal')
   })
 
   test.afterEach(() => {
@@ -61,7 +61,9 @@ test.describe('home folders panel', () => {
       // select Contracts → active tree row + its file
       await tree.locator('.tree-name', { hasText: 'Contracts' }).click()
       await expect(tree.locator('.tree-row.active .tree-name')).toHaveText('Contracts')
-      await expect(page.locator('.recent-list .recent-name', { hasText: 'deal.md' })).toBeVisible()
+      await expect(
+        page.locator('.recent-list .recent-name', { hasText: 'deal.docx' }),
+      ).toBeVisible()
       await page.screenshot({ path: screenshotPath('home-folders-contracts') })
 
       // new folder from the sidebar header: lands under the selected folder
@@ -74,9 +76,9 @@ test.describe('home folders panel', () => {
       ).toBeVisible()
       expect(existsSync(join(root, 'Clients', 'Contracts', 'Drafts'))).toBe(true)
 
-      // move deal.md → Personal through the picker
+      // move deal.docx → Personal through the picker
       const dealRow = page.locator('.recent-row', {
-        has: page.locator('.recent-name', { hasText: 'deal.md' }),
+        has: page.locator('.recent-name', { hasText: 'deal.docx' }),
       })
       await dealRow.locator('.more-btn').click()
       await page.locator('.row-menu button', { hasText: 'Move to folder' }).click()
@@ -87,9 +89,11 @@ test.describe('home folders panel', () => {
         .click()
       await picker.locator('.btn-primary').click()
       await expect(picker).toHaveCount(0)
-      await expect(page.locator('.recent-list .recent-name', { hasText: 'deal.md' })).toHaveCount(0)
-      expect(existsSync(join(root, 'Personal', 'deal.md'))).toBe(true)
-      expect(existsSync(join(root, 'Clients', 'Contracts', 'deal.md'))).toBe(false)
+      await expect(page.locator('.recent-list .recent-name', { hasText: 'deal.docx' })).toHaveCount(
+        0,
+      )
+      expect(existsSync(join(root, 'Personal', 'deal.docx'))).toBe(true)
+      expect(existsSync(join(root, 'Clients', 'Contracts', 'deal.docx'))).toBe(false)
 
       // rename Drafts → Final from the sub-folder row menu
       const draftsRow = page.locator('.recent-row', {
@@ -117,7 +121,9 @@ test.describe('home folders panel', () => {
 
       // Personal now lists the moved file; the Recent view shows its location
       await tree.locator('.tree-name', { hasText: 'Personal' }).click()
-      await expect(page.locator('.recent-list .recent-name', { hasText: 'deal.md' })).toBeVisible()
+      await expect(
+        page.locator('.recent-list .recent-name', { hasText: 'deal.docx' }),
+      ).toBeVisible()
       await page.screenshot({ path: screenshotPath('home-folders-personal') })
     } finally {
       await closeAndSaveVideo(launched, 'home-folders')
@@ -127,7 +133,7 @@ test.describe('home folders panel', () => {
   test('an added folder joins the tree in place and leaves the list without touching disk', async () => {
     const extra = realpathSync(mkdtempSync(join(tmpdir(), 'genoffice-e2e-extra-')))
     mkdirSync(join(extra, 'Projects', 'Alpha'), { recursive: true })
-    writeFileSync(join(extra, 'Projects', 'plan.md'), '# plan')
+    writeFileSync(join(extra, 'Projects', 'plan.docx'), '# plan')
     const launched = await launchShell({
       onboardingSeen: true,
       settings: { defaultSaveDir: root, folderRoots: [extra] },
@@ -145,7 +151,9 @@ test.describe('home folders panel', () => {
       await expect(rootRows.nth(1)).toHaveAttribute('aria-expanded', 'true')
       await expect(tree.locator('.tree-name', { hasText: 'Projects' })).toBeVisible()
       await tree.locator('.tree-name', { hasText: 'Projects' }).click()
-      await expect(page.locator('.recent-list .recent-name', { hasText: 'plan.md' })).toBeVisible()
+      await expect(
+        page.locator('.recent-list .recent-name', { hasText: 'plan.docx' }),
+      ).toBeVisible()
       await expect(page.locator('.recent-list .recent-name', { hasText: 'Alpha' })).toBeVisible()
 
       // edits happen where the folder really is
@@ -164,14 +172,16 @@ test.describe('home folders panel', () => {
       await rootRows.nth(1).locator('.folder-more-btn').click()
       await page.locator('.folder-menu button', { hasText: 'Remove from list' }).click()
       await expect(rootRows).toHaveCount(1)
-      await expect(page.locator('.recent-list .recent-name', { hasText: 'plan.md' })).toHaveCount(0)
+      await expect(page.locator('.recent-list .recent-name', { hasText: 'plan.docx' })).toHaveCount(
+        0,
+      )
       await expect
         .poll(() => {
           const settings = JSON.parse(readFileSync(join(userDataDir, 'app-settings.json'), 'utf8'))
           return settings.folderRoots
         })
         .toEqual([])
-      expect(existsSync(join(extra, 'Projects', 'plan.md'))).toBe(true)
+      expect(existsSync(join(extra, 'Projects', 'plan.docx'))).toBe(true)
       expect(existsSync(join(extra, 'Projects', 'Beta'))).toBe(true)
     } finally {
       await closeAndSaveVideo(launched, 'home-folders-roots')
@@ -191,21 +201,18 @@ test.describe('home folders panel', () => {
       await expect(page.locator('.folder-panel .tree .tree-row.active .tree-name')).toHaveText(
         'Personal',
       )
-      // the blank PDF is written synchronously by the shell, so it exercises the pending-folder path
-      await page.locator('.quick-card', { hasText: 'AI PDF' }).click()
-      const hasPdf = (dir: string) =>
-        existsSync(dir) && readdirSync(dir).some((f) => f.endsWith('.pdf'))
-      await expect.poll(() => hasPdf(join(root, 'Personal')), { timeout: 15_000 }).toBe(true)
-      expect(hasPdf(root)).toBe(false)
-      // and the tab opened on the moved path, not the vanished root one
-      await expect(page.locator('.tab-bar .tab-item', { hasText: '.pdf' })).toBeVisible()
-      // a second New from the same folder view lands there too (the folder is not a one-shot slot)
-      await page.locator('.tab-bar .tab-item.tab-home').click()
-      await page.locator('.quick-card', { hasText: 'AI Sheets' }).click()
-      const hasXlsx = (dir: string) =>
-        existsSync(dir) && readdirSync(dir).some((f) => f.endsWith('.xlsx'))
-      await expect.poll(() => hasXlsx(join(root, 'Personal')), { timeout: 15_000 }).toBe(true)
-      expect(hasXlsx(root)).toBe(false)
+      const newDocx = (dir: string) =>
+        existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith('.docx')).length : 0
+      await page.locator('.quick-card', { hasText: 'AI Docs' }).click()
+      // a blank document reaches disk on its first (silent) save
+      const docs = await waitForPageWithUrl(app, '://docs/')
+      await docs.waitForSelector('.ProseMirror', { timeout: 30_000 })
+      await docs.locator('.ProseMirror').first().click()
+      await docs.keyboard.type('Folder note')
+      await docs.keyboard.press('ControlOrMeta+s')
+      await expect.poll(() => newDocx(join(root, 'Personal')), { timeout: 15_000 }).toBe(1)
+      // report.docx and notes.docx were already there
+      expect(newDocx(root)).toBe(2)
       // back home: the new tab must not block shutdown
       await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.focus())
     } finally {

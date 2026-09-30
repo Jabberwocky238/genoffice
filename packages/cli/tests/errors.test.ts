@@ -2,15 +2,10 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { classifyOpError } from '../src/op-errors'
-import { xlsxSidecarPath } from '../src/resources'
 import { run, tempDir } from './helpers'
 
 const REPO = resolve(__dirname, '../../..')
 const DOCX = join(REPO, 'apps/docs/tests/pagination-corpus/docx/01-simple-english.docx')
-const PPTX = join(REPO, 'packages/pptx-engine/tests/fixtures/01_standard_business.pptx')
-const XLSX = join(REPO, 'apps/sheets/fixtures/generated/compatibility-basic.xlsx')
-
-const TEXT = [{ runs: [{ text: 'x' }] }]
 
 function copyOf(src: string, name: string): { dir: string; file: string } {
   const dir = tempDir()
@@ -39,7 +34,6 @@ describe('structured errors', () => {
     expect((await run(['guide', 'foo', '--json'])).json().error).toBe('invalid_argument')
     expect((await run(['docs', 'reed', DOCX, '--json'])).json().error).toBe('invalid_argument')
     expect((await run(['docs', '--json'])).json().error).toBe('missing_argument')
-    expect((await run(['sheet', '--json'])).json().error).toBe('missing_argument')
   })
 
   it('separates file errors that share exit code 2', async () => {
@@ -47,10 +41,10 @@ describe('structured errors', () => {
     expect(missing).toMatchObject({ code: 2, error: 'file_not_found' })
 
     const { dir } = copyOf(DOCX, 'in.docx')
-    const csv = join(dir, 'd.csv')
-    writeFileSync(csv, 'a,b\n1,2\n')
-    expect((await run(['convert', csv, '--to', 'xlsx', '--json'])).code).toBe(0)
-    const exists = (await run(['convert', csv, '--to', 'xlsx', '--json'])).json()
+    const md = join(dir, 'd.md')
+    writeFileSync(md, '# a\n')
+    expect((await run(['convert', md, '--to', 'html', '--json'])).code).toBe(0)
+    const exists = (await run(['convert', md, '--to', 'html', '--json'])).json()
     expect(exists).toMatchObject({ code: 2, error: 'output_exists' })
     expect(exists.suggestion).toContain('--force')
   })
@@ -112,44 +106,6 @@ describe('structured errors', () => {
     expect(group.did_you_mean).toBe('g_1')
   })
 
-  it('reports slides op failures with reason, range and suggestion', async () => {
-    const { dir, file } = copyOf(PPTX, 'deck.pptx')
-    const ops = join(dir, 'ops.json')
-
-    writeFileSync(
-      ops,
-      JSON.stringify([{ op: 'setText', target: { slide: 99, el: 'e_1' }, paragraphs: TEXT }]),
-    )
-    const range = (await run(['slides', 'apply', file, '--ops', ops, '--json'])).json()
-    expect(range).toMatchObject({ code: 1, error: 'out_of_range' })
-    expect(range.detail.failures[0]).toMatchObject({
-      index: 0,
-      op: 'setText',
-      reason: 'out_of_range',
-    })
-    expect(range.detail.failures[0].valid_range[0]).toBe(0)
-    expect(range.suggestion).toContain('between 0 and')
-
-    writeFileSync(
-      ops,
-      JSON.stringify([{ op: 'setText', target: { slide: 0, el: 'e_nope' }, paragraphs: TEXT }]),
-    )
-    const target = (await run(['slides', 'apply', file, '--ops', ops, '--json'])).json()
-    expect(target).toMatchObject({ error: 'target_not_found' })
-    expect(target.detail.failures[0].available.length).toBeGreaterThan(0)
-    expect(target.suggestion).toContain('genoffice slides read')
-
-    writeFileSync(ops, JSON.stringify([{ op: 'frobnicate', target: { slide: 0 } }]))
-    const unknown = (await run(['slides', 'apply', file, '--ops', ops, '--json'])).json()
-    expect(unknown).toMatchObject({ error: 'unknown_op' })
-    expect(unknown.detail.failures[0].supported).toContain('setText')
-
-    const flag = (await run(['slides', 'read', file, '--slide', '99', '--json'])).json()
-    expect(flag).toMatchObject({ error: 'out_of_range' })
-    expect(flag.detail.valid_range[0]).toBe(0)
-    expect(readFileSync(file).equals(readFileSync(PPTX))).toBe(true)
-  })
-
   it('reports docs op failures the same way', async () => {
     const { dir, file } = copyOf(DOCX, 'doc.docx')
     const ops = join(dir, 'ops.json')
@@ -178,20 +134,6 @@ describe('structured errors', () => {
     expect((await run(['docs', 'read', file, '--range', 'abc', '--json'])).json().error).toBe(
       'invalid_argument',
     )
-  })
-
-  it.skipIf(!xlsxSidecarPath())('reports sheet errors with the sheet list', async () => {
-    const { dir, file } = copyOf(XLSX, 'book.xlsx')
-    const missing = (await run(['sheet', 'read', file, '--sheet', 'Nope', '--json'])).json()
-    expect(missing).toMatchObject({ error: 'sheet_not_found' })
-    expect(missing.detail.sheets.length).toBeGreaterThan(0)
-
-    const ops = join(dir, 'ops.json')
-    writeFileSync(ops, JSON.stringify([{ op: 'frobnicate' }]))
-    const unknown = (await run(['sheet', 'apply', file, '--ops', ops, '--json'])).json()
-    expect(unknown).toMatchObject({ error: 'unknown_op' })
-    expect(unknown.detail.supported).toContain('set_cell')
-    expect(unknown.suggestion).toContain('genoffice guide sheets')
   })
 })
 

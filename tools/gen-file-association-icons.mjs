@@ -26,15 +26,9 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const svgDir = join(root, 'apps/shell/src/renderer/src/assets')
 const outDir = join(root, 'apps/shell/build')
 
-// One icon per visual type; associations for xlsm/xls/csv/markdown reuse
-// these via the fileAssociations `icon` field.
+// One icon per associated type (fileAssociations `icon` field).
 const TYPES = {
   docx: 'file-docx.svg',
-  xlsx: 'file-xlsx.svg',
-  pptx: 'file-pptx.svg',
-  pdf: 'file-pdf.svg',
-  md: 'file-md.svg',
-  html: 'file-html.svg',
 }
 
 // macOS icons carry the standard app-icon grid margin (824/1024 content, same

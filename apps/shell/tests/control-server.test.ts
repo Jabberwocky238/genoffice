@@ -95,15 +95,15 @@ describe('control handler', () => {
   it('activates the tab that already shows the file, waits for the renderer and relays the target', async () => {
     const { wc, executeJavaScript } = fakeWebContents([
       { status: 'not_ready' },
-      { status: 'ok', result: { slide: 2 } },
+      { status: 'ok', result: { block: 2 } },
     ])
-    const h = host({ findTab: () => ({ id: 't1', kind: 'slides', webContents: wc }) })
+    const h = host({ findTab: () => ({ id: 't1', kind: 'docs', webContents: wc }) })
     const reply = await controlHandler(h)({
       cmd: 'open',
       path: __filename,
-      target: { kind: 'slide', slide: 2 },
+      target: { kind: 'block', block: 2 },
     })
-    expect(reply).toEqual({ ok: true, result: { slide: 2 } })
+    expect(reply).toEqual({ ok: true, result: { block: 2 } })
     expect(h.reveal).toHaveBeenCalled()
     expect(h.activateTab).toHaveBeenCalledWith('t1')
     expect(h.openDocument).not.toHaveBeenCalled()
@@ -162,13 +162,13 @@ describe('control handler', () => {
     const { wc } = fakeWebContents([
       {
         status: 'error',
-        error: { reason: 'out_of_range', message: 'slide 9', detail: { valid_range: '0-3' } },
+        error: { reason: 'out_of_range', message: 'block 9', detail: { valid_range: '0-3' } },
       },
     ])
-    const h = host({ findTab: () => ({ id: 't1', kind: 'slides', webContents: wc }) })
+    const h = host({ findTab: () => ({ id: 't1', kind: 'docs', webContents: wc }) })
     expect(await controlHandler(h)({ cmd: 'selection', path: __filename })).toEqual({
       ok: false,
-      error: { reason: 'out_of_range', message: 'slide 9', detail: { valid_range: '0-3' } },
+      error: { reason: 'out_of_range', message: 'block 9', detail: { valid_range: '0-3' } },
     })
 
     const never = fakeWebContents([])

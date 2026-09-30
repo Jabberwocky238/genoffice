@@ -1,9 +1,7 @@
 import { basename, dirname, extname, join } from 'node:path'
 import { PdfLoadError } from '@genoffice/pdf2docx'
 import { flagBool, flagString, type ParsedArgs } from '../args'
-import { csvToXlsx, sheetNameFromStem } from '../formats/csv'
 import { convertPdf, type PdfTarget } from '../formats/pdf'
-import { convertLegacyWorkbook, sheetToCsv } from '../formats/xlsx'
 import { exportViaApp, type AppExportTarget } from '../formats/app-export'
 import { htmlToMarkdown, markdownToDocx, markdownToHtml } from '../formats/markdown'
 import { closeDocument, documentHtml, openDocument } from '../formats/docx'
@@ -13,34 +11,19 @@ import { CliError, EXIT } from '../result'
 
 /** Conversions that run in this process. */
 const NODE_ROUTES: Record<string, readonly string[]> = {
-  pdf: ['docx', 'pptx', 'xlsx'],
-  csv: ['xlsx'],
-  xls: ['xlsx'],
-  xlsb: ['xlsx'],
-  ods: ['xlsx'],
+  pdf: ['docx'],
   md: ['docx', 'html'],
   markdown: ['docx', 'html'],
   docx: ['md'],
-  xlsx: ['csv'],
-  xlsm: ['csv'],
 }
 
 /**
  * Conversions the GenOffice binary runs for us in its hidden headless-export
- * mode: anything that needs an app renderer (page layout for pdf, the Word
- * editor's HTML export, html2docx). Mirrors HEADLESS_TARGETS in the shell.
+ * mode: the Word renderer's page layout (pdf) and HTML export. Mirrors
+ * HEADLESS_TARGETS in the shell.
  */
 const APP_ROUTES: Record<string, readonly AppExportTarget[]> = {
-  csv: ['pdf'],
-  xls: ['pdf'],
-  md: ['pdf'],
-  markdown: ['pdf'],
   docx: ['pdf', 'html'],
-  xlsx: ['pdf'],
-  xlsm: ['pdf'],
-  pptx: ['pdf'],
-  html: ['pdf', 'docx'],
-  htm: ['pdf', 'docx'],
 }
 
 const ROUTES: Record<string, readonly string[]> = Object.fromEntries(
@@ -58,17 +41,12 @@ function appTarget(from: string, to: string): AppExportTarget | null {
 export const convertCommand: CommandDef = {
   name: 'convert',
   summary: 'Convert a document to another format using the GenOffice engines.',
-  usage: 'convert <file> --to <format> [--out <path>] [--force] [--password <pw>] [--sheet <name>]',
+  usage: 'convert <file> --to <format> [--out <path>] [--force] [--password <pw>]',
   options: [
     { name: 'to', value: 'format', description: 'target format: ' + describeRoutes() },
     { name: 'out', value: 'path', description: 'output file (default: same name, new extension)' },
     { name: 'force', description: 'overwrite an existing output file' },
     { name: 'password', value: 'pw', description: 'password for an encrypted PDF' },
-    {
-      name: 'sheet',
-      value: 'name',
-      description: 'xlsx→csv: worksheet to export (default: the active one)',
-    },
   ],
   async run(args, ctx) {
     const input = resolveInput(args.positionals[0], ctx)
@@ -87,7 +65,7 @@ export const convertCommand: CommandDef = {
         { reason: 'unsupported', suggestion: 'pick a route from detail.supported' },
       )
     }
-    // before run(): the sidecar and app routes write the output themselves
+    // before run(): the app routes write the output themselves
     const output = resolveOutput(flagString(args, 'out'), ctx, {
       fallback: join(dirname(input), `${basename(input, extname(input))}.${to}`),
       force: flagBool(args, 'force'),
@@ -145,15 +123,6 @@ async function run(
     }
     return { bytes: await markdownToDocx(text, { file: input, ctx }), detail: { title } }
   }
-  if (from === 'csv') {
-    const sheet = sheetNameFromStem(basename(input, extname(input)))
-    return { bytes: await csvToXlsx(readInput(input), sheet), detail: { sheet } }
-  }
-  if (to === 'csv') {
-    const { csv, ...detail } = await sheetToCsv(input, { sheet: flagString(args, 'sheet') })
-    // UTF-8 BOM, as the app writes it, so Excel opens the file without a wizard
-    return { bytes: Buffer.from('\ufeff' + csv, 'utf-8'), detail }
-  }
   if (to === 'md') {
     const doc = await openDocument(readInput(input))
     try {
@@ -178,8 +147,9 @@ async function run(
       closeDocument(doc)
     }
   }
-  const r = await convertLegacyWorkbook(input, output)
-  return { detail: { sheets: r.sheets, cells: r.cells } }
+  throw new CliError(EXIT.usage, `cannot convert .${from} to .${to}`, undefined, {
+    reason: 'unsupported',
+  })
 }
 
 function describeRoutes(): string {

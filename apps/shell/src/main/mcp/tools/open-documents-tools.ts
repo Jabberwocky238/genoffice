@@ -20,21 +20,10 @@ import { sanitizeFileBase, uniquePathIn } from './document-tools'
 /** tab kind -> format family (the registry's vocabulary, for the type label) */
 const FAMILY_BY_KIND: Record<Exclude<TabKind, 'home'>, EditorFamily> = {
   docs: 'docx',
-  sheets: 'xlsx',
-  slides: 'pptx',
-  markdown: 'md',
-  html: 'html',
-  pdf: 'pdf',
 }
 
 /** families whose live content can be read back over MCP */
-const READABLE_KINDS: ReadonlySet<TabKind> = new Set<TabKind>([
-  'docs',
-  'sheets',
-  'slides',
-  'markdown',
-  'html',
-])
+const READABLE_KINDS: ReadonlySet<TabKind> = new Set<TabKind>(['docs'])
 
 export interface OpenDocumentsControl {
   /** every editor tab the user can see (Home and chrome-free Present tabs excluded) */

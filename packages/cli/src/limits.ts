@@ -1,7 +1,5 @@
 import { closeSync, fstatSync, openSync, readSync } from 'node:fs'
 import { DOCX_ZIP_LIMITS } from '@genoffice/docx-engine'
-import { PPTX_ZIP_LIMITS } from '@genoffice/pptx-engine'
-import { XLSX_ZIP_LIMITS } from '@genoffice/xlsx-gateway/gateway/xlsx-gateway'
 import { CliError, EXIT } from './result'
 
 export interface ZipDirectoryEntry {
@@ -19,8 +17,6 @@ interface PackageLimits {
 /** Per-format ceilings are the engines' own, so the CLI never refuses what the engine would open. */
 const LIMITS: Record<string, PackageLimits> = {
   docx: DOCX_ZIP_LIMITS,
-  pptx: PPTX_ZIP_LIMITS,
-  xlsx: { ...XLSX_ZIP_LIMITS, maxPartBytes: XLSX_ZIP_LIMITS.maxTotalBytes },
 }
 
 const FAMILY: Record<string, keyof typeof LIMITS> = {
@@ -28,15 +24,6 @@ const FAMILY: Record<string, keyof typeof LIMITS> = {
   docm: 'docx',
   dotx: 'docx',
   dotm: 'docx',
-  xlsx: 'xlsx',
-  xlsm: 'xlsx',
-  xltx: 'xlsx',
-  xltm: 'xlsx',
-  pptx: 'pptx',
-  pptm: 'pptx',
-  potx: 'pptx',
-  potm: 'pptx',
-  ppsx: 'pptx',
 }
 
 /** Real OOXML parts deflate well under 100:1; a bomb declares thousands to one. */
@@ -155,7 +142,7 @@ export function readZipDirectory(path: string, maxEntries = Infinity): ZipDirect
   }
 }
 
-/** Same rule as the xlsx gateway: only a `..` that walks out of the root (or a NUL) is an escape; leading slashes and backslashes are producer quirks it folds away. */
+/** Only a `..` that walks out of the root (or a NUL) is an escape; leading slashes and backslashes are producer quirks it folds away. */
 function unsafeName(name: string): boolean {
   if (name.includes('\0')) return true
   let depth = 0
@@ -188,7 +175,7 @@ export function assertPackageWithinLimits(path: string, ext: string): void {
     throw refuse(
       `${path}: ${dir.count} zip entries exceeds the ${limits.maxParts} limit`,
       { entries: dir.count, limit: limits.maxParts },
-      'reduce the number of parts (embedded media, sheets, slides) in the package',
+      'reduce the number of parts (embedded media) in the package',
     )
   }
   const { entries } = dir
